@@ -1,9 +1,12 @@
 import os
 import sys
 import argparse
+import logging
 from datetime import datetime
 from glob import glob
 from pathlib import Path
+
+from typing import Dict, Any
 
 # 确保导入项目目录下的模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,58 +21,294 @@ from dataset.data_interface import DataInterface
 from model import ModelInterface
 from utils import (
     load_callbacks,
-    load_config,
     load_loggers,
     fix_seed
 )
 
+# 设置日志记录器
+logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision('high')
 
 
+# 编码器特征维度映射
+ENCODER_FEATURE_DIMS = {
+    'uni': 1024,
+    'conch': 512
+}
+
+# 数据集配置 - 包含路径和slide划分信息
+DATASETS = {
+    'PRAD': {
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
+        'val_slides': 'MEND139',
+        'test_slides': 'MEND140',
+        'recommended_encoder': 'uni'
+    },
+    'her2st': {
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
+        'val_slides': 'A1,B1',
+        'test_slides': 'C1,D1', 
+        'recommended_encoder': 'conch'
+    }
+}
+
+# 模型配置
+MODELS = {
+    'MFBP': {
+        'model_name': 'MFBP',
+        'num_genes': 200,
+        'dropout_rate': 0.1
+    }
+}
+
+# 默认训练配置 - 从base_config.yaml提取的核心配置
+DEFAULT_CONFIG = {
+    'GENERAL': {
+        'seed': 2021,
+        'log_path': './logs/hest',
+        'debug': False
+    },
+    'DATA': {
+        'normalize': True,
+        'cpm': True,
+        'smooth': True,
+        'train_dataloader': {
+            'batch_size': 256,
+            'num_workers': 4,
+            'pin_memory': True,
+            'shuffle': True,
+            'persistent_workers': True
+        },
+        'val_dataloader': {
+            'batch_size': 1,
+            'num_workers': 4,
+            'pin_memory': True,
+            'shuffle': False,
+            'persistent_workers': True
+        },
+        'test_dataloader': {
+            'batch_size': 1,
+            'num_workers': 4,
+            'pin_memory': True,
+            'shuffle': False,
+            'persistent_workers': True
+        }
+    },
+    'TRAINING': {
+        'num_epochs': 200,
+        'learning_rate': 1.0e-4,
+        'weight_decay': 1.0e-4,
+        'mode': 'min',
+        'monitor': 'val_loss',
+        'lr_scheduler': {
+            'monitor': 'val_loss',
+            'patience': 5,
+            'factor': 0.5,
+            'mode': 'min'
+        },
+        'gradient_clip_val': 1.0
+    },
+    'CALLBACKS': {
+        'early_stopping': {
+            'monitor': 'val_loss',
+            'patience': 10,
+            'mode': 'min',
+            'min_delta': 0.0
+        },
+        'model_checkpoint': {
+            'monitor': 'val_loss',
+            'save_top_k': 1,
+            'mode': 'min',
+            'filename': 'epoch={epoch}-val_loss={val_loss:.4f}'
+        },
+        'learning_rate_monitor': {
+            'logging_interval': 'epoch'
+        }
+    },
+    'MULTI_GPU': {
+        'strategy': 'ddp',
+        'sync_batchnorm': True,
+        'find_unused_parameters': False,
+        'lr_scaling': 'linear',
+        'base_lr': 1.0e-4,
+        'accumulate_grad_batches': 1
+    }
+}
+
+
+
+
+
 def get_parse():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help='配置文件路径')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='运行模式')
+    """
+    Parse command line arguments for simplified MFBP training.
     
-    # 新增参数
-    parser.add_argument('--expr_name', type=str, required=True, help='数据集名称 (PRAD, her2st, kidney, mouse_brain)')
-    parser.add_argument('--data_path', type=str, required=True, help='数据集根目录路径')
-    parser.add_argument('--slide_val', type=str, default='', help='验证集slide ID，逗号分隔')
-    parser.add_argument('--slide_test', type=str, default='', help='测试集slide ID，逗号分隔')
-    parser.add_argument('--encoder_name', type=str, default='uni', choices=['uni', 'conch'], help='编码器类型')
-    parser.add_argument('--use_augmented', action='store_true', help='是否使用增强嵌入')
-    parser.add_argument('--expand_augmented', action='store_true', help='是否展开3D增强嵌入为7倍训练样本（仅训练模式）')
-    parser.add_argument('--aug_strategy', type=str, default='random', 
-                        choices=['random', 'mean', 'attention', 'first', 'all'],
-                        help='3D增强嵌入处理策略: random(推荐)|mean(取平均)|attention(注意力)|first(原图)|all(保留所有)')
+    Returns:
+        argparse.ArgumentParser: Configured argument parser with simplified parameters
+    """
+    parser = argparse.ArgumentParser(
+        description='Simplified Training for Spatial Transcriptomics Models',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage
+  python src/main.py --dataset PRAD --gpus 4
+  
+  # With custom parameters
+  python src/main.py --dataset PRAD --model MFBP --encoder uni \\
+      --gpus 4 --epochs 200 --batch-size 256 --lr 1e-4
+  
+  # Single GPU training
+  python src/main.py --dataset her2st --gpus 1
+  
+  # Test mode
+  python src/main.py --dataset PRAD --gpus 1 --mode test
+        """
+    )
+    
+    # === 核心参数 ===
+    parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
+                        help='数据集名称 (PRAD, her2st)')
+    parser.add_argument('--model', type=str, default='MFBP', choices=list(MODELS.keys()),
+                        help='模型名称 (默认: MFBP)')
+    parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
+                        help='编码器类型 (uni, conch)，默认使用数据集推荐编码器')
+    
+    # === 训练参数 ===
+    parser.add_argument('--gpus', type=int, default=1,
+                        help='GPU数量 (默认: 1)')
+    parser.add_argument('--epochs', type=int,
+                        help='训练轮数 (默认: 200)')
+    parser.add_argument('--batch-size', type=int,
+                        help='批次大小 (默认: 256)')
+    parser.add_argument('--lr', type=float,
+                        help='学习率 (默认: 1e-4)')
+    parser.add_argument('--weight-decay', type=float,
+                        help='权重衰减 (默认: 1e-4)')
+    
+    # === 多GPU参数 ===
+    parser.add_argument('--strategy', type=str, default='auto',
+                        choices=['auto', 'ddp', 'ddp_spawn', 'dp'],
+                        help='多GPU策略 (默认: auto，多GPU时使用ddp)')
+    parser.add_argument('--sync-batchnorm', action='store_true',
+                        help='启用同步BatchNorm (多GPU训练推荐)')
+    
+    # === 数据增强参数 ===
+    parser.add_argument('--use-augmented', action='store_true', default=True,
+                        help='使用数据增强 (默认: True)')
+    parser.add_argument('--expand-augmented', action='store_true', default=True,
+                        help='展开增强数据为7倍样本 (默认: True)')
+    
+    # === 其他参数 ===
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
+                        help='运行模式 (默认: train)')
+    parser.add_argument('--seed', type=int,
+                        help='随机种子 (默认: 2021)')
+    
+    # === 向后兼容参数 (保留最少必要的) ===
+    parser.add_argument('--config', type=str,
+                        help='[已弃用] 请使用 --dataset 参数替代')
     
     return parser
 
 
-def validate_args(args):
-    """验证命令行参数的有效性"""
-    # 检查数据路径是否存在
-    if not os.path.exists(args.data_path):
-        raise FileNotFoundError(f"数据路径不存在: {args.data_path}")
+def build_config_from_args(args):
+    """
+    从简化的命令行参数构建完整配置
     
-    # 确保data_path以'/'结尾
-    if not args.data_path.endswith('/'):
-        args.data_path += '/'
+    Args:
+        args: 解析后的命令行参数
+        
+    Returns:
+        完整的配置对象
+    """
+    from addict import Dict
     
-    # 检查关键目录是否存在
-    st_dir = os.path.join(args.data_path, 'st')
-    processed_dir = os.path.join(args.data_path, 'processed_data')
+    # 如果使用了原有的config参数，则使用原有逻辑
+    if args.config:
+        print("🔄 使用原有配置文件模式")
+        return None  # 返回None表示使用原有逻辑
     
-    if not os.path.exists(st_dir):
-        raise FileNotFoundError(f"ST数据目录不存在: {st_dir}")
+    # 检查必需参数
+    if not args.dataset:
+        raise ValueError("必须指定 --dataset 参数")
     
-    if not os.path.exists(processed_dir):
-        raise FileNotFoundError(f"处理数据目录不存在: {processed_dir}")
+    if args.dataset not in DATASETS:
+        raise ValueError(f"不支持的数据集: {args.dataset}，支持的数据集: {list(DATASETS.keys())}")
     
-    print(f"✅ 数据路径验证通过: {args.data_path}")
+    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型={args.model}")
     
-    return args
+    # 获取数据集信息
+    dataset_info = DATASETS[args.dataset]
+    
+    # 获取模型信息
+    model_info = MODELS[args.model]
+    
+    # 确定编码器
+    encoder_name = args.encoder or dataset_info['recommended_encoder']
+    
+    # 确定GPU相关参数
+    devices = args.gpus
+    strategy = 'ddp' if devices > 1 and args.strategy == 'auto' else args.strategy
+    sync_batchnorm = getattr(args, 'sync_batchnorm', False) or (devices > 1)
+    
+    # 构建完整配置
+    config = Dict(DEFAULT_CONFIG)
+    
+    # 更新模型配置
+    config.MODEL = Dict(model_info)
+    config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
+    
+    # 更新训练参数
+    if args.epochs:
+        config.TRAINING.num_epochs = args.epochs
+    if args.lr:
+        config.TRAINING.learning_rate = args.lr
+    if args.weight_decay:
+        config.TRAINING.weight_decay = args.weight_decay
+    if getattr(args, 'batch_size', None):
+        config.DATA.train_dataloader.batch_size = args.batch_size
+    
+    # 更新种子
+    if args.seed:
+        config.GENERAL.seed = args.seed
+    
+    # 设置数据集相关参数
+    config.mode = args.mode
+    config.expr_name = args.dataset
+    config.data_path = dataset_info['path']
+    config.slide_val = dataset_info['val_slides']
+    config.slide_test = dataset_info['test_slides']
+    config.encoder_name = encoder_name
+    config.use_augmented = getattr(args, 'use_augmented', True)
+    config.expand_augmented = getattr(args, 'expand_augmented', True)
+    
+    # 设置多GPU参数
+    config.devices = devices
+    config.strategy = strategy
+    config.sync_batchnorm = sync_batchnorm
+    
+    # 设置时间戳和配置路径
+    config.GENERAL.current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    config.config = 'built-in'  # 标记为内置配置
+    
+    print(f"✅ 配置构建完成:")
+    print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
+    print(f"   - 模型: {args.model}")
+    print(f"   - 编码器: {encoder_name} (特征维度: {ENCODER_FEATURE_DIMS[encoder_name]})")
+    print(f"   - GPU: {devices}个 (策略: {strategy})")
+    print(f"   - 训练轮数: {config.TRAINING.num_epochs}")
+    print(f"   - 批次大小: {config.DATA.train_dataloader.batch_size}")
+    print(f"   - 学习率: {config.TRAINING.learning_rate}")
+    
+    return config
+
+
+
+
+
+
 
 
 def main(config):
@@ -104,14 +343,59 @@ def main(config):
     print(f'callbacks: {callbacks}')
 
     print(f'intializing trainer...')
+    
+    # Configure multi-GPU training strategy based on user selection
+    # DDP (DistributedDataParallel) is the recommended strategy for multi-GPU training
+    # as it provides better performance and memory efficiency compared to DataParallel
+    strategy_config = config.strategy
+    if config.devices > 1 and config.strategy == 'ddp':
+        # Configure DDP strategy with advanced optimization parameters
+        from pytorch_lightning.strategies import DDPStrategy
+        strategy_config = DDPStrategy(
+            # find_unused_parameters: Set to False for better performance when all parameters are used
+            # Setting to True can help with debugging but may slow down training
+            find_unused_parameters=getattr(getattr(config, 'MULTI_GPU', None), 'find_unused_parameters', False),
+            # gradient_as_bucket_view: Memory optimization that reduces GPU memory usage
+            # by storing gradients as views into buckets rather than separate tensors
+            gradient_as_bucket_view=True,
+            # static_graph: Set to False to support dynamic computational graphs
+            # Required for models with conditional execution paths
+            static_graph=False
+        )
+        print(f"配置DDP策略: find_unused_parameters={getattr(getattr(config, 'MULTI_GPU', None), 'find_unused_parameters', False)}")
+    
+    # Configure gradient accumulation for handling large effective batch sizes
+    # When GPU memory is limited, gradient accumulation allows training with larger
+    # effective batch sizes by accumulating gradients over multiple mini-batches
+    accumulate_grad_batches = 1
+    if hasattr(config, 'MULTI_GPU') and hasattr(config.MULTI_GPU, 'accumulate_grad_batches'):
+        accumulate_grad_batches = config.MULTI_GPU.accumulate_grad_batches
+    
+    # Initialize PyTorch Lightning Trainer with multi-GPU optimizations
     trainer = pl.Trainer(
-        accelerator='gpu',
-        devices=1,
-        max_epochs=config.TRAINING.num_epochs,
-        logger=logger,
-        check_val_every_n_epoch=1,
-        callbacks=callbacks,
-        precision= '16-mixed',
+        # Hardware configuration
+        accelerator='gpu',  # Use GPU acceleration
+        devices=config.devices,  # Number of GPUs to use
+        max_epochs=config.TRAINING.num_epochs,  # Maximum training epochs
+        
+        # Logging and monitoring
+        logger=logger,  # TensorBoard/WandB logger for experiment tracking
+        check_val_every_n_epoch=1,  # Validate after every epoch
+        callbacks=callbacks,  # Early stopping, checkpointing, etc.
+        
+        # Training optimizations
+        precision='16-mixed',  # Mixed precision training for faster training and reduced memory
+        strategy=strategy_config,  # Multi-GPU training strategy (DDP/DP)
+        sync_batchnorm=config.sync_batchnorm,  # Synchronize BatchNorm statistics across GPUs
+        accumulate_grad_batches=accumulate_grad_batches,  # Gradient accumulation steps
+        
+        # Progress monitoring and debugging options
+        enable_progress_bar=True,  # Show training progress bar
+        log_every_n_steps=50,  # Log metrics every N training steps
+        gradient_clip_val=getattr(config.TRAINING, 'gradient_clip_val', 1.0),  # Gradient clipping for stability
+        
+        # Reproducibility settings
+        deterministic=False,  # Set to True for fully deterministic training (may impact performance)
     )
 
     print(f'trainer: {trainer}')
@@ -126,79 +410,7 @@ if __name__ == '__main__':
     parser = get_parse()
     args = parser.parse_args()
     
-    # 验证参数
-    args = validate_args(args)
-
-    config = load_config(args.config)
-    
-    # 更新配置对象
-    config.mode = args.mode
-    config.expr_name = args.expr_name
-    config.data_path = args.data_path
-    config.slide_val = args.slide_val
-    config.slide_test = args.slide_test
-    config.encoder_name = args.encoder_name
-    config.use_augmented = args.use_augmented
-    config.expand_augmented = args.expand_augmented
-    config.aug_strategy = args.aug_strategy
-    config.config = args.config
-    
-    # 根据编码器类型动态设置特征维度
-    feature_dim = 1024 if args.encoder_name == 'uni' else 512
-    config.MODEL.feature_dim = feature_dim
-    print(f"✅ 根据编码器 '{args.encoder_name}' 设置特征维度为: {feature_dim}")
-    
-    now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    config.GENERAL.current_time = current_time
+    # 构建配置并运行训练
+    config = build_config_from_args(args)
 
     main(config)
-    #test_data_module(config)
-
-    
-
-
-# def test_data_module(cfg):
-#     # 初始化数据模块
-#     data_module = DataInterface(cfg)
-    
-#     # 手动调用 setup 进行测试
-#     data_module.setup('fit')
-    
-#     # 检查数据集是否正确初始化
-#     print(f"Train dataset: {data_module.train_dataset}")
-#     print(f"Val dataset: {data_module.val_dataset}")
-    
-#     # 获取数据加载器并尝试迭代
-#     train_loader = data_module.train_dataloader()
-#     val_loader = data_module.val_dataloader()
-#     batch = next(iter(train_loader))
-#     print(f"Sample batch shape: {[b.shape if hasattr(b, 'shape') else type(b) for b in batch]}")
-
-#      # 打印训练数据的第一个批次
-#     print("\n=== 训练数据批次结构 ===")
-#     train_batch = next(iter(train_loader))
-#     if isinstance(train_batch, dict):
-#         print("训练批次是字典类型")
-#         for key, value in train_batch.items():
-#             if hasattr(value, 'shape'):
-#                 print(f"  - {key}: {value.shape}")
-#             else:
-#                 print(f"  - {key}: {type(value)}")
-#     else:
-#         print(f"训练批次类型: {type(train_batch)}")
-#         print(f"训练批次形状: {[b.shape if hasattr(b, 'shape') else type(b) for b in train_batch]}")
-    
-#     # 打印验证数据的第一个批次
-#     print("\n=== 验证数据批次结构 ===")
-#     val_batch = next(iter(val_loader))
-#     if isinstance(val_batch, dict):
-#         print("验证批次是字典类型")
-#         for key, value in val_batch.items():
-#             if hasattr(value, 'shape'):
-#                 print(f"  - {key}: {value.shape}")
-#             else:
-#                 print(f"  - {key}: {type(value)}")
-#     else:
-#         print(f"验证批次类型: {type(val_batch)}")
-#         print(f"验证批次形状: {[b.shape if hasattr(b, 'shape') else type(b) for b in val_batch]}")

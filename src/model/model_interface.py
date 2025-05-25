@@ -1,6 +1,7 @@
 import os
 import inspect
 import importlib
+import logging
 import numpy as np
 import torch
 import torchmetrics
@@ -18,6 +19,9 @@ from pytorch_lightning.callbacks import BasePredictionWriter
 import torch.nn.functional as F
 
 
+# 设置日志记录器
+logger = logging.getLogger(__name__)
+
 
 class ModelInterface(pl.LightningModule):
 
@@ -26,18 +30,14 @@ class ModelInterface(pl.LightningModule):
         self.config = config
 
         self.save_hyperparameters()
-        
-        self.debug_mode = config.get('debug', False)
 
         self.model_name = config.MODEL.model_name if hasattr(config.MODEL, 'model_name') else None
         self.model_config = config.MODEL
 
-        if self.debug_mode:
-            print(f"Model config: {self.model_config}")
+        logger.debug(f"Model config: {self.model_config}")
         self.model = self.load_model()
 
-        if self.debug_mode:
-            print(f"Model: {self.model}")
+        logger.debug(f"Model: {self.model}")
 
         self.criterion = torch.nn.MSELoss()
 
@@ -57,14 +57,8 @@ class ModelInterface(pl.LightningModule):
         self.avg_pcc = None
 
 
-
-
-
-
-
     def training_step(self, batch, batch_idx):
-         
-        self._debug_print(f'============Training step============')
+        logger.debug('Training step started')
 
         batch = self._preprocess_inputs(batch)
 
@@ -84,12 +78,8 @@ class ModelInterface(pl.LightningModule):
         return loss
 
 
-
-
-
-
     def validation_step(self, batch, batch_idx):
-        self._debug_print(f"\n[DEBUG] ===== 验证步骤 {batch_idx} =====")
+        logger.debug(f"Validation step {batch_idx} started")
         
         # 预处理输入
         batch = self._preprocess_inputs(batch)
@@ -113,7 +103,7 @@ class ModelInterface(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        self._debug_shapes(batch)
+        self._log_tensor_shapes(batch, "Test batch")
         
         batch = self._preprocess_inputs(batch)
 
@@ -123,7 +113,7 @@ class ModelInterface(pl.LightningModule):
         
         # 计算损失和指标
         loss = self._compute_loss(results_dict, batch)
-        self._debug_print(f"[DEBUG] 测试损失: {loss.item():.4f}")
+        logger.debug(f"Test loss: {loss.item():.4f}")
         
         # 更新指标
         self._update_metrics('test', logits, target_genes)
@@ -134,32 +124,77 @@ class ModelInterface(pl.LightningModule):
         return {'logits': logits, 'target_genes': target_genes}
     
     def configure_optimizers(self):
-        weight_decay = float(self.config.TRAINING.get('weight_decay', 0.0))
+        """
+        Configure optimizer and learning rate scheduler with multi-GPU support.
+        
+        This method implements learning rate scaling strategies for multi-GPU training
+        and sets up the AdamW optimizer with ReduceLROnPlateau scheduler.
+        
+        Returns:
+            dict: Dictionary containing optimizer and lr_scheduler configurations
+        """
+        weight_decay = float(getattr(self.config.TRAINING, 'weight_decay', 0.0))
         learning_rate = float(self.config.TRAINING.learning_rate)
         
-        # 配置优化器
+        # Apply learning rate scaling for multi-GPU training
+        # When training with multiple GPUs, the effective batch size increases proportionally
+        # Different scaling strategies help maintain training stability and convergence
+        if hasattr(self.config, 'devices') and self.config.devices > 1:
+            if hasattr(self.config, 'MULTI_GPU') and hasattr(self.config.MULTI_GPU, 'lr_scaling'):
+                lr_scaling = self.config.MULTI_GPU.lr_scaling
+                if lr_scaling == 'linear':
+                    # Linear scaling: lr = base_lr * num_gpus
+                    # Commonly used rule: scale learning rate linearly with batch size
+                    learning_rate = learning_rate * self.config.devices
+                    logger.info(f"多卡训练线性缩放学习率: {learning_rate} (原始: {self.config.TRAINING.learning_rate}, 设备数: {self.config.devices})")
+                elif lr_scaling == 'sqrt':
+                    # Square root scaling: lr = base_lr * sqrt(num_gpus)
+                    # More conservative scaling, often used for very large batch sizes
+                    learning_rate = learning_rate * (self.config.devices ** 0.5)
+                    logger.info(f"多卡训练平方根缩放学习率: {learning_rate} (原始: {self.config.TRAINING.learning_rate}, 设备数: {self.config.devices})")
+                else:
+                    # No scaling: keep original learning rate
+                    # Useful when batch size scaling is handled elsewhere or not needed
+                    logger.info(f"多卡训练不缩放学习率: {learning_rate}")
+        
+        # Initialize AdamW optimizer with weight decay for regularization
+        # AdamW decouples weight decay from gradient-based update, improving generalization
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
         )
         
-        # 配置学习率调度器
+        # Configure ReduceLROnPlateau scheduler for adaptive learning rate adjustment
+        # Reduces learning rate when validation loss plateaus, helping fine-tune convergence
+        lr_scheduler_config = self.config.TRAINING.lr_scheduler
+        
+        # Handle both dict and Namespace types for lr_scheduler configuration
+        if isinstance(lr_scheduler_config, dict):
+            factor = lr_scheduler_config.get('factor', 0.5)
+            patience = lr_scheduler_config.get('patience', 5)
+            mode = lr_scheduler_config.get('mode', 'min')
+        else:
+            factor = getattr(lr_scheduler_config, 'factor', 0.5)
+            patience = getattr(lr_scheduler_config, 'patience', 5)
+            mode = getattr(lr_scheduler_config, 'mode', 'min')
+        
         scheduler = {
             'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
-                mode=self.config.TRAINING.mode,
-                factor=self.config.TRAINING.lr_scheduler.factor,
-                patience=self.config.TRAINING.lr_scheduler.patience,
-                verbose=True
+                mode=self.config.TRAINING.mode,  # 'min' for loss, 'max' for accuracy
+                factor=factor,  # Reduction factor
+                patience=patience,  # Epochs to wait before reduction
+                verbose=True  # Log learning rate changes
             ),
-            'monitor': self.config.TRAINING.monitor,
-            'interval': 'epoch',
-            'frequency': 1
+            'monitor': self.config.TRAINING.monitor,  # Metric to monitor (e.g., 'val_loss')
+            'interval': 'epoch',  # Check at the end of each epoch
+            'frequency': 1  # Check every epoch
         }
         
-        # 添加梯度裁剪
-        self.trainer.gradient_clip_val = self.config.TRAINING.get('gradient_clip_val', 1.0)
+        # Set gradient clipping value for training stability
+        # Prevents exploding gradients by clipping gradient norms above threshold
+        self.trainer.gradient_clip_val = getattr(self.config.TRAINING, 'gradient_clip_val', 1.0)
         
         return {
             'optimizer': optimizer,
@@ -175,13 +210,16 @@ class ModelInterface(pl.LightningModule):
                 with open(gene_file, 'r') as f:
                     genes = [line.strip() for line in f.readlines() if line.strip()]
                 num_outputs = len(genes)
-                print(f"从基因列表文件获取基因数量: {num_outputs}")
-            except:
+                logger.info(f"从基因列表文件获取基因数量: {num_outputs}")
+            except FileNotFoundError:
                 num_outputs = 200  # 默认值
-                print(f"无法读取基因列表文件，使用默认基因数量: {num_outputs}")
+                logger.warning(f"无法读取基因列表文件，使用默认基因数量: {num_outputs}")
+            except Exception as e:
+                num_outputs = 200  # 默认值
+                logger.error(f"读取基因列表文件时出错: {e}，使用默认基因数量: {num_outputs}")
         else:
             num_outputs = 200  # 默认值
-            print(f"配置中无数据路径，使用默认基因数量: {num_outputs}")
+            logger.warning(f"配置中无数据路径，使用默认基因数量: {num_outputs}")
 
         metrics = {
             'mse': MeanSquaredError(num_outputs=num_outputs),
@@ -212,31 +250,29 @@ class ModelInterface(pl.LightningModule):
 
 
     def _preprocess_inputs(self, inputs):
-        """预处理输入数据，适配新的数据格式"""
-        # 处理图像特征
-        if 'img' in inputs and len(inputs['img'].shape) == 5:
-            inputs['img'] = inputs['img'].squeeze(0)
+        """预处理输入数据，简化维度处理"""
+        processed_inputs = {}
         
-        # 处理目标基因（新格式）
-        if 'target_genes' in inputs and len(inputs['target_genes'].shape) == 3:
-            inputs['target_genes'] = inputs['target_genes'].squeeze(0)
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                # 统一处理：如果有多余的batch维度就移除
+                if key in ['img', 'target_genes', 'positions'] and value.dim() > 2:
+                    # 只在确实有多余维度时才squeeze
+                    while value.dim() > 2 and value.size(0) == 1:
+                        value = value.squeeze(0)
+                processed_inputs[key] = value
+            else:
+                processed_inputs[key] = value
         
-        # 处理位置信息
-        if 'positions' in inputs and len(inputs['positions'].shape) == 3:
-            inputs['positions'] = inputs['positions'].squeeze(0)
-        
-        return inputs
+        return processed_inputs
 
 
-    def _debug_print(self, msg):
-        if hasattr(self, 'debug_mode') and self.debug_mode:
-            print(msg)
-
-    def _debug_shapes(self, tensors_dict, prefix=""):
-        if self.debug_mode:
+    def _log_tensor_shapes(self, tensors_dict, prefix=""):
+        """记录张量形状信息到日志"""
+        if logger.isEnabledFor(logging.DEBUG):
             for name, tensor in tensors_dict.items():
                 if isinstance(tensor, torch.Tensor):
-                    print(f"{prefix}{name}: {tensor.shape}")
+                    logger.debug(f"{prefix}{name}: {tensor.shape}")
 
     
 
@@ -275,7 +311,7 @@ class ModelInterface(pl.LightningModule):
                         self.log(f'{stage}_pearson_high_std', high_std, prog_bar=True)
 
         except Exception as e:
-            self._debug_print(f"更新指标时发生错误: {e}")
+            logger.error(f"更新指标时发生错误: {e}")
             raise e
     
     
@@ -336,64 +372,70 @@ class ModelInterface(pl.LightningModule):
             else:
                 camel_name = self.model_name
                 
-            if self.debug_mode:
-                print(f"\n加载模型类：{self.model_name}")
-                print(f"转换后的名称：{camel_name}")
+            logger.debug(f"加载模型类：{self.model_name}")
+            logger.debug(f"转换后的名称：{camel_name}")
             
             # 根据模型名称选择相应的导入路径
             if self.model_name == 'MFBP':
-                print("加载MFBP模型...")
+                logger.info("加载MFBP模型...")
                 Model = getattr(importlib.import_module(
                     f'model.MFBP.MFBP'), 'MFBP')
             else:
                 Model = getattr(importlib.import_module(
                     f'model.{self.model_name.lower()}'), camel_name)
                 
-            if self.debug_mode:
-                print("模型类加载成功")
+            logger.debug("模型类加载成功")
                 
             # 实例化模型
             model = self.instancialize(Model)
             
-            if self.debug_mode:
-                print("模型实例化成功")
+            logger.debug("模型实例化成功")
                 
             return model
             
         except Exception as e:
-            print(f"加载模型时出错：{str(e)}")
+            logger.error(f"加载模型时出错：{str(e)}")
             raise ValueError('Invalid Module File Name or Invalid Class Name!')
 
     def instancialize(self, Model, **other_args):
         try:
             # 获取模型初始化参数
             class_args = inspect.getfullargspec(Model.__init__).args[1:]
-            inkeys = self.model_config.keys()
+            
+            # 处理model_config，支持Namespace和dict两种类型
+            if hasattr(self.model_config, '__dict__'):
+                # Namespace对象，转换为字典
+                model_config_dict = vars(self.model_config)
+                inkeys = model_config_dict.keys()
+            else:
+                # 字典对象
+                model_config_dict = self.model_config
+                inkeys = model_config_dict.keys()
+            
             args1 = {}
             
             # 从配置中获取参数
             for arg in class_args:
                 if arg in inkeys:
-                    args1[arg] = getattr(self.model_config, arg)
+                    args1[arg] = model_config_dict[arg]
                 elif arg == 'config':  # 如果需要config参数，传入完整配置
                     args1[arg] = self.config
                     
             # 添加其他参数
             args1.update(other_args)
             
-            if self.debug_mode:
-                print(f"模型参数：{args1}")
+            logger.debug(f"模型参数：{args1}")
                 
             # 实例化模型
             return Model(**args1)
             
         except Exception as e:
-            print(f"模型实例化失败：{str(e)}")
-            print(f"模型参数：{args1 if 'args1' in locals() else 'Not available'}")
+            logger.error(f"模型实例化失败：{str(e)}")
+            logger.error(f"模型参数：{args1 if 'args1' in locals() else 'Not available'}")
             raise
     
     def on_fit_end(self):
-        print("训练完成")
+        logger.info("训练完成")
 
     def _compute_loss(self, outputs, batch):
         """简化的损失计算 - 只计算基因表达预测损失"""
@@ -410,6 +452,6 @@ class ModelInterface(pl.LightningModule):
         # 计算MSE损失
         loss = self.criterion(logits, target_genes)
         
-        self._debug_print(f"基因表达预测损失: {loss.item():.4f}")
+        logger.debug(f"基因表达预测损失: {loss.item():.4f}")
         
         return loss

@@ -91,101 +91,8 @@ def fix_seed(seed):
     print(f"已设置随机种子：{seed}")
     return seed
 
-def normalize_adata(adata, cpm=False, smooth=False):
-    """标准化基因表达数据
-
-    Args:
-        adata (sc.AnnData): 输入数据
-        cpm (bool): 是否进行CPM标准化
-        smooth (bool): 是否平滑处理
-
-    Returns:
-        sc.AnnData: 标准化后的数据
-    """
-    # 1. CPM标准化
-    if cpm:
-        sc.pp.normalize_total(adata, target_sum=1e6)
-    else:
-        sc.pp.normalize_total(adata)
-    
-    # 2. Log转换
-    sc.pp.log1p(adata)
-    
-    # 3. 基因级别的z-score标准化
-    if sparse.issparse(adata.X):
-        mean = np.mean(adata.X.toarray(), axis=0)
-        std = np.std(adata.X.toarray(), axis=0)
-    else:
-        mean = np.mean(adata.X, axis=0)
-        std = np.std(adata.X, axis=0)
-    
-    # 避免除以0
-    std = np.where(std == 0, 1, std)
-    
-    # 应用标准化
-    if sparse.issparse(adata.X):
-        adata.X = sparse.csr_matrix((adata.X.toarray() - mean) / std)
-    else:
-        adata.X = (adata.X - mean) / std
-    
-    # 4. 如果需要平滑处理
-    if smooth:
-        # 使用高斯平滑
-        from scipy.ndimage import gaussian_filter
-        if sparse.issparse(adata.X):
-            adata.X = sparse.csr_matrix(gaussian_filter(adata.X.toarray(), sigma=1))
-        else:
-            adata.X = gaussian_filter(adata.X, sigma=1)
-    
-    return adata
-
-# Load config
-def load_config(config_name: str):
-    """加载配置文件并处理继承关系
-
-    Args:
-        config_name (str): 配置文件路径
-
-    Returns:
-        Dict: 包含配置的Dict实例
-    """
-    with open(config_name, 'r') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-    
-    # 处理配置继承
-    if 'defaults' in config:
-        base_config_path = os.path.join(os.path.dirname(config_name), config['defaults'][0])
-        with open(base_config_path, 'r') as f:
-            base_config = yaml.load(f, Loader=yaml.FullLoader)
-            
-        # 删除defaults键
-        del config['defaults']
-        
-        # 递归合并配置
-        merged_config = merge_configs(base_config, config)
-        return Dict(merged_config)
-    
-    return Dict(config)
-
-def merge_configs(base, override):
-    """递归合并两个配置字典
-    
-    Args:
-        base: 基础配置字典
-        override: 要覆盖的配置字典
-        
-    Returns:
-        dict: 合并后的配置字典
-    """
-    merged = base.copy()
-    
-    for key, value in override.items():
-        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-            merged[key] = merge_configs(base[key], value)
-        else:
-            merged[key] = value
-            
-    return merged
+# 注意：load_config 和 merge_configs 函数已被移除
+# 现在使用内置的简化配置系统，不再需要外部YAML文件
 
 # Load loggers
 def load_loggers(cfg: Dict):
@@ -204,14 +111,14 @@ def load_loggers(cfg: Dict):
         if isinstance(cfg.GENERAL.log_path, str):
             log_path = cfg.GENERAL.log_path
             
-    current_time = cfg.GENERAL.timestamp
+    current_time = cfg.GENERAL.current_time
     
     # 从配置文件路径获取日志名称
     config_path = Path(cfg.config)
     model_name = config_path.stem  # 获取文件名（不含扩展名）
     
-    # 构建日志路径
-    version_path = f"{model_name}/{current_time}/fold{cfg.DATA.fold}"
+    # 构建日志路径（移除fold概念）
+    version_path = f"{model_name}/{current_time}/{cfg.expr_name}"
     
     # 确保日志目录存在
     Path(log_path).mkdir(exist_ok=True, parents=True)
@@ -221,7 +128,7 @@ def load_loggers(cfg: Dict):
     # Wandb logger
     wandb_logger = pl_loggers.WandbLogger(
         save_dir=log_path,
-        name=f'{model_name}-{current_time}-fold{cfg.DATA.fold}', 
+        name=f'{model_name}-{current_time}-{cfg.expr_name}', 
         project='ST_prediction'
     )
     
@@ -229,7 +136,7 @@ def load_loggers(cfg: Dict):
     csv_logger = pl_loggers.CSVLogger(
         save_dir=log_path,
         name=model_name,
-        version=f'{current_time}/fold{cfg.DATA.fold}'
+        version=f'{current_time}/{cfg.expr_name}'
     )
     
     loggers = [wandb_logger, csv_logger]
@@ -252,25 +159,49 @@ def load_callbacks(cfg: Dict):
     # 处理early stopping配置
     if 'early_stopping' in cfg.CALLBACKS:
         early_stopping_cfg = cfg.CALLBACKS.early_stopping
+        
+        # 处理字典和Namespace两种类型
+        if isinstance(early_stopping_cfg, dict):
+            monitor = early_stopping_cfg['monitor']
+            patience = early_stopping_cfg['patience']
+            mode = early_stopping_cfg['mode']
+            min_delta = early_stopping_cfg.get('min_delta', 0.0)
+        else:
+            monitor = early_stopping_cfg.monitor
+            patience = early_stopping_cfg.patience
+            mode = early_stopping_cfg.mode
+            min_delta = getattr(early_stopping_cfg, 'min_delta', 0.0)
+            
         early_stopping = EarlyStopping(
-            monitor=str(early_stopping_cfg.monitor),  # 确保是字符串
-            patience=int(early_stopping_cfg.patience),  # 确保是整数
-            mode=str(early_stopping_cfg.mode),  # 确保是字符串
-            min_delta=float(early_stopping_cfg.get('min_delta', 0.0))  # 确保是浮点数
+            monitor=str(monitor),  # 确保是字符串
+            patience=int(patience),  # 确保是整数
+            mode=str(mode),  # 确保是字符串
+            min_delta=float(min_delta)  # 确保是浮点数
         )
         Mycallbacks.append(early_stopping)
     
     # 处理model checkpoint配置
     if 'model_checkpoint' in cfg.CALLBACKS:
         ckpt_cfg = cfg.CALLBACKS.model_checkpoint
+        
+        # 处理字典和Namespace两种类型
+        if isinstance(ckpt_cfg, dict):
+            monitor = ckpt_cfg['monitor']
+            save_top_k = ckpt_cfg['save_top_k']
+            mode = ckpt_cfg['mode']
+        else:
+            monitor = ckpt_cfg.monitor
+            save_top_k = ckpt_cfg.save_top_k
+            mode = ckpt_cfg.mode
+            
         # 确保目录存在
         os.makedirs(cfg.GENERAL.log_path, exist_ok=True)
         
         model_checkpoint = ModelCheckpoint(
             dirpath=cfg.GENERAL.log_path,  # 直接使用配置文件中指定的路径
-            monitor=str(ckpt_cfg.monitor),  # 确保是字符串
-            save_top_k=int(ckpt_cfg.save_top_k),  # 确保是整数
-            mode=str(ckpt_cfg.mode),  # 确保是字符串
+            monitor=str(monitor),  # 确保是字符串
+            save_top_k=int(save_top_k),  # 确保是整数
+            mode=str(mode),  # 确保是字符串
             filename='best-epoch={epoch:02d}-{val_mse:.4f}'  # 简化格式，删除多余的val_mse前缀
         )
         Mycallbacks.append(model_checkpoint)

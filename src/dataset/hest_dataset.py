@@ -21,10 +21,27 @@ class STDataset(Dataset):
                  encoder_name: str = 'uni',    # 编码器类型
                  use_augmented: bool = False,  # 是否使用增强
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
-                 aug_strategy: str = 'random', # 3D增强嵌入处理策略
                  normalize: bool = True,       # 数据归一化
                  cpm: bool = True,            # CPM归一化
                  smooth: bool = True):        # 高斯平滑
+        """
+        空间转录组学数据集
+        
+        Args:
+            mode: 数据模式 ('train', 'val', 'test')
+            data_path: 数据集根路径
+            expr_name: 数据集名称 (如 'PRAD')
+            slide_val: 验证集slide IDs，逗号分隔
+            slide_test: 测试集slide IDs，逗号分隔
+            encoder_name: 编码器类型 ('uni' 或 'conch')
+            use_augmented: 是否使用增强嵌入文件
+            expand_augmented: 是否将3D增强嵌入展开为7倍训练样本
+                - True: 每个spot变成7个训练样本 (真正的数据增强)
+                - False: 只使用第一个增强版本 (原图)
+            normalize: 是否进行数据归一化
+            cpm: 是否进行CPM归一化
+            smooth: 是否进行高斯平滑
+        """
         super(STDataset, self).__init__()
         
         # 验证输入参数
@@ -33,17 +50,14 @@ class STDataset(Dataset):
         
         if encoder_name not in ['uni', 'conch']:
             raise ValueError(f"encoder_name must be one of ['uni', 'conch'], but got {encoder_name}")
-            
-        if aug_strategy not in ['random', 'mean', 'attention', 'first', 'all']:
-            raise ValueError(f"aug_strategy must be one of ['random', 'mean', 'attention', 'first', 'all'], but got {aug_strategy}")
         
         # expand_augmented只在use_augmented=True且mode='train'时有效
         if expand_augmented and not use_augmented:
-            print("警告: expand_augmented=True但use_augmented=False，将被忽略")
+            print("⚠️  警告: expand_augmented=True但use_augmented=False，将被忽略")
             expand_augmented = False
         
         if expand_augmented and mode != 'train':
-            print("警告: expand_augmented只在训练模式有效，其他模式将使用取平均")
+            print("⚠️  警告: expand_augmented只在训练模式有效，其他模式将使用第一个增强版本")
             expand_augmented = False
         
         self.mode = mode
@@ -52,7 +66,6 @@ class STDataset(Dataset):
         self.encoder_name = encoder_name
         self.use_augmented = use_augmented
         self.expand_augmented = expand_augmented
-        self.aug_strategy = aug_strategy
         self.norm_param = {'normalize': normalize, 'cpm': cpm, 'smooth': smooth}
         
         # 构建路径
@@ -63,12 +76,21 @@ class STDataset(Dataset):
         emb_suffix = "_aug" if use_augmented else ""
         self.emb_dir = f"{self.processed_dir}/1spot_{encoder_name}_ebd{emb_suffix}"
         
-        print(f"初始化STDataset:")
+        # 打印初始化信息
+        print(f"🔧 初始化STDataset:")
         print(f"  - 模式: {mode}")
         print(f"  - 数据路径: {data_path}")
         print(f"  - 数据集名称: {expr_name}")
         print(f"  - 编码器: {encoder_name}")
         print(f"  - 使用增强: {use_augmented}")
+        
+        if self.expand_augmented:
+            print(f"  - 🚀 增强模式: 7倍样本展开 (每个spot变成7个训练样本)")
+        elif self.use_augmented:
+            print(f"  - 📊 增强模式: 只使用第一个增强版本 (原图)")
+        else:
+            print(f"  - 🔧 标准模式: 使用原始2D嵌入")
+        
         print(f"  - ST目录: {self.st_dir}")
         print(f"  - 嵌入目录: {self.emb_dir}")
         
@@ -89,7 +111,7 @@ class STDataset(Dataset):
         if self.mode == 'train':
             self._init_train_mode()
         
-        print(f"STDataset初始化完成")
+        print(f"✅ STDataset初始化完成")
 
     def load_gene_list(self) -> List[str]:
         """从selected_gene_list.txt读取基因列表"""
@@ -99,7 +121,7 @@ class STDataset(Dataset):
             raise FileNotFoundError(f"基因列表文件不存在: {gene_file}")
         
         try:
-            with open(gene_file, 'r') as f:
+            with open(gene_file, 'r', encoding='utf-8') as f:
                 genes = [line.strip() for line in f.readlines() if line.strip()]
             
             if len(genes) == 0:
@@ -108,28 +130,36 @@ class STDataset(Dataset):
             print(f"从{gene_file}加载{len(genes)}个基因")
             return genes
             
-        except Exception as e:
-            raise ValueError(f"读取基因列表失败: {e}")
+        except UnicodeDecodeError as e:
+            raise ValueError(f"基因列表文件编码错误: {gene_file}, 错误: {e}")
+        except PermissionError as e:
+            raise PermissionError(f"没有权限读取基因列表文件: {gene_file}, 错误: {e}")
+        except IOError as e:
+            raise IOError(f"读取基因列表文件时发生IO错误: {gene_file}, 错误: {e}")
 
     def load_slide_splits(self, slide_val: str, slide_test: str) -> Dict[str, List[str]]:
         """加载和划分slides"""
         # 读取所有slide列表
         slide_file = f"{self.processed_dir}/all_slide_lst.txt"
-        
+
         if not os.path.exists(slide_file):
             raise FileNotFoundError(f"Slide列表文件不存在: {slide_file}")
         
-        try:
-            with open(slide_file, 'r') as f:
+        try: 
+            with open(slide_file, 'r', encoding='utf-8') as f:
                 all_slides = [line.strip() for line in f.readlines() if line.strip()]
             
             if len(all_slides) == 0:
                 raise ValueError(f"Slide列表为空: {slide_file}")
             
             print(f"从{slide_file}加载{len(all_slides)}个slides")
-            
-        except Exception as e:
-            raise ValueError(f"读取slide列表失败: {e}")
+        
+        except UnicodeDecodeError as e:
+            raise ValueError(f"Slide列表文件编码错误: {slide_file}, 错误: {e}")
+        except PermissionError as e:
+            raise PermissionError(f"没有权限读取Slide列表文件: {slide_file}, 错误: {e}")
+        except IOError as e:
+            raise IOError(f"读取Slide列表文件时发生IO错误: {slide_file}, 错误: {e}")
         
         # 解析验证集和测试集slides
         val_slides = [s.strip() for s in slide_val.split(',') if s.strip()] if slide_val else []
@@ -139,7 +169,7 @@ class STDataset(Dataset):
         all_slides_set = set(all_slides)
         for slide in val_slides + test_slides:
             if slide not in all_slides_set:
-                raise ValueError(f"指定的slide ID不存在: {slide}")
+                raise ValueError(f"指定的slide ID不存在: {slide}, 可用的slides: {sorted(all_slides)}")
         
         # 检查重复
         overlap = set(val_slides) & set(test_slides)
@@ -246,18 +276,15 @@ class STDataset(Dataset):
             print(f"  - 原始spot数量: {original_total}")
             print(f"  - 扩展倍数: {self.cumlen[-1] / original_total:.1f}x")
 
-    def load_emb(self, slide_id: str, idx: Optional[int] = None, aug_strategy: str = 'random') -> torch.Tensor:
+    def load_emb(self, slide_id: str, idx: Optional[int] = None, mode: str = 'first') -> torch.Tensor:
         """加载嵌入特征
         
         Args:
             slide_id: slide标识符
             idx: spot索引，如果None则返回所有spots
-            aug_strategy: 3D增强嵌入的处理策略
-                - 'random': 随机选择一个增强版本 (推荐)
-                - 'mean': 取平均 (原方案)
-                - 'attention': 使用注意力机制加权
+            mode: 3D增强嵌入的处理模式
                 - 'first': 使用第一个增强版本 (原图)
-                - 'all': 返回所有7个版本 (用于特殊处理)
+                - 'all': 返回所有7个版本 (用于expand_augmented)
         """
         # 构建文件名，增强嵌入需要添加_aug后缀
         if self.use_augmented:
@@ -273,38 +300,21 @@ class STDataset(Dataset):
             emb = torch.load(emb_file, weights_only=True)
             
             if not isinstance(emb, torch.Tensor):
-                raise ValueError(f"嵌入文件格式错误，期望torch.Tensor，得到{type(emb)}")
+                raise TypeError(f"嵌入文件格式错误，期望torch.Tensor，得到{type(emb)}")
             
             # 处理不同的tensor维度
             if len(emb.shape) == 3:
                 # 3D tensor: [num_spots, num_augmentations, feature_dim]
-                print(f"检测到3D增强嵌入格式: {emb.shape} -> 使用'{aug_strategy}'策略处理")
-                
-                if aug_strategy == 'random':
-                    # 随机选择一个增强版本 (推荐方案)
-                    aug_idx = torch.randint(0, emb.shape[1], (emb.shape[0],))  # [num_spots]
-                    emb = emb[torch.arange(emb.shape[0]), aug_idx]  # [num_spots, feature_dim]
-                    
-                elif aug_strategy == 'mean':
-                    # 取平均 (原方案)
-                    emb = emb.mean(dim=1)  # [num_spots, feature_dim]
-                    
-                elif aug_strategy == 'attention':
-                    # 使用简单注意力机制加权组合
-                    # 计算每个增强版本的重要性权重
-                    weights = torch.softmax(emb.mean(dim=-1), dim=-1)  # [num_spots, num_augmentations]
-                    emb = (emb * weights.unsqueeze(-1)).sum(dim=1)  # [num_spots, feature_dim]
-                    
-                elif aug_strategy == 'first':
-                    # 使用第一个增强版本（通常是原图）
+                if mode == 'first':
+                    # 使用第一个增强版本（原图）
+                    print(f"检测到3D增强嵌入格式: {emb.shape} -> 使用第一个增强版本")
                     emb = emb[:, 0, :]  # [num_spots, feature_dim]
-                    
-                elif aug_strategy == 'all':
-                    # 返回所有增强版本 (用于特殊处理)
+                elif mode == 'all':
+                    # 返回所有增强版本 (用于expand_augmented)
+                    print(f"检测到3D增强嵌入格式: {emb.shape} -> 保留所有增强版本")
                     pass  # 保持原始3D格式
-                    
                 else:
-                    raise ValueError(f"不支持的增强策略: {aug_strategy}")
+                    raise ValueError(f"不支持的模式: {mode}，只支持 'first' 或 'all'")
                     
             elif len(emb.shape) == 2:
                 # 2D tensor: [num_spots, feature_dim] (标准格式)
@@ -322,13 +332,21 @@ class STDataset(Dataset):
             if idx is not None:
                 if idx >= emb.shape[0]:
                     raise IndexError(f"索引越界: {idx} >= {emb.shape[0]}")
-                if aug_strategy == 'all' and len(emb.shape) == 3:
+                if mode == 'all' and len(emb.shape) == 3:
                     return emb[idx]  # [num_augmentations, feature_dim]
                 else:
                     return emb[idx]  # [feature_dim]
             else:
                 return emb  # [num_spots, feature_dim] 或 [num_spots, num_augmentations, feature_dim]
                 
+        except FileNotFoundError:
+            raise FileNotFoundError(f"嵌入文件不存在: {emb_file}")
+        except PermissionError as e:
+            raise PermissionError(f"没有权限读取嵌入文件: {emb_file}, 错误: {e}")
+        except torch.serialization.pickle.UnpicklingError as e:
+            raise ValueError(f"嵌入文件损坏或格式不正确: {emb_file}, 错误: {e}")
+        except RuntimeError as e:
+            raise RuntimeError(f"加载嵌入文件时发生运行时错误: {emb_file}, 错误: {e}")
         except Exception as e:
             raise ValueError(f"加载嵌入文件失败 {emb_file}: {e}")
 
@@ -469,7 +487,7 @@ class STDataset(Dataset):
             }
         else:
             # 原有模式：动态加载
-            features = self.load_emb(slide_id, sample_idx, self.aug_strategy)  # [feature_dim]
+            features = self.load_emb(slide_id, sample_idx, 'first')  # [feature_dim]
             
             # 加载基因表达
             adata = self.adata_dict[slide_id]
@@ -496,7 +514,7 @@ class STDataset(Dataset):
         slide_id = self.int2id[index]
         
         # 加载嵌入特征
-        features = self.load_emb(slide_id, None, self.aug_strategy)  # [num_spots, feature_dim]
+        features = self.load_emb(slide_id, None, 'first')  # [num_spots, feature_dim]
         
         # 加载ST数据
         adata = self.load_st(slide_id, self.genes, **self.norm_param)

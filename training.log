@@ -1,0 +1,402 @@
+2025-05-25 15:51:00,437 - __main__ - ERROR - Configuration system not properly set up: Required configuration directory not found: config/config/base
+Please ensure the hierarchical config structure is set up correctly.
+2025-05-25 15:51:00,437 - __main__ - ERROR - Please ensure the hierarchical config structure exists in the 'config' directory
+2025-05-25 15:55:45,958 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:55:58,427 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:56:10,062 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:56:10,188 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 15:56:10,188 - __main__ - INFO - Auto-detected 4 GPUs, using 4
+2025-05-25 15:56:10,189 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 15:56:10,190 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 15:56:10,190 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:56:10,190 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 15:56:10,198 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 15:56:10,198 - __main__ - INFO - Dry run mode - showing configuration:
+2025-05-25 15:56:10,198 - __main__ - INFO - Model: MFBP
+2025-05-25 15:56:10,198 - __main__ - INFO - Dataset: PRAD
+2025-05-25 15:56:10,198 - __main__ - INFO - GPUs: 4
+2025-05-25 15:56:10,198 - __main__ - INFO - Strategy: ddp
+2025-05-25 15:56:10,198 - __main__ - INFO - Epochs: 200
+2025-05-25 15:56:10,198 - __main__ - INFO - Batch size: 256
+2025-05-25 15:56:10,198 - __main__ - INFO - 🎯 Training Summary: 1/1 datasets completed successfully
+2025-05-25 15:56:10,198 - __main__ - INFO - 🎉 All training tasks completed successfully!
+2025-05-25 15:57:45,724 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:57:45,854 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 15:57:45,854 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 15:57:45,856 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 15:57:45,856 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 15:57:45,856 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:57:45,856 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 15:57:45,864 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 15:57:45,865 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 15:57:45,867 - model.model_interface - ERROR - 加载模型时出错：argument of type 'NoneType' is not iterable
+2025-05-25 15:57:45,867 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: Invalid Module File Name or Invalid Class Name!
+2025-05-25 15:57:45,867 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 358, in load_model
+    if '_' in self.model_name:
+TypeError: argument of type 'NoneType' is not iterable
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 218, in main
+    model = ModelInterface(config)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 38, in __init__
+    self.model = self.load_model()
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 386, in load_model
+    raise ValueError('Invalid Module File Name or Invalid Class Name!')
+ValueError: Invalid Module File Name or Invalid Class Name!
+2025-05-25 15:57:45,868 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 15:57:45,868 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 15:57:45,868 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 15:59:33,345 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:59:33,468 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 15:59:33,468 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 15:59:33,470 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 15:59:33,470 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 15:59:33,470 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 15:59:33,470 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 15:59:33,476 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 15:59:33,476 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 15:59:33,478 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 15:59:33,478 - model.model_interface - ERROR - 模型实例化失败：'Namespace' object has no attribute 'keys'
+2025-05-25 15:59:33,478 - model.model_interface - ERROR - 模型参数：Not available
+2025-05-25 15:59:33,478 - model.model_interface - ERROR - 加载模型时出错：'Namespace' object has no attribute 'keys'
+2025-05-25 15:59:33,478 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: Invalid Module File Name or Invalid Class Name!
+2025-05-25 15:59:33,478 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 378, in load_model
+    model = self.instancialize(Model)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 392, in instancialize
+    inkeys = self.model_config.keys()
+AttributeError: 'Namespace' object has no attribute 'keys'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 218, in main
+    model = ModelInterface(config)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 38, in __init__
+    self.model = self.load_model()
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 386, in load_model
+    raise ValueError('Invalid Module File Name or Invalid Class Name!')
+ValueError: Invalid Module File Name or Invalid Class Name!
+2025-05-25 15:59:33,479 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 15:59:33,479 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 15:59:33,479 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:00:07,200 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:00:07,336 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:00:07,336 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:00:07,338 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:00:07,338 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:00:07,338 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:00:07,338 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:00:07,347 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:00:07,347 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:00:07,349 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:00:07,408 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:00:07,416 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'Namespace' object has no attribute 'config'
+2025-05-25 16:00:07,416 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 222, in main
+    logger = load_loggers(config)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/utils.py", line 162, in load_loggers
+    config_path = Path(cfg.config)
+AttributeError: 'Namespace' object has no attribute 'config'
+2025-05-25 16:00:07,417 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:00:07,417 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:00:07,417 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:00:46,139 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:00:46,267 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:00:46,267 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:00:46,269 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:00:46,269 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:00:46,269 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:00:46,269 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:00:46,278 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:00:46,278 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:00:46,280 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:00:46,341 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:00:46,352 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'dict' object has no attribute 'monitor'
+2025-05-25 16:00:46,352 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 226, in main
+    callbacks = load_callbacks(config)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/utils.py", line 208, in load_callbacks
+    monitor=str(early_stopping_cfg.monitor),  # 确保是字符串
+AttributeError: 'dict' object has no attribute 'monitor'
+2025-05-25 16:00:46,354 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:00:46,354 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:00:46,354 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:01:50,262 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:01:50,376 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:01:50,377 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:01:50,378 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:01:50,378 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:01:50,378 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:01:50,378 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:01:50,384 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:01:50,384 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:01:50,386 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:01:50,434 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:01:50,444 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'Namespace' object has no attribute 'get'
+2025-05-25 16:01:50,444 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 279, in main
+    gradient_clip_val=config.TRAINING.get('gradient_clip_val', 1.0),  # Gradient clipping for stability
+AttributeError: 'Namespace' object has no attribute 'get'
+2025-05-25 16:01:50,444 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:01:50,445 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:01:50,445 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:03:07,845 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:03:07,979 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:03:07,980 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:03:07,982 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:03:07,982 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:03:07,982 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:03:07,982 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:03:07,995 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:03:07,996 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:03:07,999 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:03:08,087 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:03:20,817 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'Namespace' object has no attribute 'get'
+2025-05-25 16:03:20,817 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 289, in main
+    trainer.fit(model, datamodule=dataset)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 539, in fit
+    call._call_and_handle_interrupt(
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 47, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 575, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 958, in _run
+    self.strategy.setup(self)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 159, in setup
+    self.setup_optimizers(trainer)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 139, in setup_optimizers
+    self.optimizers, self.lr_scheduler_configs = _init_optimizers_and_lr_schedulers(self.lightning_module)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/core/optimizer.py", line 180, in _init_optimizers_and_lr_schedulers
+    optim_conf = call._call_lightning_module_hook(model.trainer, "configure_optimizers", pl_module=model)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 171, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 136, in configure_optimizers
+    weight_decay = float(self.config.TRAINING.get('weight_decay', 0.0))
+AttributeError: 'Namespace' object has no attribute 'get'
+2025-05-25 16:03:20,819 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:03:20,819 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:03:20,819 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:04:10,430 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:04:10,561 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:04:10,562 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:04:10,564 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:04:10,564 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:04:10,564 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:04:10,564 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:04:10,573 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:04:10,573 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:04:10,575 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:04:10,642 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:04:22,220 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'Namespace' object has no attribute 'mode'
+2025-05-25 16:04:22,221 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 289, in main
+    trainer.fit(model, datamodule=dataset)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 539, in fit
+    call._call_and_handle_interrupt(
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 47, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 575, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 958, in _run
+    self.strategy.setup(self)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 159, in setup
+    self.setup_optimizers(trainer)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 139, in setup_optimizers
+    self.optimizers, self.lr_scheduler_configs = _init_optimizers_and_lr_schedulers(self.lightning_module)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/core/optimizer.py", line 180, in _init_optimizers_and_lr_schedulers
+    optim_conf = call._call_lightning_module_hook(model.trainer, "configure_optimizers", pl_module=model)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 171, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 173, in configure_optimizers
+    mode=self.config.TRAINING.mode,  # 'min' for loss, 'max' for accuracy
+AttributeError: 'Namespace' object has no attribute 'mode'
+2025-05-25 16:04:22,222 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:04:22,222 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:04:22,223 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:08:29,809 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:08:29,938 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:08:29,938 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:08:29,940 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:08:29,940 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:08:29,940 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:08:29,940 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:08:29,948 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:08:29,948 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:08:29,950 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:08:30,018 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:08:40,961 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'Namespace' object has no attribute 'mode'
+2025-05-25 16:08:40,963 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 289, in main
+    trainer.fit(model, datamodule=dataset)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 539, in fit
+    call._call_and_handle_interrupt(
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 47, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 575, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 958, in _run
+    self.strategy.setup(self)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 159, in setup
+    self.setup_optimizers(trainer)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 139, in setup_optimizers
+    self.optimizers, self.lr_scheduler_configs = _init_optimizers_and_lr_schedulers(self.lightning_module)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/core/optimizer.py", line 180, in _init_optimizers_and_lr_schedulers
+    optim_conf = call._call_lightning_module_hook(model.trainer, "configure_optimizers", pl_module=model)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 171, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 173, in configure_optimizers
+    mode=self.config.TRAINING.mode,  # 'min' for loss, 'max' for accuracy
+AttributeError: 'Namespace' object has no attribute 'mode'
+2025-05-25 16:08:40,965 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:08:40,965 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:08:40,965 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:09:47,726 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:09:47,851 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:09:47,852 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:09:47,855 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:09:47,855 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:09:47,855 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:09:47,855 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:09:47,864 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:09:47,864 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:09:47,866 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:09:47,931 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:09:59,572 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'dict' object has no attribute 'factor'
+2025-05-25 16:09:59,573 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 289, in main
+    trainer.fit(model, datamodule=dataset)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 539, in fit
+    call._call_and_handle_interrupt(
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 47, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 575, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 958, in _run
+    self.strategy.setup(self)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 159, in setup
+    self.setup_optimizers(trainer)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/strategies/strategy.py", line 139, in setup_optimizers
+    self.optimizers, self.lr_scheduler_configs = _init_optimizers_and_lr_schedulers(self.lightning_module)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/core/optimizer.py", line 180, in _init_optimizers_and_lr_schedulers
+    optim_conf = call._call_lightning_module_hook(model.trainer, "configure_optimizers", pl_module=model)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 171, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/model/model_interface.py", line 174, in configure_optimizers
+    factor=self.config.TRAINING.lr_scheduler.factor,  # Reduction factor
+AttributeError: 'dict' object has no attribute 'factor'
+2025-05-25 16:09:59,574 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:09:59,574 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:09:59,574 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:10:39,331 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:10:39,460 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:10:39,461 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:10:39,462 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:10:39,462 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:10:39,462 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:10:39,462 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:10:39,471 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:10:39,472 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:10:39,474 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:10:39,535 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:10:49,971 - __main__ - ERROR - ❌ Training failed for MFBP on PRAD: 'dict' object has no attribute 'batch_size'
+2025-05-25 16:10:49,972 - __main__ - ERROR - Full error traceback:
+Traceback (most recent call last):
+  File "/home/ouyangjiarui/project/ST/MFBP/train.py", line 360, in train_single_dataset
+    model = train_main(config_namespace)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/main.py", line 289, in main
+    trainer.fit(model, datamodule=dataset)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 539, in fit
+    call._call_and_handle_interrupt(
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 47, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 575, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 982, in _run
+    results = self._run_stage()
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 1024, in _run_stage
+    self._run_sanity_check()
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/trainer.py", line 1053, in _run_sanity_check
+    val_loop.run()
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/loops/utilities.py", line 179, in _decorator
+    return loop_run(self, *args, **kwargs)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/loops/evaluation_loop.py", line 119, in run
+    self.setup_data()
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/loops/evaluation_loop.py", line 175, in setup_data
+    dataloaders = _request_dataloader(source)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/connectors/data_connector.py", line 326, in _request_dataloader
+    return data_source.dataloader()
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/connectors/data_connector.py", line 293, in dataloader
+    return call._call_lightning_datamodule_hook(self.instance.trainer, self.name)
+  File "/home/ouyangjiarui/mambaforge/envs/TRIP/lib/python3.9/site-packages/pytorch_lightning/trainer/call.py", line 193, in _call_lightning_datamodule_hook
+    return fn(*args, **kwargs)
+  File "/home/ouyangjiarui/project/ST/MFBP/src/dataset/data_interface.py", line 97, in val_dataloader
+    print(f"创建验证DataLoader: batch_size={val_config.batch_size}")
+AttributeError: 'dict' object has no attribute 'batch_size'
+2025-05-25 16:10:49,973 - __main__ - ERROR - Training failed for dataset: PRAD
+2025-05-25 16:10:49,973 - __main__ - INFO - 🎯 Training Summary: 0/1 datasets completed successfully
+2025-05-25 16:10:49,974 - __main__ - ERROR - ⚠️  1 training tasks failed
+2025-05-25 16:12:01,120 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:12:01,245 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:12:01,245 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:12:01,247 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:12:01,247 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:12:01,247 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:12:01,247 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:12:01,254 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:12:01,255 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:12:01,256 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:12:01,305 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:13:44,498 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:13:44,617 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:13:44,617 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:13:44,618 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:13:44,618 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:13:44,619 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:13:44,619 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:13:44,627 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:13:44,628 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:13:44,630 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:13:44,693 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
+2025-05-25 16:14:18,343 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:14:18,483 - __main__ - INFO - Hardware detection: 4 GPUs available
+2025-05-25 16:14:18,483 - __main__ - INFO - Test run mode: Using minimal epochs and batch size
+2025-05-25 16:14:18,485 - __main__ - INFO - 📊 Processing dataset PRAD (1/1)
+2025-05-25 16:14:18,485 - __main__ - INFO - 🚀 Starting training: MFBP on PRAD
+2025-05-25 16:14:18,485 - src.simple_config - INFO - SimpleConfigManager initialized with root: config
+2025-05-25 16:14:18,485 - src.simple_config - INFO - Building config for MFBP + PRAD
+2025-05-25 16:14:18,495 - src.simple_config - INFO - Configuration built successfully
+2025-05-25 16:14:18,495 - __main__ - INFO - Configuration loaded successfully for MFBP + PRAD
+2025-05-25 16:14:18,498 - model.model_interface - INFO - 加载MFBP模型...
+2025-05-25 16:14:18,563 - model.model_interface - INFO - 从基因列表文件获取基因数量: 200
