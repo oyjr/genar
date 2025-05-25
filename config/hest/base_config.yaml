@@ -1,0 +1,62 @@
+GENERAL:
+  seed: 2021
+  log_path: ./logs/hest
+  debug: false
+
+MODEL:
+  model_name: MFBP
+  num_genes: 200
+  feature_dim: 1024  # 默认值，会根据编码器类型动态覆盖: UNI=1024, CONCH=512
+
+DATA:
+  # 数据归一化设置
+  normalize: True
+  cpm: True
+  smooth: True
+  
+  # 数据加载器配置
+  train_dataloader:
+    batch_size: 32
+    num_workers: 2
+    pin_memory: True
+    shuffle: True
+    
+  val_dataloader:
+    batch_size: 1
+    num_workers: 2
+    pin_memory: True
+    shuffle: False
+    
+  test_dataloader:
+    batch_size: 1
+    num_workers: 2
+    pin_memory: True
+    shuffle: False
+
+TRAINING:
+  num_epochs: 200
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  mode: min
+  monitor: val_loss
+  lr_scheduler:
+    monitor: val_loss
+    patience: 5
+    factor: 0.5
+    mode: min
+  gradient_clip_val: 1.0
+    
+CALLBACKS:
+  early_stopping:
+    monitor: val_loss
+    patience: 10
+    mode: min
+    min_delta: 0.0
+  model_checkpoint:
+    monitor: 'val_loss'
+    save_top_k: 1
+    mode: 'min'
+    filename: 'epoch={epoch}-val_loss={val_loss:.4f}'
+    
+  learning_rate_monitor:
+    logging_interval: 'epoch' 
