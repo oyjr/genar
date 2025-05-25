@@ -70,9 +70,7 @@ DEFAULT_CONFIG = {
         'debug': False
     },
     'DATA': {
-        'normalize': True,
-        'cpm': True,
-        'smooth': True,
+        'normalize': True,  # STEm方式: log2(+1)变换
         'train_dataloader': {
             'batch_size': 256,
             'num_workers': 4,

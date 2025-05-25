@@ -39,8 +39,6 @@ class DataInterface(pl.LightningDataModule):
             'encoder_name': self.config.encoder_name,
             'use_augmented': self.config.use_augmented,
             'normalize': self.config.DATA.normalize,
-            'cpm': self.config.DATA.cpm,
-            'smooth': self.config.DATA.smooth,
         }
         
         print(f"基础参数配置: {base_params}")

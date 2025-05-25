@@ -21,9 +21,7 @@ class STDataset(Dataset):
                  encoder_name: str = 'uni',    # 编码器类型
                  use_augmented: bool = False,  # 是否使用增强
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
-                 normalize: bool = True,       # 数据归一化
-                 cpm: bool = True,            # CPM归一化
-                 smooth: bool = True):        # 高斯平滑
+                 normalize: bool = True):      # 数据归一化 (STEm方式: log2(+1))
         """
         空间转录组学数据集
         
@@ -38,9 +36,7 @@ class STDataset(Dataset):
             expand_augmented: 是否将3D增强嵌入展开为7倍训练样本
                 - True: 每个spot变成7个训练样本 (真正的数据增强)
                 - False: 只使用第一个增强版本 (原图)
-            normalize: 是否进行数据归一化
-            cpm: 是否进行CPM归一化
-            smooth: 是否进行高斯平滑
+            normalize: 是否进行数据归一化 (STEm方式: log2(+1))
         """
         super(STDataset, self).__init__()
         
@@ -66,7 +62,7 @@ class STDataset(Dataset):
         self.encoder_name = encoder_name
         self.use_augmented = use_augmented
         self.expand_augmented = expand_augmented
-        self.norm_param = {'normalize': normalize, 'cpm': cpm, 'smooth': smooth}
+        self.norm_param = {'normalize': normalize}
         
         # 构建路径
         self.st_dir = f"{data_path}st"
@@ -387,40 +383,22 @@ class STDataset(Dataset):
                 adata = adata[:, common_genes].copy()
                 print(f"过滤后保留{adata.n_vars}个基因")
             
-            # 数据归一化
+            # 数据归一化 - 遵循STEm的简单标准化方式
             if kwargs.get('normalize', True):
-                print("执行数据归一化...")
+                print("执行数据归一化 (遵循STEm方式)...")
                 
-                # 1. CPM归一化
-                if kwargs.get('cpm', True):
-                    print("  - CPM归一化")
-                    sc.pp.normalize_total(adata, target_sum=1e6, inplace=True)
-                
-                # 2. 对数变换
-                print("  - 对数变换")
-                sc.pp.log1p(adata)
-                
-                # 3. Z-score标准化
-                print("  - Z-score标准化")
+                # STEm方式: 只使用log2(+1)变换
+                print("  - log2(+1)变换 (STEm标准)")
                 if sparse.issparse(adata.X):
                     X = adata.X.toarray()
                 else:
-                    X = adata.X
+                    X = adata.X.copy()
                 
-                gene_mean = X.mean(axis=0)
-                gene_std = X.std(axis=0)
-                gene_std[gene_std == 0] = 1.0
-                
-                X = (X - gene_mean) / gene_std
+                # 应用log2(+1)变换
+                X = np.log2(X + 1)
                 adata.X = sparse.csr_matrix(X) if sparse.issparse(adata.X) else X
                 
-                # 4. 高斯平滑（可选）
-                if kwargs.get('smooth', False):
-                    print("  - 高斯平滑")
-                    if sparse.issparse(adata.X):
-                        adata.X = sparse.csr_matrix(gaussian_filter(adata.X.toarray(), sigma=1))
-                    else:
-                        adata.X = gaussian_filter(adata.X, sigma=1)
+                print(f"  - 标准化完成，数据范围: [{X.min():.4f}, {X.max():.4f}]")
             
             # 保存标准化后的坐标
             adata.obsm['positions'] = coords
