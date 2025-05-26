@@ -155,7 +155,7 @@ Examples:
   
   # With custom parameters
   python src/main.py --dataset PRAD --model MFBP --encoder uni \\
-      --gpus 4 --epochs 200 --batch-size 256 --lr 1e-4
+      --gpus 4 --epochs 200 --batch_size 256 --lr 1e-4
   
   # Single GPU training
   python src/main.py --dataset her2st --gpus 1
@@ -178,7 +178,7 @@ Examples:
                         help='GPU数量 (默认: 1)')
     parser.add_argument('--epochs', type=int,
                         help='训练轮数 (默认: 200)')
-    parser.add_argument('--batch-size', type=int,
+    parser.add_argument('--batch_size', type=int,
                         help='批次大小 (默认: 256)')
     parser.add_argument('--lr', type=float,
                         help='学习率 (默认: 1e-4)')

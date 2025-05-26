@@ -48,13 +48,7 @@ class GeneVisualizer:
                                  save_name: str = "gene_variation_curves",
                                  show_plots: bool = False) -> None:
         """
-        Plot gene variation curves comparing ground truth and predictions.
-        
-        This function creates a 2x2 subplot showing:
-        1. Normalized mean expression comparison
-        2. Absolute mean expression comparison  
-        3. Normalized variance comparison
-        4. Absolute variance comparison
+        Plot gene variation curves following STEm's exact implementation.
         
         Args:
             y_true: Ground truth gene expression [num_spots, num_genes]
@@ -62,80 +56,61 @@ class GeneVisualizer:
             save_name: Name for saved plot file
             show_plots: Whether to display plots interactively
         """
-        fig, axs = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('Gene Expression Variation Analysis', fontsize=16, fontweight='bold')
+        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
         
-        # Calculate statistics
+        # 1. Normalized Mean (STEm approach)
         pred_mean = np.mean(y_pred, axis=0)
-        gt_mean = np.mean(y_true, axis=0)
-        pred_var = np.var(y_pred, axis=0)
-        gt_var = np.var(y_true, axis=0)
-        
-        # 1. Normalized Mean Expression
         pred_mean_norm = pred_mean / np.sum(pred_mean)
+        gt_mean = np.mean(y_true, axis=0)
         gt_mean_norm = gt_mean / np.sum(gt_mean)
         gt_mean_sorted = np.sort(gt_mean_norm)
         pred_mean_sorted = pred_mean_norm[np.argsort(gt_mean_norm)]
-        
-        axs[0, 0].plot(np.arange(len(gt_mean_sorted)), gt_mean_sorted, 
-                      label="Ground Truth", color="blue", linewidth=2)
-        axs[0, 0].scatter(np.arange(len(pred_mean_sorted)), pred_mean_sorted, 
-                         s=8, label="Predicted", color="orange", alpha=0.7)
-        axs[0, 0].set_title("Normalized Mean Expression", fontsize=14, fontweight='bold')
-        axs[0, 0].set_xlabel("Gene Index (ordered by GT mean)")
-        axs[0, 0].set_ylabel("Normalized Mean Expression")
+        axs[0, 0].plot(np.arange(len(gt_mean_sorted)), gt_mean_sorted, label="Ground Truth", c="b")
+        axs[0, 0].scatter(np.arange(len(pred_mean_sorted)), pred_mean_sorted, s=5, label="Predicted", c="orange")
+        axs[0, 0].set_title("Normalized Mean")
+        axs[0, 0].set_xlabel("gene index ordered by mean")
+        axs[0, 0].set_ylabel("normalized mean")
         axs[0, 0].legend()
-        axs[0, 0].grid(True, alpha=0.3)
         
-        # 2. Absolute Mean Expression
+        # 2. Absolute Mean (STEm approach)
         gt_mean_sorted = np.sort(gt_mean)
         pred_mean_sorted = pred_mean[np.argsort(gt_mean)]
-        
-        axs[1, 0].plot(np.arange(len(gt_mean_sorted)), gt_mean_sorted, 
-                      label="Ground Truth", color="blue", linewidth=2)
-        axs[1, 0].scatter(np.arange(len(pred_mean_sorted)), pred_mean_sorted, 
-                         s=8, label="Predicted", color="orange", alpha=0.7)
-        axs[1, 0].set_title("Absolute Mean Expression", fontsize=14, fontweight='bold')
-        axs[1, 0].set_xlabel("Gene Index (ordered by GT mean)")
-        axs[1, 0].set_ylabel("Absolute Mean Expression")
+        axs[1, 0].plot(np.arange(len(gt_mean_sorted)), gt_mean_sorted, label="Ground Truth", c="b")
+        axs[1, 0].scatter(np.arange(len(pred_mean_sorted)), pred_mean_sorted, s=5, label="Predicted", c="orange")
+        axs[1, 0].set_title("Absolute Mean")
+        axs[1, 0].set_xlabel("gene index ordered by mean")
+        axs[1, 0].set_ylabel("absolute mean")
         axs[1, 0].legend()
-        axs[1, 0].grid(True, alpha=0.3)
         
-        # 3. Normalized Variance
+        # 3. Normalized Variance (STEm approach)
+        pred_var = np.var(y_pred, axis=0)
         pred_var_norm = pred_var / np.sum(pred_var)
+        gt_var = np.var(y_true, axis=0)
         gt_var_norm = gt_var / np.sum(gt_var)
         gt_var_sorted = np.sort(gt_var_norm)
         pred_var_sorted = pred_var_norm[np.argsort(gt_var_norm)]
-        
-        axs[0, 1].plot(np.arange(len(gt_var_sorted)), gt_var_sorted, 
-                      label="Ground Truth", color="green", linewidth=2)
-        axs[0, 1].scatter(np.arange(len(pred_var_sorted)), pred_var_sorted, 
-                         s=8, label="Predicted", color="red", alpha=0.7)
-        axs[0, 1].set_title("Normalized Variance", fontsize=14, fontweight='bold')
-        axs[0, 1].set_xlabel("Gene Index (ordered by GT variance)")
-        axs[0, 1].set_ylabel("Normalized Variance")
+        axs[0, 1].plot(np.arange(len(gt_var_sorted)), gt_var_sorted, label="Ground Truth", c="b")
+        axs[0, 1].scatter(np.arange(len(pred_var_sorted)), pred_var_sorted, s=5, label="Predicted", c="orange")
+        axs[0, 1].set_title("Normalized Variance")
+        axs[0, 1].set_xlabel("gene index ordered by var")
+        axs[0, 1].set_ylabel("normalized variance")
         axs[0, 1].legend()
-        axs[0, 1].grid(True, alpha=0.3)
         
-        # 4. Absolute Variance
+        # 4. Absolute Variance (STEm approach)
         gt_var_sorted = np.sort(gt_var)
         pred_var_sorted = pred_var[np.argsort(gt_var)]
-        
-        axs[1, 1].plot(np.arange(len(gt_var_sorted)), gt_var_sorted, 
-                      label="Ground Truth", color="green", linewidth=2)
-        axs[1, 1].scatter(np.arange(len(pred_var_sorted)), pred_var_sorted, 
-                         s=8, label="Predicted", color="red", alpha=0.7)
-        axs[1, 1].set_title("Absolute Variance", fontsize=14, fontweight='bold')
-        axs[1, 1].set_xlabel("Gene Index (ordered by GT variance)")
-        axs[1, 1].set_ylabel("Absolute Variance")
+        axs[1, 1].plot(np.arange(len(gt_var_sorted)), gt_var_sorted, label="Ground Truth", c="b")
+        axs[1, 1].scatter(np.arange(len(pred_var_sorted)), pred_var_sorted, s=5, label="Predicted", c="orange")
+        axs[1, 1].set_title("Absolute Variance")
+        axs[1, 1].set_xlabel("gene index ordered by var")
+        axs[1, 1].set_ylabel("absolute variance")
         axs[1, 1].legend()
-        axs[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
         
-        # Save plot
+        # Save plot (STEm approach)
         save_path = self.save_dir / f"{save_name}.png"
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300)
         print(f"Gene variation curves saved to: {save_path}")
         
         if show_plots:
@@ -266,7 +241,7 @@ class GeneVisualizer:
                                    show_plots: bool = False) -> None:
         """
         Plot spatial gene expression maps for marker genes on WSI tissue images.
-        This follows STEm's approach for spatial transcriptomics visualization.
+        Completely follows STEm's implementation approach.
         
         Args:
             adata: AnnData object containing spatial coordinates and ground truth
@@ -281,98 +256,66 @@ class GeneVisualizer:
         # Handle PIL image size limit for large WSI images
         Image.MAX_IMAGE_PIXELS = None
         
-        # Try to load WSI tissue image with different extensions
-        img_path = os.path.join(data_path, "wsis")
+        # Load WSI image following STEm's approach
+        img_path = data_path + "wsis/"
         img_raw = None
         
-        for suffix in ['.tif', '.jpg', '.png', '.jpeg', '.tiff']:
-            try:
-                full_img_path = os.path.join(img_path, slide_id + suffix)
-                if os.path.exists(full_img_path):
+        try:
+            # Try different file extensions as in STEm
+            for suffix in ['.tif', '.jpg', '.png']:
+                try:
+                    full_img_path = img_path + slide_id + suffix
                     img_raw = Image.open(full_img_path)
                     print(f"Successfully loaded WSI image: {full_img_path}")
                     break
-            except Exception as e:
-                continue
-        
-        if img_raw is None:
-            print(f"Warning: Could not find WSI image for slide {slide_id} in {img_path}")
-            print("Available files:")
-            if os.path.exists(img_path):
-                for f in os.listdir(img_path):
-                    print(f"  - {f}")
-            print("Proceeding without tissue image background...")
-        
-        # Get spatial coordinates
-        if 'spatial' not in adata.obsm:
-            print("Error: No spatial coordinates found in adata.obsm['spatial']")
+                except FileNotFoundError:
+                    continue
+            else:
+                print(f"Warning: Could not find WSI image for slide {slide_id}, skipping marker gene visualization")
+                return
+        except Exception as e:
+            print(f"Error loading WSI image: {e}")
             return
-            
+        
+        # Get spatial coordinates (STEm approach)
         x = adata.obsm["spatial"][:, 0]
         y = adata.obsm["spatial"][:, 1]
         
-        print(f"Plotting spatial expression for {len(marker_genes)} marker genes...")
-        
-        # Plot each marker gene
+        # Plot each marker gene following STEm's exact approach
         for gene in marker_genes:
+            # Check if gene is in selected gene list (STEm approach)
             if gene not in gene_names:
                 print(f"Warning: Gene {gene} not found in gene list, skipping")
                 continue
             
             try:
-                # Create figure with two subplots (Ground Truth vs Prediction)
                 fig, axs = plt.subplots(1, 2, figsize=(16, 8))
-                fig.suptitle(f"Gene: {gene}", fontsize=16, fontweight='bold')
+                fig.suptitle(f"Gene: {gene}", fontsize=16)
                 
-                gene_idx = gene_names.index(gene)
+                gene_idx = np.where(np.array(gene_names) == gene)[0][0]
                 
-                # === Ground Truth Panel ===
-                if img_raw:
-                    axs[0].imshow(img_raw)
-                    axs[0].set_xlim(0, img_raw.width)
-                    axs[0].set_ylim(img_raw.height, 0)  # Flip Y axis for image coordinates
-                
-                # Get ground truth expression
-                if gene in adata.var_names:
-                    if hasattr(adata.X, 'toarray'):
-                        color_gt = adata[:, adata.var_names == gene].X.toarray().flatten()
-                    else:
-                        color_gt = adata[:, adata.var_names == gene].X.flatten()
+                # Ground Truth panel (STEm approach)
+                axs[0].imshow(img_raw)
+                # Handle different matrix types as in STEm
+                if isinstance(adata.X, np.ndarray):
+                    color_gt = adata[:, adata.var_names == gene].X.flatten()
                 else:
-                    print(f"Warning: Gene {gene} not found in adata, using zeros")
-                    color_gt = np.zeros(len(x))
-                
-                # Plot ground truth expression as scatter points on tissue
+                    color_gt = adata[:, adata.var_names == gene].X.toarray().flatten()
                 im0 = axs[0].scatter(x, y, c=color_gt, s=15, alpha=0.9, cmap='viridis')
                 axs[0].set_title("Ground Truth", fontsize=14)
-                axs[0].axis('off')  # Hide axes for cleaner look
-                fig.colorbar(im0, ax=axs[0], shrink=0.8)
+                fig.colorbar(im0, ax=axs[0])
                 
-                # === Prediction Panel ===
-                if img_raw:
-                    axs[1].imshow(img_raw)
-                    axs[1].set_xlim(0, img_raw.width)
-                    axs[1].set_ylim(img_raw.height, 0)  # Flip Y axis for image coordinates
-                
-                # Plot predicted expression
+                # Prediction panel (STEm approach)
+                axs[1].imshow(img_raw)
                 color_pred = y_pred[:, gene_idx]
-                im1 = axs[1].scatter(x, y, c=color_pred, s=15, alpha=0.9, cmap='viridis')
+                im1 = axs[1].scatter(x, y, c=color_pred, s=15, alpha=0.9, cmap='viridis') 
                 axs[1].set_title("Prediction", fontsize=14)
-                axs[1].axis('off')  # Hide axes for cleaner look
-                fig.colorbar(im1, ax=axs[1], shrink=0.8)
+                fig.colorbar(im1, ax=axs[1])
                 
-                # Calculate and display correlation in title
-                if np.std(color_gt) > 0 and np.std(color_pred) > 0:
-                    correlation = np.corrcoef(color_gt, color_pred)[0, 1]
-                    if not np.isnan(correlation):
-                        fig.suptitle(f"Gene: {gene} (Correlation: {correlation:.3f})", 
-                                   fontsize=16, fontweight='bold')
-                
+                # Save plot (STEm approach)
                 plt.tight_layout()
-                
-                # Save plot
-                save_path = self.save_dir / f"marker_gene_{gene}.png"
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                save_path = self.save_dir / f'marker_gene_{gene}.png'
+                plt.savefig(save_path, dpi=300)
                 print(f"Spatial expression plot for {gene} saved to: {save_path}")
                 
                 if show_plots:
@@ -382,11 +325,9 @@ class GeneVisualizer:
                     
             except Exception as e:
                 print(f"Error plotting gene {gene}: {e}")
-                import traceback
-                traceback.print_exc()
                 continue
         
-        print(f"Completed spatial expression visualization for {len(marker_genes)} genes")
+        print(f"Completed spatial gene expression visualization for {len(marker_genes)} genes")
     
     def create_summary_report(self, 
                             metrics: Dict[str, float],

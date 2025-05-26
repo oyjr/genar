@@ -24,11 +24,17 @@ logger = logging.getLogger(__name__)
 
 # Import visualization module
 try:
+    # Try relative import first
     from ..visualization import GeneVisualizer
     VISUALIZATION_AVAILABLE = True
 except ImportError:
-    VISUALIZATION_AVAILABLE = False
-    logger.warning("Visualization module not available. Install matplotlib, seaborn, and PIL to enable visualization.")
+    try:
+        # Fallback to absolute import
+        from visualization import GeneVisualizer
+        VISUALIZATION_AVAILABLE = True
+    except ImportError:
+        VISUALIZATION_AVAILABLE = False
+        logger.warning("Visualization module not available. Install matplotlib, seaborn, and PIL to enable visualization.")
 
 
 class ModelInterface(pl.LightningModule):
@@ -386,22 +392,27 @@ class ModelInterface(pl.LightningModule):
             if key != 'correlations':  # 不记录相关性数组
                 self.log(f'{phase}_detailed_{key.replace("-", "_")}', value, logger=True)
         
-        # 保存到文件
-        if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
-            log_dir = self.config.GENERAL.log_path
-        else:
-            log_dir = './logs'
+        # 保存到文件 - 每10个epoch保存一次，或者是最后一个epoch
+        save_metrics = (self.current_epoch % 10 == 0) or (self.current_epoch == self.trainer.max_epochs - 1)
+        
+        if save_metrics:
+            if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
+                log_dir = self.config.GENERAL.log_path
+            else:
+                log_dir = './logs'
+                
+            # 创建保存路径
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            save_path = os.path.join(log_dir, 'evaluation_results', 
+                                    f'{phase}_metrics_epoch_{self.current_epoch}_{timestamp}.txt')
             
-        # 创建保存路径
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_path = os.path.join(log_dir, 'evaluation_results', 
-                                f'{phase}_metrics_epoch_{self.current_epoch}_{timestamp}.txt')
-        
-        self.save_evaluation_results(metrics, save_path, 
-                                   slide_id=f"epoch_{self.current_epoch}", 
-                                   model_name="MFBP")
-        
-        logger.info(f"{phase.capitalize()} 评估指标已保存到: {save_path}")
+            self.save_evaluation_results(metrics, save_path, 
+                                       slide_id=f"epoch_{self.current_epoch}", 
+                                       model_name="MFBP")
+            
+            logger.info(f"{phase.capitalize()} 评估指标已保存到: {save_path}")
+        else:
+            logger.debug(f"{phase.capitalize()} epoch {self.current_epoch}: 评估指标计算完成，跳过文件保存")
         
         # 注意：可视化现在只在训练完成后生成，不在每个epoch生成
         # 这样可以避免产生大量中间可视化文件
@@ -411,41 +422,232 @@ class ModelInterface(pl.LightningModule):
         
     def on_validation_epoch_end(self):
         self._compute_and_log_evaluation_metrics('val')
-        self._process_epoch_end('val')
+        # 只有在非最后一个epoch时才清空数据，保留最后一个epoch的数据用于可视化
+        if self.current_epoch < self.trainer.max_epochs - 1:
+            self._process_epoch_end('val')
         
     def on_test_epoch_end(self):
         self._compute_and_log_evaluation_metrics('test')
-        self._process_epoch_end('test')
+        # 只有在非最后一个epoch时才清空数据，保留最后一个epoch的数据用于可视化
+        if self.current_epoch < self.trainer.max_epochs - 1:
+            self._process_epoch_end('test')
     
     def on_fit_end(self):
         """训练完成时的回调 - 生成最终可视化"""
-        logger.info("训练完成，开始生成最终可视化...")
+        # 多GPU环境下只在主进程（rank 0）执行可视化
+        if self.trainer.is_global_zero:
+            print("=" * 60)
+            print("🎉 训练完成！开始生成最终可视化...")
+            print("=" * 60)
+            logger.info("训练完成，开始生成最终可视化...")
+            logger.info(f"验证数据输出数量: {len(self.val_outputs)}")
+            logger.info(f"测试数据输出数量: {len(self.test_outputs)}")
+            print(f"📊 验证数据输出数量: {len(self.val_outputs)}")
+            print(f"📊 测试数据输出数量: {len(self.test_outputs)}")
+            
+            # 智能获取可视化设置
+            enable_vis = self._get_visualization_setting()
+            print(f"🔍 enable_visualization: {enable_vis}")
+            print(f"🔍 VISUALIZATION_AVAILABLE: {VISUALIZATION_AVAILABLE}")
+            
+            if enable_vis:
+                try:
+                    # 如果有验证数据，使用验证数据生成可视化
+                    if len(self.val_outputs) > 0:
+                        print("🎨 开始使用验证数据生成最终可视化...")
+                        logger.info("使用验证数据生成最终可视化...")
+                        self._generate_final_visualization('val')
+                        print("🎨 验证数据可视化完成")
+                    elif len(self.test_outputs) > 0:
+                        print("🎨 开始使用测试数据生成最终可视化...")
+                        logger.info("使用测试数据生成最终可视化...")
+                        self._generate_final_visualization('test')
+                        print("🎨 测试数据可视化完成")
+                    else:
+                        print("❌ 没有可用的验证或测试数据用于生成可视化")
+                        logger.warning("没有可用的验证或测试数据用于生成可视化")
+                        
+                except Exception as e:
+                    print(f"❌ 可视化生成异常: {e}")
+                    logger.error(f"最终可视化生成失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    logger.warning("训练已完成，但跳过可视化生成")
+            else:
+                print("❌ 可视化已禁用")
+                logger.info("可视化已禁用，跳过可视化生成")
+            
+            logger.info("训练和可视化生成完成")
+        else:
+            # 非主进程只记录信息
+            logger.info(f"GPU进程 {self.trainer.global_rank}: 训练完成，跳过可视化生成（只在主进程生成）")
+
+    def _get_visualization_setting(self):
+        """智能获取可视化设置"""
+        # 尝试多个可能的配置位置
+        possible_paths = [
+            'enable_visualization',
+            'GENERAL.enable_visualization', 
+            'TRAINING.enable_visualization',
+            'visualization.enable',
+            'vis_enable'
+        ]
         
-        # 只在训练完成后生成可视化
-        if getattr(self.config, 'enable_visualization', True):
+        for attr_path in possible_paths:
             try:
-                # 如果有验证数据，使用验证数据生成可视化
-                if len(self.val_outputs) > 0:
-                    self._generate_final_visualization('val')
-                
-                # 如果有测试数据，使用测试数据生成可视化
-                if len(self.test_outputs) > 0:
-                    self._generate_final_visualization('test')
-                    
-            except Exception as e:
-                logger.warning(f"最终可视化生成失败: {e}")
-                logger.warning("训练已完成，但跳过可视化生成")
+                value = self.config
+                for part in attr_path.split('.'):
+                    value = getattr(value, part)
+                # 如果找到了布尔值，直接返回
+                if isinstance(value, bool):
+                    logger.info(f"Found visualization setting at {attr_path}: {value}")
+                    return value
+                # 如果是字符串，尝试转换
+                elif isinstance(value, str):
+                    if value.lower() in ['true', '1', 'yes', 'on']:
+                        logger.info(f"Found visualization setting at {attr_path}: {value} -> True")
+                        return True
+                    elif value.lower() in ['false', '0', 'no', 'off']:
+                        logger.info(f"Found visualization setting at {attr_path}: {value} -> False")
+                        return False
+            except AttributeError:
+                continue
         
-        logger.info("训练和可视化生成完成")
+        # 检查命令行参数或环境变量
+        if hasattr(self.config, '__dict__'):
+            config_dict = vars(self.config)
+            logger.debug(f"Config attributes: {list(config_dict.keys())}")
+            
+            # 查找任何包含 'visual' 的属性
+            for key, value in config_dict.items():
+                if 'visual' in key.lower():
+                    logger.info(f"Found visualization-related config: {key} = {value}")
+                    if isinstance(value, bool):
+                        return value
+        
+        # 默认启用可视化
+        logger.info("No explicit visualization setting found, defaulting to True")
+        return True
+
+    def _load_gene_names(self):
+        """加载基因名称列表"""
+        try:
+            # 尝试从配置的数据路径加载基因列表
+            if hasattr(self.config, 'data_path'):
+                gene_file = f"{self.config.data_path}processed_data/selected_gene_list.txt"
+                if os.path.exists(gene_file):
+                    with open(gene_file, 'r') as f:
+                        gene_names = [line.strip() for line in f.readlines() if line.strip()]
+                    logger.info(f"Loaded {len(gene_names)} gene names from {gene_file}")
+                    return gene_names
+            
+            # 如果基因列表文件不存在，尝试从训练器的数据模块获取
+            if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'gene_names'):
+                gene_names = self.trainer.datamodule.gene_names
+                logger.info(f"Loaded {len(gene_names)} gene names from datamodule")
+                return gene_names
+                
+            logger.warning("Could not load gene names, spatial visualization may be limited")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error loading gene names: {e}")
+            return None
+
+    def _load_adata_for_visualization(self, phase):
+        """加载用于可视化的AnnData对象，同时返回对应的slide_id"""
+        try:
+            # 尝试从trainer的数据模块获取相应阶段的数据集
+            if hasattr(self.trainer, 'datamodule'):
+                datamodule = self.trainer.datamodule
+                
+                # 根据阶段选择相应的数据集
+                if phase == 'val' and hasattr(datamodule, 'val_dataloader'):
+                    dataset = datamodule.val_dataloader().dataset
+                elif phase == 'test' and hasattr(datamodule, 'test_dataloader'):
+                    dataset = datamodule.test_dataloader().dataset
+                else:
+                    logger.warning(f"No {phase} dataloader found")
+                    return None, None
+                
+                # 方法1：尝试获取预存储的AnnData对象
+                if hasattr(dataset, 'adata'):
+                    adata = dataset.adata
+                    # 尝试获取对应的slide_id
+                    slide_id = dataset.ids[0] if hasattr(dataset, 'ids') and len(dataset.ids) > 0 else 'unknown_slide'
+                    logger.info(f"Loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
+                    return adata, slide_id
+                elif hasattr(dataset, 'dataset') and hasattr(dataset.dataset, 'adata'):
+                    adata = dataset.dataset.dataset.adata
+                    # 尝试获取对应的slide_id
+                    slide_id = dataset.dataset.ids[0] if hasattr(dataset.dataset, 'ids') and len(dataset.dataset.ids) > 0 else 'unknown_slide'
+                    logger.info(f"Loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
+                    return adata, slide_id
+                
+                # 方法2：如果没有预存储的，尝试动态加载（像eval模式那样）
+                elif hasattr(dataset, 'load_st') and hasattr(dataset, 'ids'):
+                    # 获取第一个slide的ID（用于可视化）
+                    if len(dataset.ids) > 0:
+                        slide_id = dataset.ids[0]  # 取第一个slide用于可视化
+                        logger.info(f"Dynamically loading AnnData for slide: {slide_id}")
+                        
+                        # 使用数据集的load_st方法动态加载
+                        adata = dataset.load_st(slide_id, dataset.genes if hasattr(dataset, 'genes') else None)
+                        logger.info(f"Dynamically loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
+                        return adata, slide_id
+                    else:
+                        logger.warning(f"No slides found in {phase} dataset")
+                        return None, None
+                
+                # 方法3：如果是包装类，尝试深度查找
+                else:
+                    logger.warning(f"Trying to find AnnData in nested dataset structure...")
+                    current_dataset = dataset
+                    for i in range(3):  # 最多查找3层
+                        if hasattr(current_dataset, 'dataset'):
+                            current_dataset = current_dataset.dataset
+                            if hasattr(current_dataset, 'adata'):
+                                adata = current_dataset.adata
+                                slide_id = current_dataset.ids[0] if hasattr(current_dataset, 'ids') and len(current_dataset.ids) > 0 else 'unknown_slide'
+                                logger.info(f"Found AnnData at depth {i+1} for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
+                                return adata, slide_id
+                            elif hasattr(current_dataset, 'load_st') and hasattr(current_dataset, 'ids'):
+                                if len(current_dataset.ids) > 0:
+                                    slide_id = current_dataset.ids[0]
+                                    logger.info(f"Dynamically loading AnnData for slide: {slide_id} at depth {i+1}")
+                                    adata = current_dataset.load_st(slide_id, getattr(current_dataset, 'genes', None))
+                                    logger.info(f"Dynamically loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
+                                    return adata, slide_id
+                        else:
+                            break
+                    
+                    logger.warning(f"No AnnData object found in {phase} dataset after deep search")
+                    return None, None
+            else:
+                logger.warning("No datamodule found in trainer")
+                return None, None
+                
+        except Exception as e:
+            logger.error(f"Error loading AnnData for visualization: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
 
     def _generate_final_visualization(self, phase):
         """生成最终的可视化报告"""
+        print(f"📊 _generate_final_visualization called with phase: {phase}")
         outputs = getattr(self, f'{phase}_outputs')
+        print(f"📊 Found {len(outputs)} outputs for {phase}")
         if len(outputs) == 0:
+            print(f"❌ 没有{phase}数据用于生成可视化")
             logger.warning(f"没有{phase}数据用于生成可视化")
             return
         
+        print(f"🎨 开始处理{phase}阶段的最终可视化...")
         logger.info(f"开始生成{phase}阶段的最终可视化...")
+        
+        # 获取AnnData对象和对应的slide_id用于空间可视化
+        adata, slide_id = self._load_adata_for_visualization(phase)
         
         # 收集所有预测和目标
         all_preds = []
@@ -472,6 +674,19 @@ class ModelInterface(pl.LightningModule):
         all_preds = torch.cat(all_preds, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
+        # 如果有AnnData，确保预测数据与空间坐标维度匹配
+        if adata is not None:
+            n_spots = adata.n_obs
+            print(f"🔍 AnnData spots: {n_spots}, Prediction spots: {all_preds.shape[0]}")
+            
+            # 如果预测数据比空间点多，只取前n_spots个（通常是第一个slide的数据）
+            if all_preds.shape[0] > n_spots:
+                print(f"📏 Truncating prediction data from {all_preds.shape[0]} to {n_spots} to match spatial coordinates")
+                all_preds = all_preds[:n_spots]
+                all_targets = all_targets[:n_spots]
+            elif all_preds.shape[0] < n_spots:
+                print(f"⚠️ Warning: Prediction data ({all_preds.shape[0]}) is less than spatial coordinates ({n_spots})")
+        
         # 计算评估指标
         metrics = self.calculate_evaluation_metrics(all_targets.numpy(), all_preds.numpy())
         
@@ -480,15 +695,24 @@ class ModelInterface(pl.LightningModule):
             dataset_name = getattr(self.config, 'expr_name', 'default')
             marker_genes = self.get_marker_genes_for_dataset(dataset_name)
             
+            # 获取基因名称列表
+            gene_names = self._load_gene_names()
+            
+            print(f"🧬 Dataset: {dataset_name}")
+            print(f"🎯 Marker genes: {marker_genes}")
+            print(f"📝 Gene names loaded: {len(gene_names) if gene_names else 0}")
+            print(f"🗺️ AnnData available: {adata is not None}")
+            
             # 创建最终可视化
             self.create_visualizations(
                 phase=f"{phase}_final",  # 添加"final"标识
                 y_true=all_targets.numpy(),
                 y_pred=all_preds.numpy(),
                 metrics=metrics,
-                gene_names=None,  # 可以从配置中加载
+                gene_names=gene_names,  # 从配置中加载的基因名称
                 marker_genes=marker_genes,
-                adata=None,  # 如果需要可以从数据集加载
+                adata=adata,  # 从数据集加载的AnnData对象
+                slide_id=slide_id,  # 从数据集获取的实际slide_id
                 img_path=None  # 如果需要可以配置
             )
             
@@ -745,7 +969,7 @@ class ModelInterface(pl.LightningModule):
 
     def create_visualizations(self, phase: str, y_true: np.ndarray, y_pred: np.ndarray, 
                             metrics: dict, gene_names: list = None, 
-                            marker_genes: list = None, adata=None, img_path: str = None) -> None:
+                            marker_genes: list = None, adata=None, slide_id: str = None, img_path: str = None) -> None:
         """
         Create comprehensive visualizations for model evaluation.
         
@@ -770,7 +994,11 @@ class ModelInterface(pl.LightningModule):
             else:
                 log_dir = './logs'
             
-            vis_dir = os.path.join(log_dir, 'vis', f'{phase}_epoch_{self.current_epoch}')
+            # 处理不同的阶段格式
+            if phase.endswith('_final'):
+                vis_dir = os.path.join(log_dir, 'vis', phase)
+            else:
+                vis_dir = os.path.join(log_dir, 'vis', f'{phase}_epoch_{self.current_epoch}')
             
             # Initialize visualizer
             visualizer = GeneVisualizer(save_dir=vis_dir)
@@ -795,11 +1023,16 @@ class ModelInterface(pl.LightningModule):
             # 3. Create spatial gene expression maps (if data available)
             if marker_genes and adata is not None:
                 logger.info(f"Creating spatial gene expression maps for {phase}...")
-                # Get dataset path and slide info from config
+                # Get dataset path from config
                 data_path = getattr(self.config, 'data_path', '')
-                slide_id = getattr(self.config, 'slide_test', 'unknown_slide')
-                if phase == 'val':
-                    slide_id = getattr(self.config, 'slide_val', slide_id)
+                
+                # Use the passed slide_id if available, otherwise fall back to config
+                if slide_id is None:
+                    slide_id = getattr(self.config, 'slide_test', 'unknown_slide')
+                    if phase == 'val':
+                        slide_id = getattr(self.config, 'slide_val', slide_id)
+                
+                logger.info(f"Using slide_id for WSI visualization: {slide_id}")
                 
                 visualizer.plot_spatial_gene_expression(
                     adata, y_pred, gene_names or [], marker_genes,
