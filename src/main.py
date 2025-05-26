@@ -66,7 +66,7 @@ MODELS = {
 DEFAULT_CONFIG = {
     'GENERAL': {
         'seed': 2021,
-        'log_path': './logs/hest',
+        'log_path': './logs',  # Will be updated to dataset-specific path
         'debug': False
     },
     'DATA': {
@@ -253,6 +253,9 @@ def build_config_from_args(args):
     
     # 构建完整配置
     config = Dict(DEFAULT_CONFIG)
+    
+    # 更新日志路径为数据集名称和模型名称
+    config.GENERAL.log_path = f'./logs/{args.dataset}/{args.model}'
     
     # 更新模型配置
     config.MODEL = Dict(model_info)

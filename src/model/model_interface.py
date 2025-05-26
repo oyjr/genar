@@ -13,14 +13,22 @@ from torchmetrics.regression import (
 )
 
 from scipy.stats import pearsonr
+from datetime import datetime
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
 import torch.nn.functional as F
 
-
 # 设置日志记录器
 logger = logging.getLogger(__name__)
+
+# Import visualization module
+try:
+    from ..visualization import GeneVisualizer
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    logger.warning("Visualization module not available. Install matplotlib, seaborn, and PIL to enable visualization.")
 
 
 class ModelInterface(pl.LightningModule):
@@ -96,6 +104,9 @@ class ModelInterface(pl.LightningModule):
         
         # 更新指标
         self._update_metrics('val', logits, target_genes)
+        
+        # 保存输出用于详细评估
+        self._save_step_outputs('val', loss, logits, target_genes, batch_idx)
         
         # 记录损失
         self.log('val_loss', loss, on_epoch=True, logger=True, sync_dist=True)
@@ -318,8 +329,8 @@ class ModelInterface(pl.LightningModule):
     def _save_step_outputs(self, phase, loss, preds, targets, batch_idx=None):
         output_dict = {
             'loss': loss.detach(),
-            'preds': preds,
-            'targets': targets,
+            'preds': preds.detach().cpu(),
+            'targets': targets.detach().cpu(),
         }
         if batch_idx is not None:
             output_dict['batch_idx'] = batch_idx
@@ -334,14 +345,159 @@ class ModelInterface(pl.LightningModule):
         # 清空输出列表
         outputs.clear()
 
+    def _compute_and_log_evaluation_metrics(self, phase):
+        """计算并记录详细的评估指标"""
+        outputs = getattr(self, f'{phase}_outputs')
+        if len(outputs) == 0:
+            return
+        
+        # 收集所有预测和目标
+        all_preds = []
+        all_targets = []
+        
+        for output in outputs:
+            preds = output['preds']
+            targets = output['targets']
+            
+            # 确保维度正确
+            if preds.dim() == 3:
+                preds = preds.reshape(-1, preds.size(-1))
+            if targets.dim() == 3:
+                targets = targets.reshape(-1, targets.size(-1))
+                
+            all_preds.append(preds)
+            all_targets.append(targets)
+        
+        if len(all_preds) == 0:
+            return
+            
+        # 合并所有批次的结果
+        all_preds = torch.cat(all_preds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        
+        # 计算评估指标
+        metrics = self.calculate_evaluation_metrics(all_targets.numpy(), all_preds.numpy())
+        
+        # 打印结果
+        self.print_evaluation_results(metrics, prefix=phase.capitalize())
+        
+        # 记录到tensorboard
+        for key, value in metrics.items():
+            if key != 'correlations':  # 不记录相关性数组
+                self.log(f'{phase}_detailed_{key.replace("-", "_")}', value, logger=True)
+        
+        # 保存到文件
+        if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
+            log_dir = self.config.GENERAL.log_path
+        else:
+            log_dir = './logs'
+            
+        # 创建保存路径
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_path = os.path.join(log_dir, 'evaluation_results', 
+                                f'{phase}_metrics_epoch_{self.current_epoch}_{timestamp}.txt')
+        
+        self.save_evaluation_results(metrics, save_path, 
+                                   slide_id=f"epoch_{self.current_epoch}", 
+                                   model_name="MFBP")
+        
+        logger.info(f"{phase.capitalize()} 评估指标已保存到: {save_path}")
+        
+        # 注意：可视化现在只在训练完成后生成，不在每个epoch生成
+        # 这样可以避免产生大量中间可视化文件
+
     def on_train_epoch_end(self):
         self._process_epoch_end('train')
         
     def on_validation_epoch_end(self):
+        self._compute_and_log_evaluation_metrics('val')
         self._process_epoch_end('val')
         
     def on_test_epoch_end(self):
+        self._compute_and_log_evaluation_metrics('test')
         self._process_epoch_end('test')
+    
+    def on_fit_end(self):
+        """训练完成时的回调 - 生成最终可视化"""
+        logger.info("训练完成，开始生成最终可视化...")
+        
+        # 只在训练完成后生成可视化
+        if getattr(self.config, 'enable_visualization', True):
+            try:
+                # 如果有验证数据，使用验证数据生成可视化
+                if len(self.val_outputs) > 0:
+                    self._generate_final_visualization('val')
+                
+                # 如果有测试数据，使用测试数据生成可视化
+                if len(self.test_outputs) > 0:
+                    self._generate_final_visualization('test')
+                    
+            except Exception as e:
+                logger.warning(f"最终可视化生成失败: {e}")
+                logger.warning("训练已完成，但跳过可视化生成")
+        
+        logger.info("训练和可视化生成完成")
+
+    def _generate_final_visualization(self, phase):
+        """生成最终的可视化报告"""
+        outputs = getattr(self, f'{phase}_outputs')
+        if len(outputs) == 0:
+            logger.warning(f"没有{phase}数据用于生成可视化")
+            return
+        
+        logger.info(f"开始生成{phase}阶段的最终可视化...")
+        
+        # 收集所有预测和目标
+        all_preds = []
+        all_targets = []
+        
+        for output in outputs:
+            preds = output['preds']
+            targets = output['targets']
+            
+            # 确保维度正确
+            if preds.dim() == 3:
+                preds = preds.reshape(-1, preds.size(-1))
+            if targets.dim() == 3:
+                targets = targets.reshape(-1, targets.size(-1))
+                
+            all_preds.append(preds)
+            all_targets.append(targets)
+        
+        if len(all_preds) == 0:
+            logger.warning(f"没有有效的{phase}预测数据")
+            return
+            
+        # 合并所有批次的结果
+        all_preds = torch.cat(all_preds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        
+        # 计算评估指标
+        metrics = self.calculate_evaluation_metrics(all_targets.numpy(), all_preds.numpy())
+        
+        try:
+            # 获取数据集名称和标记基因
+            dataset_name = getattr(self.config, 'expr_name', 'default')
+            marker_genes = self.get_marker_genes_for_dataset(dataset_name)
+            
+            # 创建最终可视化
+            self.create_visualizations(
+                phase=f"{phase}_final",  # 添加"final"标识
+                y_true=all_targets.numpy(),
+                y_pred=all_preds.numpy(),
+                metrics=metrics,
+                gene_names=None,  # 可以从配置中加载
+                marker_genes=marker_genes,
+                adata=None,  # 如果需要可以从数据集加载
+                img_path=None  # 如果需要可以配置
+            )
+            
+            logger.info(f"{phase}阶段最终可视化生成完成")
+            
+        except Exception as e:
+            logger.error(f"生成{phase}最终可视化时出错: {e}")
+            import traceback
+            traceback.print_exc()
 
     def predict_step(self, batch, batch_idx):
         batch = self._preprocess_inputs(batch)
@@ -434,8 +590,7 @@ class ModelInterface(pl.LightningModule):
             logger.error(f"模型参数：{args1 if 'args1' in locals() else 'Not available'}")
             raise
     
-    def on_fit_end(self):
-        logger.info("训练完成")
+
 
     def _compute_loss(self, outputs, batch):
         """简化的损失计算 - 只计算基因表达预测损失"""
@@ -455,3 +610,234 @@ class ModelInterface(pl.LightningModule):
         logger.debug(f"基因表达预测损失: {loss.item():.4f}")
         
         return loss
+
+    def calculate_gene_correlations(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+        """
+        Calculate gene-wise Pearson correlation coefficients.
+        
+        Args:
+            y_true: Ground truth gene expression [num_spots, num_genes]
+            y_pred: Predicted gene expression [num_spots, num_genes]
+            
+        Returns:
+            Array of correlation coefficients for each gene [num_genes]
+        """
+        num_genes = y_true.shape[1]
+        correlations = []
+        
+        for i in range(num_genes):
+            # Extract gene expression for all spots
+            true_gene = y_true[:, i]
+            pred_gene = y_pred[:, i]
+            
+            # Calculate Pearson correlation
+            if np.std(true_gene) == 0 or np.std(pred_gene) == 0:
+                # Handle constant values (no variation)
+                corr = 0.0
+            else:
+                corr = np.corrcoef(true_gene, pred_gene)[0, 1]
+                # Handle NaN values
+                if np.isnan(corr):
+                    corr = 0.0
+            
+            correlations.append(corr)
+        
+        return np.array(correlations)
+
+    def calculate_evaluation_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+        """
+        Calculate comprehensive evaluation metrics for spatial transcriptomics.
+        
+        Args:
+            y_true: Ground truth gene expression [num_spots, num_genes]
+            y_pred: Predicted gene expression [num_spots, num_genes]
+            
+        Returns:
+            Dictionary containing all evaluation metrics
+        """
+        # Ensure inputs are numpy arrays
+        if torch.is_tensor(y_true):
+            y_true = y_true.cpu().numpy()
+        if torch.is_tensor(y_pred):
+            y_pred = y_pred.cpu().numpy()
+        
+        # Calculate gene-wise correlations
+        correlations = self.calculate_gene_correlations(y_true, y_pred)
+        
+        # Sort correlations in descending order for PCC metrics
+        sorted_corr = np.sort(correlations)[::-1]
+        
+        # Calculate PCC metrics (top-k correlations)
+        pcc_10 = np.mean(sorted_corr[:10]) if len(sorted_corr) >= 10 else np.mean(sorted_corr)
+        pcc_50 = np.mean(sorted_corr[:50]) if len(sorted_corr) >= 50 else np.mean(sorted_corr)
+        pcc_200 = np.mean(sorted_corr[:200]) if len(sorted_corr) >= 200 else np.mean(sorted_corr)
+        
+        # Calculate MSE and MAE
+        mse = np.mean((y_true - y_pred) ** 2)
+        mae = np.mean(np.abs(y_true - y_pred))
+        
+        # Calculate RVD (Relative Variance Difference)
+        pred_var = np.var(y_pred, axis=0)  # Variance across spots for each gene
+        true_var = np.var(y_true, axis=0)  # Variance across spots for each gene
+        
+        # Avoid division by zero
+        valid_mask = true_var > 1e-8
+        if np.sum(valid_mask) > 0:
+            rvd = np.mean(((pred_var[valid_mask] - true_var[valid_mask]) ** 2) / (true_var[valid_mask] ** 2))
+        else:
+            rvd = 0.0
+        
+        return {
+            'PCC-10': float(pcc_10),
+            'PCC-50': float(pcc_50), 
+            'PCC-200': float(pcc_200),
+            'MSE': float(mse),
+            'MAE': float(mae),
+            'RVD': float(rvd),
+            'correlations': correlations  # Keep for detailed analysis
+        }
+
+    def print_evaluation_results(self, metrics: dict, prefix: str = "") -> None:
+        """
+        Print evaluation metrics in a formatted way.
+        
+        Args:
+            metrics: Dictionary containing evaluation metrics
+            prefix: Optional prefix for the output (e.g., "Val", "Test")
+        """
+        if prefix:
+            print(f"\n========== {prefix} 评估结果 ==========")
+        else:
+            print(f"\n========== 评估结果 ==========")
+        
+        print(f"PCC-10: {metrics['PCC-10']:.4f}")
+        print(f"PCC-50: {metrics['PCC-50']:.4f}")
+        print(f"PCC-200: {metrics['PCC-200']:.4f}")
+        print(f"MSE: {metrics['MSE']:.4f}")
+        print(f"MAE: {metrics['MAE']:.4f}")
+        print(f"RVD: {metrics['RVD']:.4f}")
+
+    def save_evaluation_results(self, metrics: dict, save_path: str, 
+                               slide_id: str = "", model_name: str = "MFBP") -> None:
+        """
+        Save evaluation metrics to file.
+        
+        Args:
+            metrics: Dictionary containing evaluation metrics
+            save_path: Path to save the results
+            slide_id: Optional slide identifier
+            model_name: Optional model name
+        """
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        with open(save_path, 'w') as f:
+            f.write(f"Model: {model_name}\n")
+            if slide_id:
+                f.write(f"Slide: {slide_id}\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\n")
+            f.write(f"PCC-10: {metrics['PCC-10']:.4f}\n")
+            f.write(f"PCC-50: {metrics['PCC-50']:.4f}\n")
+            f.write(f"PCC-200: {metrics['PCC-200']:.4f}\n")
+            f.write(f"MSE: {metrics['MSE']:.4f}\n")
+            f.write(f"MAE: {metrics['MAE']:.4f}\n")
+            f.write(f"RVD: {metrics['RVD']:.4f}\n")
+
+    def create_visualizations(self, phase: str, y_true: np.ndarray, y_pred: np.ndarray, 
+                            metrics: dict, gene_names: list = None, 
+                            marker_genes: list = None, adata=None, img_path: str = None) -> None:
+        """
+        Create comprehensive visualizations for model evaluation.
+        
+        Args:
+            phase: Training phase ('val', 'test', etc.)
+            y_true: Ground truth gene expression [num_spots, num_genes]
+            y_pred: Predicted gene expression [num_spots, num_genes]
+            metrics: Dictionary containing evaluation metrics
+            gene_names: Optional list of gene names
+            marker_genes: Optional list of marker genes for spatial visualization
+            adata: Optional AnnData object for spatial coordinates
+            img_path: Optional path to tissue image
+        """
+        if not VISUALIZATION_AVAILABLE:
+            logger.warning("Visualization module not available. Skipping visualization creation.")
+            return
+        
+        try:
+            # Create visualization directory
+            if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
+                log_dir = self.config.GENERAL.log_path
+            else:
+                log_dir = './logs'
+            
+            vis_dir = os.path.join(log_dir, 'vis', f'{phase}_epoch_{self.current_epoch}')
+            
+            # Initialize visualizer
+            visualizer = GeneVisualizer(save_dir=vis_dir)
+            
+            # 1. Create gene variation curves
+            logger.info(f"Creating gene variation curves for {phase}...")
+            visualizer.plot_gene_variation_curves(
+                y_true, y_pred, 
+                save_name=f"{phase}_gene_variation_curves",
+                show_plots=False
+            )
+            
+            # 2. Create correlation analysis
+            logger.info(f"Creating correlation analysis for {phase}...")
+            correlations = visualizer.plot_correlation_analysis(
+                y_true, y_pred,
+                gene_names=gene_names,
+                save_name=f"{phase}_correlation_analysis", 
+                show_plots=False
+            )
+            
+            # 3. Create spatial gene expression maps (if data available)
+            if marker_genes and adata is not None:
+                logger.info(f"Creating spatial gene expression maps for {phase}...")
+                # Get dataset path and slide info from config
+                data_path = getattr(self.config, 'data_path', '')
+                slide_id = getattr(self.config, 'slide_test', 'unknown_slide')
+                if phase == 'val':
+                    slide_id = getattr(self.config, 'slide_val', slide_id)
+                
+                visualizer.plot_spatial_gene_expression(
+                    adata, y_pred, gene_names or [], marker_genes,
+                    data_path=data_path,
+                    slide_id=slide_id,
+                    save_name=f"{phase}_spatial_expression",
+                    show_plots=False
+                )
+            
+            # 4. Create summary report
+            logger.info(f"Creating summary report for {phase}...")
+            visualizer.create_summary_report(
+                metrics, correlations,
+                save_name=f"{phase}_summary_report"
+            )
+            
+            logger.info(f"All visualizations for {phase} saved to: {vis_dir}")
+            
+        except Exception as e:
+            logger.error(f"Error creating visualizations for {phase}: {e}")
+            logger.error(f"Visualization will be skipped for this epoch.")
+
+    def get_marker_genes_for_dataset(self, dataset_name: str) -> list:
+        """
+        Get default marker genes for different datasets.
+        
+        Args:
+            dataset_name: Name of the dataset
+            
+        Returns:
+            List of marker gene names
+        """
+        # Default marker genes for different datasets
+        marker_genes_dict = {
+            'PRAD': ['KLK3', 'AR', 'FOLH1', 'ACPP', 'KLK2', 'STEAP2', 'PSMA', 'NKX3-1'],
+            'her2st': ['ERBB2', 'ESR1', 'PGR', 'MKI67', 'TP53', 'BRCA1', 'BRCA2'],
+            'default': ['CD3E', 'CD4', 'CD8A', 'CD19', 'CD68', 'PTPRC', 'VIM', 'KRT19']
+        }
+        
+        dataset_key = dataset_name.upper() if dataset_name else 'default'
+        return marker_genes_dict.get(dataset_key, marker_genes_dict['default'])
