@@ -3,18 +3,12 @@ import sys
 import argparse
 import logging
 from datetime import datetime
-from glob import glob
-from pathlib import Path
-
-from typing import Dict, Any
 
 # 确保导入项目目录下的模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.strategies.ddp import DDPStrategy
-from pytorch_lightning import loggers as pl_loggers
 
 # 导入项目模块
 from dataset.data_interface import DataInterface
@@ -59,6 +53,18 @@ MODELS = {
         'model_name': 'MFBP',
         'num_genes': 200,
         'dropout_rate': 0.1
+    },
+    'VAR_ST': {
+        'model_name': 'VAR_ST',
+        'num_genes': 200,
+        # VAR-ST 特定参数来自配置文件
+        'spatial_size': 16,
+        'vae_ch': 128,
+        'vae_embed_dim': 256,
+        'vae_num_embeddings': 1024,
+        'var_depth': 16,
+        'var_embed_dim': 1024,
+        'var_num_heads': 16,
     }
 }
 
@@ -100,17 +106,15 @@ DEFAULT_CONFIG = {
         'mode': 'min',
         'monitor': 'val_loss',
         'lr_scheduler': {
-            'monitor': 'val_loss',
-            'patience': 5,
-            'factor': 0.5,
-            'mode': 'min'
+            'patience': 0,  # 默认禁用，只有命令行指定时才启用
+            'factor': 0.5
         },
         'gradient_clip_val': 1.0
     },
     'CALLBACKS': {
         'early_stopping': {
             'monitor': 'val_loss',
-            'patience': 10,
+            'patience': 10000,  # 默认设置很大值，实际禁用早停
             'mode': 'min',
             'min_delta': 0.0
         },
@@ -125,17 +129,10 @@ DEFAULT_CONFIG = {
         }
     },
     'MULTI_GPU': {
-        'strategy': 'ddp',
-        'sync_batchnorm': True,
         'find_unused_parameters': False,
-        'lr_scaling': 'linear',
-        'base_lr': 1.0e-4,
         'accumulate_grad_batches': 1
     }
 }
-
-
-
 
 
 def get_parse():
@@ -184,6 +181,8 @@ Examples:
                         help='学习率 (默认: 1e-4)')
     parser.add_argument('--weight-decay', type=float,
                         help='权重衰减 (默认: 1e-4)')
+    parser.add_argument('--patience', type=int,
+                        help='学习率调度器耐心值 (默认: 禁用, 只有指定时才启用patience机制)')
     
     # === 多GPU参数 ===
     parser.add_argument('--strategy', type=str, default='auto',
@@ -268,8 +267,20 @@ def build_config_from_args(args):
         config.TRAINING.learning_rate = args.lr
     if args.weight_decay:
         config.TRAINING.weight_decay = args.weight_decay
-    if getattr(args, 'batch_size', None):
-        config.DATA.train_dataloader.batch_size = args.batch_size
+    batch_size = getattr(args, 'batch_size', None)
+    if batch_size:
+        config.DATA.train_dataloader.batch_size = batch_size
+    if args.patience is not None:
+        # 只有明确指定patience时才启用patience机制
+        config.TRAINING.lr_scheduler.patience = args.patience
+        # 设置早停的patience（通常设为lr_scheduler patience的2倍）
+        if args.patience == 0:
+            # 如果明确设为0，禁用早停
+            config.CALLBACKS.early_stopping.patience = 10000
+        else:
+            # 启用早停，设为patience的2倍
+            config.CALLBACKS.early_stopping.patience = max(10, args.patience * 2)
+    # 如果没有指定patience，保持默认的禁用状态（patience=0和early_stopping=10000）
     
     # 更新种子
     if args.seed:
@@ -294,6 +305,11 @@ def build_config_from_args(args):
     config.GENERAL.current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     config.config = 'built-in'  # 标记为内置配置
     
+    # 检查patience状态
+    lr_patience = config.TRAINING.lr_scheduler.patience
+    early_patience = config.CALLBACKS.early_stopping.patience
+    patience_status = "禁用" if lr_patience == 0 else f"启用 (LR调度器: {lr_patience}, 早停: {early_patience})"
+    
     print(f"✅ 配置构建完成:")
     print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
     print(f"   - 模型: {args.model}")
@@ -302,106 +318,54 @@ def build_config_from_args(args):
     print(f"   - 训练轮数: {config.TRAINING.num_epochs}")
     print(f"   - 批次大小: {config.DATA.train_dataloader.batch_size}")
     print(f"   - 学习率: {config.TRAINING.learning_rate}")
+    print(f"   - Patience机制: {patience_status}")
     
     return config
 
 
-
-
-
-
-
-
 def main(config):
-    print("begin main.py")
-    print("config_infomation")
-    print(config)
-     
-    seed = config.GENERAL.seed
-    print(f"---seed: {seed}---")
-    fix_seed(seed)
-
-    print(f'mode: {config.mode}')
-    print(f'expr_name: {config.expr_name}')
-    print(f'data_path: {config.data_path}')
-    print(f'encoder_name: {config.encoder_name}')
-
-    # initialize dataset
-    print(f'intializing dataset...')
-    dataset = DataInterface(config)
-    print(f'dataset: {dataset}')
-
-    print(f'intializing model...')
-    model = ModelInterface(config)
-    print(f'model: {model}')
-
-    print(f'intializing logger...')
-    logger = load_loggers(config)
-    print(f'logger: {logger}')
-
-    print(f'intializing callbacks...')
-    callbacks = load_callbacks(config)
-    print(f'callbacks: {callbacks}')
-
-    print(f'intializing trainer...')
+    print("🚀 开始训练...")
     
-    # Configure multi-GPU training strategy based on user selection
-    # DDP (DistributedDataParallel) is the recommended strategy for multi-GPU training
-    # as it provides better performance and memory efficiency compared to DataParallel
+    # 设置随机种子
+    fix_seed(config.GENERAL.seed)
+
+    # 初始化组件
+    dataset = DataInterface(config)
+    model = ModelInterface(config)
+    logger = load_loggers(config)
+    callbacks = load_callbacks(config)
+
+    # 配置多GPU策略
     strategy_config = config.strategy
     if config.devices > 1 and config.strategy == 'ddp':
-        # Configure DDP strategy with advanced optimization parameters
         from pytorch_lightning.strategies import DDPStrategy
         strategy_config = DDPStrategy(
-            # find_unused_parameters: Set to False for better performance when all parameters are used
-            # Setting to True can help with debugging but may slow down training
-            find_unused_parameters=getattr(getattr(config, 'MULTI_GPU', None), 'find_unused_parameters', False),
-            # gradient_as_bucket_view: Memory optimization that reduces GPU memory usage
-            # by storing gradients as views into buckets rather than separate tensors
+            find_unused_parameters=config.MULTI_GPU.find_unused_parameters,
             gradient_as_bucket_view=True,
-            # static_graph: Set to False to support dynamic computational graphs
-            # Required for models with conditional execution paths
             static_graph=False
         )
-        print(f"配置DDP策略: find_unused_parameters={getattr(getattr(config, 'MULTI_GPU', None), 'find_unused_parameters', False)}")
     
-    # Configure gradient accumulation for handling large effective batch sizes
-    # When GPU memory is limited, gradient accumulation allows training with larger
-    # effective batch sizes by accumulating gradients over multiple mini-batches
-    accumulate_grad_batches = 1
-    if hasattr(config, 'MULTI_GPU') and hasattr(config.MULTI_GPU, 'accumulate_grad_batches'):
-        accumulate_grad_batches = config.MULTI_GPU.accumulate_grad_batches
+    # 配置梯度累积
+    accumulate_grad_batches = getattr(config.MULTI_GPU, 'accumulate_grad_batches', 1)
     
-    # Initialize PyTorch Lightning Trainer with multi-GPU optimizations
+    # 初始化训练器
     trainer = pl.Trainer(
-        # Hardware configuration
-        accelerator='gpu',  # Use GPU acceleration
-        devices=config.devices,  # Number of GPUs to use
-        max_epochs=config.TRAINING.num_epochs,  # Maximum training epochs
-        
-        # Logging and monitoring
-        logger=logger,  # TensorBoard/WandB logger for experiment tracking
-        check_val_every_n_epoch=1,  # Validate after every epoch
-        callbacks=callbacks,  # Early stopping, checkpointing, etc.
-        
-        # Training optimizations
-        precision='16-mixed',  # Mixed precision training for faster training and reduced memory
-        strategy=strategy_config,  # Multi-GPU training strategy (DDP/DP)
-        sync_batchnorm=config.sync_batchnorm,  # Synchronize BatchNorm statistics across GPUs
-        accumulate_grad_batches=accumulate_grad_batches,  # Gradient accumulation steps
-        
-        # Progress monitoring and debugging options
-        enable_progress_bar=True,  # Show training progress bar
-        log_every_n_steps=50,  # Log metrics every N training steps
-        gradient_clip_val=getattr(config.TRAINING, 'gradient_clip_val', 1.0),  # Gradient clipping for stability
-        
-        # Reproducibility settings
-        deterministic=False,  # Set to True for fully deterministic training (may impact performance)
+        accelerator='gpu',
+        devices=config.devices,
+        max_epochs=config.TRAINING.num_epochs,
+        logger=logger,
+        callbacks=callbacks,
+        precision='16-mixed',
+        strategy=strategy_config,
+        sync_batchnorm=config.sync_batchnorm,
+        accumulate_grad_batches=accumulate_grad_batches,
+        enable_progress_bar=True,
+        log_every_n_steps=50,
+        gradient_clip_val=config.TRAINING.gradient_clip_val,
+        deterministic=False,
     )
 
-    print(f'trainer: {trainer}')
-
-    print(f'training...')
+    # 开始训练
     if config.mode == 'train':
         trainer.fit(model, datamodule=dataset)
 

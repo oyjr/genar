@@ -299,7 +299,28 @@ class STDataset(Dataset):
                 raise TypeError(f"嵌入文件格式错误，期望torch.Tensor，得到{type(emb)}")
             
             # 处理不同的tensor维度
-            if len(emb.shape) == 3:
+            if len(emb.shape) == 4:
+                # 4D tensor: [batch, channel, num_spots, feature_dim] 
+                # 这种情况通常出现在某些增强嵌入文件中
+                print(f"检测到4D嵌入格式: {emb.shape}")
+                batch, channel, num_spots, feature_dim = emb.shape
+                
+                if batch == 1 and channel == 1:
+                    # 去掉前两个维度: [1, 1, num_spots, feature_dim] -> [num_spots, feature_dim]
+                    emb = emb.squeeze(0).squeeze(0)  # [num_spots, feature_dim]
+                    print(f"  -> 转换为标准格式: {emb.shape}")
+                elif batch == 1:
+                    # 去掉batch维度，保留channel作为augmentation维度: [1, C, num_spots, feature_dim] -> [num_spots, C, feature_dim]
+                    emb = emb.squeeze(0).transpose(0, 1)  # [num_spots, C, feature_dim]
+                    print(f"  -> 转换为增强格式: {emb.shape}")
+                    # 然后按照3D逻辑处理
+                    if mode == 'first':
+                        emb = emb[:, 0, :]  # [num_spots, feature_dim]
+                        print(f"  -> 使用第一个增强版本: {emb.shape}")
+                else:
+                    raise ValueError(f"不支持的4D嵌入格式: {emb.shape}，期望batch维度为1")
+                    
+            elif len(emb.shape) == 3:
                 # 3D tensor: [num_spots, num_augmentations, feature_dim]
                 if mode == 'first':
                     # 使用第一个增强版本（原图）
@@ -316,7 +337,7 @@ class STDataset(Dataset):
                 # 2D tensor: [num_spots, feature_dim] (标准格式)
                 pass
             else:
-                raise ValueError(f"嵌入维度错误，期望2D或3D tensor，得到{emb.shape}")
+                raise ValueError(f"嵌入维度错误，期望2D、3D或4D tensor，得到{emb.shape}")
             
             # 根据编码器类型验证特征维度
             expected_dim = 1024 if self.encoder_name == 'uni' else 512

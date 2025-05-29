@@ -2,3 +2,5 @@ logs/
 .cursor/
 .vscode/
 scripts/
+HEST/
+configs/

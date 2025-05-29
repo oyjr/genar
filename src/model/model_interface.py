@@ -74,15 +74,20 @@ class ModelInterface(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         logger.debug('Training step started')
 
+        original_batch = batch.copy()  # 保存原始batch用于后处理
         batch = self._preprocess_inputs(batch)
 
         results_dict = self.model(**batch)
+        
+        # 如果是VAR_ST模型，需要后处理输出
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            results_dict = self._postprocess_outputs_var_st(results_dict, original_batch)
 
         # 计算损失
-        loss = self._compute_loss(results_dict, batch)
+        loss = self._compute_loss(results_dict, original_batch)
 
-        logits = results_dict['logits']
-        target_genes = batch['target_genes']
+        # 获取预测和目标用于指标计算
+        logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
 
         # 更新指标
         self._update_metrics('train', logits, target_genes)
@@ -95,18 +100,22 @@ class ModelInterface(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         logger.debug(f"Validation step {batch_idx} started")
         
+        original_batch = batch.copy()  # 保存原始batch用于后处理
         # 预处理输入
         batch = self._preprocess_inputs(batch)
         
         # 获取模型输出
         results_dict = self.model(**batch)
+        
+        # 如果是VAR_ST模型，需要后处理输出
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            results_dict = self._postprocess_outputs_var_st(results_dict, original_batch)
 
         # 计算损失
-        loss = self._compute_loss(results_dict, batch)
+        loss = self._compute_loss(results_dict, original_batch)
         
         # 获取预测和目标
-        logits = results_dict['logits']
-        target_genes = batch['target_genes']
+        logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
         
         # 更新指标
         self._update_metrics('val', logits, target_genes)
@@ -122,14 +131,20 @@ class ModelInterface(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         self._log_tensor_shapes(batch, "Test batch")
         
+        original_batch = batch.copy()  # 保存原始batch用于后处理
         batch = self._preprocess_inputs(batch)
 
         results_dict = self.model(**batch)
-        logits = results_dict['logits']
-        target_genes = batch['target_genes']
+        
+        # 如果是VAR_ST模型，需要后处理输出
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            results_dict = self._postprocess_outputs_var_st(results_dict, original_batch)
+        
+        # 获取预测和目标
+        logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
         
         # 计算损失和指标
-        loss = self._compute_loss(results_dict, batch)
+        loss = self._compute_loss(results_dict, original_batch)
         logger.debug(f"Test loss: {loss.item():.4f}")
         
         # 更新指标
@@ -139,7 +154,7 @@ class ModelInterface(pl.LightningModule):
         self._save_step_outputs('test', loss, logits, target_genes, batch_idx)
         
         return {'logits': logits, 'target_genes': target_genes}
-    
+
     def configure_optimizers(self):
         """
         Configure optimizer and learning rate scheduler with multi-GPU support.
@@ -196,6 +211,15 @@ class ModelInterface(pl.LightningModule):
             patience = getattr(lr_scheduler_config, 'patience', 5)
             mode = getattr(lr_scheduler_config, 'mode', 'min')
         
+        # Set gradient clipping value for training stability
+        # Prevents exploding gradients by clipping gradient norms above threshold
+        self.trainer.gradient_clip_val = getattr(self.config.TRAINING, 'gradient_clip_val', 1.0)
+        
+        # Check if learning rate scheduler should be disabled
+        if patience == 0:
+            logger.info("学习率调度器已禁用 (patience=0)，将使用固定学习率")
+            return {'optimizer': optimizer}
+        
         scheduler = {
             'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
@@ -208,10 +232,6 @@ class ModelInterface(pl.LightningModule):
             'interval': 'epoch',  # Check at the end of each epoch
             'frequency': 1  # Check every epoch
         }
-        
-        # Set gradient clipping value for training stability
-        # Prevents exploding gradients by clipping gradient norms above threshold
-        self.trainer.gradient_clip_val = getattr(self.config.TRAINING, 'gradient_clip_val', 1.0)
         
         return {
             'optimizer': optimizer,
@@ -267,21 +287,178 @@ class ModelInterface(pl.LightningModule):
 
 
     def _preprocess_inputs(self, inputs):
-        """预处理输入数据，简化维度处理"""
-        processed_inputs = {}
+        """
+        预处理输入数据，使其与模型期望的格式匹配
         
+        Args:
+            inputs: 原始输入数据批次
+            
+        Returns:
+            处理后的输入数据
+        """
+        
+        # 记录输入张量的形状用于调试
+        logger.debug("Original input shapes:")
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
-                # 统一处理：如果有多余的batch维度就移除
-                if key in ['img', 'target_genes', 'positions'] and value.dim() > 2:
-                    # 只在确实有多余维度时才squeeze
-                    while value.dim() > 2 and value.size(0) == 1:
-                        value = value.squeeze(0)
-                processed_inputs[key] = value
-            else:
-                processed_inputs[key] = value
+                logger.debug(f"  {key}: {value.shape}")
         
-        return processed_inputs
+        # 如果是VAR_ST模型，需要特殊的输入格式
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            return self._preprocess_inputs_var_st(inputs)
+        else:
+            # 原有的MFBP输入格式
+            return inputs
+
+    def _preprocess_inputs_var_st(self, inputs):
+        """
+        为VAR_ST模型预处理输入数据 - 真正的空间多尺度模式
+        
+        VAR_ST现在需要的输入格式：
+        - gene_expression: [B, N, num_genes] (spots基因表达)
+        - histology_features: [B, N, feature_dim] (spots组织学特征)
+        - positions: [B, N, 2] (spots空间坐标)
+        - mode: 'training' 或 'inference'
+        """
+        processed = {}
+        
+        # 基因表达数据处理
+        if 'target_genes' in inputs:
+            target_genes = inputs['target_genes']  # 可能是 [B, N, num_genes] 或 [B, num_genes]
+            
+            if target_genes.dim() == 3:
+                # 多spots格式: [B, N, num_genes] - 直接使用
+                processed['gene_expression'] = target_genes
+                B, N, num_genes = target_genes.shape
+                print(f"📊 基因表达数据(多spots): {target_genes.shape}")
+                
+            elif target_genes.dim() == 2:
+                # 需要扩展为多spots格式: [B, num_genes] -> [B, 1, num_genes]
+                processed['gene_expression'] = target_genes.unsqueeze(1)
+                B, num_genes = target_genes.shape
+                N = 1  # 单spot
+                print(f"📊 基因表达数据转换: {target_genes.shape} -> {processed['gene_expression'].shape}")
+            else:
+                raise ValueError(f"不支持的target_genes维度: {target_genes.shape}")
+        
+        # 组织学特征处理
+        if 'img' in inputs:
+            img_features = inputs['img']
+            print(f"🔍 原始img_features形状: {img_features.shape}")
+            
+            # 处理不同的输入维度
+            if img_features.dim() == 4:
+                # 4D: [B, C, N, feature_dim] -> 去掉多余维度
+                B, C, N, feature_dim = img_features.shape
+                if C == 1:
+                    img_features = img_features.squeeze(1)  # [B, N, feature_dim]
+                    print(f"  -> 移除通道维度: [B, C, N, feature_dim] -> [B, N, feature_dim]")
+                else:
+                    raise ValueError(f"不支持的通道数: {C}")
+            
+            if img_features.dim() == 3:
+                # 3D: [B, N, feature_dim] - 理想的多spots格式
+                processed['histology_features'] = img_features
+                B, N, feature_dim = img_features.shape
+                print(f"🖼️  组织学特征(多spots): {img_features.shape}")
+                    
+            elif img_features.dim() == 2:
+                # 2D: [B, feature_dim] - 需要扩展为多spots格式
+                processed['histology_features'] = img_features.unsqueeze(1)  # [B, 1, feature_dim]
+                B, feature_dim = img_features.shape
+                N = 1
+                print(f"🖼️  组织学特征转换: {img_features.shape} -> {processed['histology_features'].shape}")
+            else:
+                raise ValueError(f"不支持的img_features维度: {img_features.shape}")
+        else:
+            raise ValueError("Missing histology features ('img' key not found in inputs)")
+        
+        # 空间位置处理
+        if 'positions' in inputs:
+            positions = inputs['positions']
+            print(f"📍 原始positions形状: {positions.shape}")
+            
+            if positions.dim() == 3:
+                # 3D: [B, N, 2] - 理想格式
+                processed['positions'] = positions
+                print(f"📍 空间位置(多spots): {positions.shape}")
+                
+            elif positions.dim() == 2:
+                if positions.shape[1] == 2:
+                    # 2D: [B, 2] - 需要扩展为多spots格式
+                    processed['positions'] = positions.unsqueeze(1)  # [B, 1, 2]
+                    print(f"📍 空间位置转换: {positions.shape} -> {processed['positions'].shape}")
+                else:
+                    # 可能是 [N, 2]，需要添加batch维度
+                    processed['positions'] = positions.unsqueeze(0)  # [1, N, 2]
+                    print(f"📍 空间位置添加batch: {positions.shape} -> {processed['positions'].shape}")
+            else:
+                raise ValueError(f"不支持的positions维度: {positions.shape}")
+        else:
+            # 如果没有提供positions，生成默认的网格位置
+            if 'histology_features' in processed:
+                B, N, _ = processed['histology_features'].shape
+                # 生成 N×1 的网格位置
+                if N == 1:
+                    # 单spot：放在中心
+                    default_positions = torch.tensor([[[0.5, 0.5]]], dtype=torch.float32)
+                else:
+                    # 多spots：生成网格布局
+                    grid_size = int(np.ceil(np.sqrt(N)))
+                    coords = np.linspace(0.1, 0.9, grid_size)
+                    pos_list = []
+                    for i in range(N):
+                        row = i // grid_size
+                        col = i % grid_size
+                        if row < len(coords) and col < len(coords):
+                            pos_list.append([coords[col], coords[row]])
+                        else:
+                            pos_list.append([0.5, 0.5])  # 默认中心位置
+                    
+                    default_positions = torch.tensor(pos_list, dtype=torch.float32).unsqueeze(0)  # [1, N, 2]
+                    default_positions = default_positions.expand(B, -1, -1)  # [B, N, 2]
+                
+                processed['positions'] = default_positions
+                print(f"📍 生成默认空间位置: {processed['positions'].shape}")
+            else:
+                raise ValueError("Cannot determine spatial positions without histology features")
+        
+        # 确保所有维度一致
+        if 'gene_expression' in processed and 'histology_features' in processed:
+            gene_B, gene_N, _ = processed['gene_expression'].shape
+            hist_B, hist_N, _ = processed['histology_features'].shape
+            pos_B, pos_N, _ = processed['positions'].shape
+            
+            if not (gene_B == hist_B == pos_B and gene_N == hist_N == pos_N):
+                print(f"⚠️ 维度不一致:")
+                print(f"   - 基因表达: [B={gene_B}, N={gene_N}]")
+                print(f"   - 组织学特征: [B={hist_B}, N={hist_N}]")
+                print(f"   - 空间位置: [B={pos_B}, N={pos_N}]")
+                
+                # 尝试调整到一致的维度
+                max_B = max(gene_B, hist_B, pos_B)
+                max_N = max(gene_N, hist_N, pos_N)
+                
+                # 扩展batch维度
+                if gene_B < max_B:
+                    processed['gene_expression'] = processed['gene_expression'].expand(max_B, -1, -1)
+                if hist_B < max_B:
+                    processed['histology_features'] = processed['histology_features'].expand(max_B, -1, -1)
+                if pos_B < max_B:
+                    processed['positions'] = processed['positions'].expand(max_B, -1, -1)
+                
+                print(f"   -> 调整后维度: [B={max_B}, N={max_N}]")
+        
+        # 设置模式
+        processed['mode'] = 'training' if 'target_genes' in inputs else 'inference'
+        
+        print(f"✅ VAR_ST预处理完成:")
+        print(f"   - 模式: {processed['mode']}")
+        for key, value in processed.items():
+            if isinstance(value, torch.Tensor):
+                print(f"   - {key}: {value.shape}")
+        
+        return processed
 
 
     def _log_tensor_shapes(self, tensors_dict, prefix=""):
@@ -760,6 +937,10 @@ class ModelInterface(pl.LightningModule):
                 logger.info("加载MFBP模型...")
                 Model = getattr(importlib.import_module(
                     f'model.MFBP.MFBP'), 'MFBP')
+            elif self.model_name == 'VAR_ST':
+                logger.info("加载VAR_ST模型...")
+                Model = getattr(importlib.import_module(
+                    f'model.VAR.VAR_ST_Complete'), 'VAR_ST_Complete')
             else:
                 Model = getattr(importlib.import_module(
                     f'model.{self.model_name.lower()}'), camel_name)
@@ -817,7 +998,65 @@ class ModelInterface(pl.LightningModule):
 
 
     def _compute_loss(self, outputs, batch):
-        """简化的损失计算 - 只计算基因表达预测损失"""
+        """
+        计算损失 - 支持不同模型的损失计算方式
+        
+        Args:
+            outputs: 模型输出
+            batch: 输入批次数据
+            
+        Returns:
+            loss: 计算得到的损失值
+        """
+        
+        # 如果是VAR_ST模型，使用其特殊的损失计算
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            return self._compute_loss_var_st(outputs, batch)
+        else:
+            # 原有的MFBP损失计算
+            return self._compute_loss_mfbp(outputs, batch)
+
+    def _compute_loss_var_st(self, outputs, batch):
+        """
+        VAR_ST模型的损失计算
+        
+        VAR_ST返回的输出包含多个损失组件：
+        - loss: 总损失 (已经在模型内部计算好)
+        - vq_loss: VQ量化损失
+        - recon_loss: 重建损失  
+        - ar_loss: 自回归损失
+        - spot_recon_loss: spots重建损失
+        """
+        if 'loss' in outputs:
+            # 如果模型已经计算好总损失，直接使用
+            total_loss = outputs['loss']
+            
+            # 记录各个损失组件用于监控
+            if 'vq_loss' in outputs:
+                self.log('train_vq_loss', outputs['vq_loss'], on_epoch=True, logger=True, sync_dist=True)
+            if 'recon_loss' in outputs:
+                self.log('train_recon_loss', outputs['recon_loss'], on_epoch=True, logger=True, sync_dist=True)
+            if 'ar_loss' in outputs:
+                self.log('train_ar_loss', outputs['ar_loss'], on_epoch=True, logger=True, sync_dist=True)
+            if 'spot_recon_loss' in outputs:
+                self.log('train_spot_recon_loss', outputs['spot_recon_loss'], on_epoch=True, logger=True, sync_dist=True)
+            
+            logger.debug(f"VAR_ST总损失: {total_loss.item():.4f}")
+            
+            return total_loss
+        else:
+            # 如果模型没有返回损失，手动计算
+            if 'predicted_expression' in outputs and 'gene_expression' in batch:
+                logits = outputs['predicted_expression']
+                target_genes = batch['gene_expression']
+                loss = self.criterion(logits, target_genes)
+                logger.debug(f"VAR_ST预测损失: {loss.item():.4f}")
+                return loss
+            else:
+                raise ValueError("VAR_ST模型输出格式不正确，缺少损失信息")
+
+    def _compute_loss_mfbp(self, outputs, batch):
+        """原有的MFBP损失计算"""
         logits = outputs['logits']
         target_genes = batch['target_genes']
         
@@ -831,7 +1070,7 @@ class ModelInterface(pl.LightningModule):
         # 计算MSE损失
         loss = self.criterion(logits, target_genes)
         
-        logger.debug(f"基因表达预测损失: {loss.item():.4f}")
+        logger.debug(f"MFBP基因表达预测损失: {loss.item():.4f}")
         
         return loss
 
@@ -1074,3 +1313,82 @@ class ModelInterface(pl.LightningModule):
         
         dataset_key = dataset_name.upper() if dataset_name else 'default'
         return marker_genes_dict.get(dataset_key, marker_genes_dict['default'])
+
+    def _extract_predictions_and_targets(self, results_dict, batch):
+        """
+        从模型输出和批次数据中提取预测和目标
+        
+        Args:
+            results_dict: 模型输出
+            batch: 输入批次数据
+            
+        Returns:
+            tuple: (logits, target_genes)
+        """
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            # VAR_ST模型输出格式
+            if 'predicted_expression' in results_dict:
+                logits = results_dict['predicted_expression']
+            elif 'logits' in results_dict:
+                logits = results_dict['logits']
+            else:
+                raise ValueError("VAR_ST模型输出中找不到predicted_expression或logits")
+            
+            # 目标数据
+            if 'gene_expression' in batch:
+                target_genes = batch['gene_expression']
+            elif 'target_genes' in batch:
+                target_genes = batch['target_genes']
+            else:
+                raise ValueError("批次数据中找不到gene_expression或target_genes")
+        else:
+            # MFBP模型输出格式
+            logits = results_dict['logits']
+            target_genes = batch['target_genes']
+            
+            # 确保维度匹配
+            if logits.dim() != target_genes.dim():
+                if logits.dim() == 3 and target_genes.dim() == 2:
+                    logits = logits.squeeze(1)
+                elif logits.dim() == 2 and target_genes.dim() == 3:
+                    target_genes = target_genes.squeeze(1)
+        
+        return logits, target_genes
+
+    def _postprocess_outputs_var_st(self, outputs, original_inputs):
+        """
+        为VAR_ST模型后处理输出数据 - 真正的空间多尺度模式
+        
+        新的VAR-ST模型输入输出都是 [B, N, num_genes] 格式，
+        基本不需要特殊后处理，但需要处理一些字段映射
+        """
+        processed = {}
+        
+        if 'target_genes' in original_inputs:
+            # 训练模式：直接使用模型输出
+            processed['loss'] = outputs['loss']
+            processed['var_loss'] = outputs.get('var_loss', outputs['loss'])
+            processed['vqvae_loss'] = outputs.get('vqvae_loss', torch.tensor(0.0))
+            processed['spatial_recon_loss'] = outputs.get('spatial_recon_loss', torch.tensor(0.0))
+            
+            # 预测和目标数据
+            processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
+            processed['targets'] = outputs.get('targets', original_inputs['target_genes'])
+            
+            if processed['predictions'] is not None:
+                print(f"🔄 训练模式输出: {processed['predictions'].shape}")
+            
+        else:
+            # 推理模式：直接使用预测结果
+            processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
+            
+            if processed['predictions'] is not None:
+                print(f"🔄 推理模式输出: {processed['predictions'].shape}")
+            
+            # 复制其他字段
+            if 'tokens' in outputs:
+                processed['tokens'] = outputs['tokens']
+            if 'multiscale_expressions' in outputs:
+                processed['multiscale_expressions'] = outputs['multiscale_expressions']
+        
+        return processed
