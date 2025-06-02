@@ -1,10 +1,11 @@
 """
-VAR-ST Complete: 空间转录组学的视觉自回归模型
+VAR-ST Complete: 基因表达向量的视觉自回归模型
 
-基于VAR原始设计理念的真正空间多尺度实现：
-- 将空间转录组学数据组织为不同分辨率的空间网格
-- 使用VQVAE对每个尺度的基因表达网格进行编码
-- VAR自回归生成：从粗粒度全局模式到细粒度局部细节
+基于VAR原始设计理念的基因维度多尺度实现：
+- 将基因表达向量组织为不同粒度的特征表示
+- 使用VQVAE对每个尺度的基因特征进行编码
+- VAR自回归生成：从粗粒度全局模式到细粒度基因表达
+- 完整保留VAR的所有组件和功能
 """
 
 import torch
@@ -15,28 +16,28 @@ import numpy as np
 
 from .vqvae_st import VQVAE
 from .var_st import VAR
-from .spatial_multiscale_organizer import SpatialMultiscaleOrganizer
+from .gene_multiscale_organizer import GeneMultiscaleOrganizer
 
 
 class VAR_ST_Complete(nn.Module):
     """
-    VAR-ST Complete: 空间转录组学的完整VAR实现
+    VAR-ST Complete: 基因表达向量的完整VAR实现
     
-    实现真正的空间多尺度VAR：
-    1. 空间多尺度组织：将spots组织为不同分辨率的空间网格
+    实现真正的基因维度多尺度VAR：
+    1. 基因多尺度组织：将基因向量组织为不同粒度的特征表示
     2. 多尺度VQVAE编码：每个尺度使用专门的VQVAE编码器
     3. VAR自回归生成：从粗粒度到细粒度渐进式生成
-    4. 空间重建：从多尺度网格重建到原始spots
+    4. 基因重建：从多尺度特征重建到完整基因表达
     """
     
     def __init__(
         self,
         num_genes: int = 200,
         histology_feature_dim: int = 512,
-        spatial_scales: List[int] = [1, 2, 4, 8],
+        gene_scales: List[int] = [1, 4, 16, 64, 200],
         vqvae_configs: Optional[List[Dict]] = None,
         var_config: Optional[Dict] = None,
-        spatial_config: Optional[Dict] = None,
+        gene_config: Optional[Dict] = None,
         **kwargs
     ):
         """
@@ -45,62 +46,64 @@ class VAR_ST_Complete(nn.Module):
         Args:
             num_genes: 基因数量
             histology_feature_dim: 组织学特征维度 
-            spatial_scales: 空间分辨率列表 [1, 2, 4, 8]
+            gene_scales: 基因多尺度特征数量列表 [1, 4, 16, 64, 200]
             vqvae_configs: 每个尺度的VQVAE配置列表
             var_config: VAR模型配置
-            spatial_config: 空间组织器配置
+            gene_config: 基因组织器配置
         """
         super().__init__()
         
         self.num_genes = num_genes
         self.histology_feature_dim = histology_feature_dim
-        self.spatial_scales = spatial_scales
-        self.num_scales = len(spatial_scales)
+        self.gene_scales = gene_scales
+        self.num_scales = len(gene_scales)
         
-        print(f"🧬 初始化VAR_ST_Complete (真正的空间多尺度模式)")
+        print(f"🧬 初始化VAR_ST_Complete (基因维度多尺度模式)")
         print(f"   - 目标基因数: {num_genes}")
         print(f"   - 组织学特征维度: {histology_feature_dim}")
-        print(f"   - 空间分辨率: {spatial_scales}")
+        print(f"   - 基因多尺度: {gene_scales}")
         
-        # 初始化空间多尺度组织器
-        spatial_config = spatial_config or {}
-        self.spatial_organizer = SpatialMultiscaleOrganizer(
-            scales=spatial_scales,
-            aggregation_method=spatial_config.get('aggregation_method', 'weighted_mean'),
-            spatial_smoothing=spatial_config.get('spatial_smoothing', True),
-            normalize_coordinates=spatial_config.get('normalize_coordinates', True)
+        # 初始化基因多尺度组织器
+        gene_config = gene_config or {}
+        self.gene_organizer = GeneMultiscaleOrganizer(
+            num_genes=num_genes,
+            scales=gene_scales,
+            projection_method=gene_config.get('projection_method', 'learned'),
+            preserve_variance=gene_config.get('preserve_variance', True),
+            normalize_features=gene_config.get('normalize_features', True)
         )
         
-        # 为每个空间尺度创建专门的VQVAE编码器
+        # 为每个基因尺度创建专门的VQVAE编码器
         self.vqvaes = nn.ModuleList()
         self.codebook_sizes = []
         
         if vqvae_configs is None:
-            vqvae_configs = [self._get_default_vqvae_config(scale) for scale in spatial_scales]
+            vqvae_configs = [self._get_default_vqvae_config(scale) for scale in gene_scales]
         
-        for scale_idx, scale in enumerate(spatial_scales):
-            print(f"🧬 初始化尺度 {scale}×{scale} 的VQVAE:")
+        for scale_idx, scale in enumerate(gene_scales):
+            print(f"🧬 初始化尺度 {scale} 特征的VQVAE:")
             
             vqvae_config = vqvae_configs[scale_idx] if scale_idx < len(vqvae_configs) else vqvae_configs[-1]
             
-            # 每个尺度的VQVAE处理相同维度的基因向量 [num_genes]
+            # 每个尺度的VQVAE处理对应维度的基因特征向量 [scale]
             vqvae = VQVAE(
-                input_dim=num_genes,
-                hidden_dim=vqvae_config.get('hidden_dim', 256),
-                latent_dim=vqvae_config.get('latent_dim', 32),
-                num_embeddings=vqvae_config.get('num_embeddings', 2048),  # 不同尺度可以有不同码本大小
+                input_dim=scale,
+                hidden_dim=vqvae_config.get('hidden_dim', max(32, scale // 2)),
+                latent_dim=vqvae_config.get('latent_dim', min(32, scale)),
+                num_embeddings=vqvae_config.get('num_embeddings', min(8192, 512 * scale)),
                 commitment_cost=vqvae_config.get('commitment_cost', 0.25)
             )
             
             self.vqvaes.append(vqvae)
-            self.codebook_sizes.append(vqvae_config.get('num_embeddings', 2048))
+            self.codebook_sizes.append(vqvae_config.get('num_embeddings', min(8192, 512 * scale)))
             
-            print(f"  - 隐藏维度: {vqvae_config.get('hidden_dim', 256)}")
-            print(f"  - 潜在维度: {vqvae_config.get('latent_dim', 32)}")
-            print(f"  - 码本大小: {vqvae_config.get('num_embeddings', 2048)}")
+            print(f"  - 输入维度: {scale}")
+            print(f"  - 隐藏维度: {vqvae_config.get('hidden_dim', max(32, scale // 2))}")
+            print(f"  - 潜在维度: {vqvae_config.get('latent_dim', min(32, scale))}")
+            print(f"  - 码本大小: {vqvae_config.get('num_embeddings', min(8192, 512 * scale))}")
         
-        # 计算每个尺度的token数量
-        self.tokens_per_scale = [scale * scale for scale in spatial_scales]
+        # 计算每个尺度的token数量（基因维度多尺度每个batch样本产生1个token）
+        self.tokens_per_scale = [1 for _ in gene_scales]  # 每个尺度每个样本产生1个token
         self.total_tokens = sum(self.tokens_per_scale)
         
         print(f"   - 每尺度token数: {self.tokens_per_scale}")
@@ -133,14 +136,11 @@ class VAR_ST_Complete(nn.Module):
     
     def _get_default_vqvae_config(self, scale: int) -> Dict:
         """为不同尺度生成默认VQVAE配置"""
-        # 较大尺度使用更大的码本和更复杂的模型
-        base_size = 1024
-        scale_factor = scale  # 尺度越大，模型越复杂
-        
+        # 根据特征维度调整模型复杂度
         return {
-            'hidden_dim': min(512, 128 + scale * 32),  # 尺度越大，隐藏层越大
-            'latent_dim': 32,
-            'num_embeddings': min(8192, base_size * scale_factor),  # 尺度越大，码本越大
+            'hidden_dim': max(32, min(512, scale * 2)),  # 隐藏层大小与特征维度成正比
+            'latent_dim': min(32, max(8, scale // 2)),   # 潜在维度适配特征维度
+            'num_embeddings': min(8192, max(256, 512 * scale)),  # 码本大小与特征维度成正比
             'commitment_cost': 0.25
         }
     
@@ -183,33 +183,59 @@ class VAR_ST_Complete(nn.Module):
         self,
         gene_expression: torch.Tensor,
         histology_features: torch.Tensor,
-        positions: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        训练阶段前向传播 - 真正的空间多尺度模式
+        训练阶段前向传播 - 基因维度多尺度模式
         
         Args:
-            gene_expression: [B, N, num_genes] - spots的基因表达
-            histology_features: [B, N, feature_dim] - spots的组织学特征
-            positions: [B, N, 2] - spots的空间坐标
+            gene_expression: [B, num_genes] or [B, N, num_genes] - 基因表达向量
+            histology_features: [B, feature_dim] or [B, N, feature_dim] - 组织学特征
+            positions: Optional[torch.Tensor] - 空间坐标(基因模式下不使用)
             class_labels: [B] - 条件类别标签(可选)
         
         Returns:
             Dict包含所有损失和预测结果
         """
-        B, N, num_genes = gene_expression.shape
+        # 检查是否为多spot模式（验证/测试时可能出现）
+        if gene_expression.dim() == 3 and gene_expression.shape[1] > 1:
+            # 多spot模式：使用专门的多spot处理方法
+            print(f"🔄 检测到多spot输入 {gene_expression.shape}，切换到多spot模式")
+            return self.forward_multi_spot(gene_expression, histology_features, positions, class_labels)
+        
+        # 单spot模式：原有的训练逻辑
+        if gene_expression.dim() == 3:
+            # 如果输入是[B, 1, num_genes]，压缩维度
+            B, N, num_genes = gene_expression.shape
+            if N == 1:
+                gene_expression = gene_expression.squeeze(1)  # [B, num_genes]
+                print(f"🔧 压缩单spot输入: [B, N=1, num_genes] -> [B, num_genes]")
+            else:
+                # 这种情况现在由forward_multi_spot处理
+                raise ValueError(f"意外的多spot输入在单spot模式中: {gene_expression.shape}")
+        
+        if histology_features.dim() == 3:
+            # 如果输入是[B, 1, feature_dim]，压缩维度
+            B, N, feature_dim = histology_features.shape
+            if N == 1:
+                histology_features = histology_features.squeeze(1)  # [B, feature_dim]
+                print(f"🔧 压缩单spot特征: [B, N=1, feature_dim] -> [B, feature_dim]")
+            else:
+                # 如果是多spot，取平均（兼容性处理）
+                histology_features = histology_features.mean(dim=1)  # [B, feature_dim]
+                print(f"🔧 平均多spot特征: [B, N={N}, feature_dim] -> [B, feature_dim]")
+        
+        B, num_genes = gene_expression.shape
         device = gene_expression.device
         
-        print(f"📊 VAR-ST训练前向传播:")
+        print(f"📊 VAR-ST训练前向传播 (基因多尺度模式):")
         print(f"   - 基因表达: {gene_expression.shape}")
         print(f"   - 组织学特征: {histology_features.shape}")
-        print(f"   - 空间位置: {positions.shape}")
         
         # 确保输入张量连续性
         gene_expression = gene_expression.contiguous()
-        histology_features = histology_features.contiguous() 
-        positions = positions.contiguous()
+        histology_features = histology_features.contiguous()
         
         # 动态适配组织学特征维度
         actual_hist_dim = histology_features.shape[-1]
@@ -218,21 +244,21 @@ class VAR_ST_Complete(nn.Module):
             print(f"   - 自动适配: {'UNI编码器(1024维)' if actual_hist_dim == 1024 else 'CONCH编码器(512维)'}")
         
         histology_processor = self._get_histology_processor(actual_hist_dim)
-        processed_hist = histology_processor(histology_features).contiguous()  # [B, N, base_hist_dim]
+        processed_hist = histology_processor(histology_features).contiguous()  # [B, base_hist_dim]
         
         # 生成类别标签 (如果没有提供)
         if class_labels is None:
             # 使用组织学特征的统计量作为类别标签
-            hist_stats = torch.mean(processed_hist.view(B, -1), dim=1) * 1000
+            hist_stats = torch.mean(processed_hist, dim=1) * 1000
             class_labels = hist_stats.long() % 1000  # [B]
             class_labels = class_labels.contiguous()
         
         print(f"   - 类别标签: {class_labels.shape}")
         
-        # Stage 1: 空间多尺度组织
-        print(f"🗂️ Stage 1: 空间多尺度组织")
-        multiscale_expressions = self.spatial_organizer.organize_multiscale(
-            gene_expression, positions
+        # Stage 1: 基因多尺度组织
+        print(f"🧬 Stage 1: 基因多尺度组织")
+        multiscale_expressions = self.gene_organizer.organize_multiscale(
+            gene_expression  # [B, num_genes] -> List[[B, scale_i]]
         )
         
         # Stage 2: 多尺度VQVAE编码
@@ -241,28 +267,25 @@ class VAR_ST_Complete(nn.Module):
         all_vqvae_losses = []
         
         for scale_idx, scale_expression in enumerate(multiscale_expressions):
-            scale = self.spatial_scales[scale_idx]
+            scale = self.gene_scales[scale_idx]
             scale_vqvae = self.vqvaes[scale_idx]
             
-            print(f"   - 编码尺度 {scale}×{scale}: {scale_expression.shape}")
+            print(f"   - 编码尺度 {scale} 特征: {scale_expression.shape}")
             
             # 确保scale_expression连续性
-            scale_expression = scale_expression.contiguous()
+            scale_expression = scale_expression.contiguous()  # [B, scale]
             
-            # 重塑为批量处理格式
-            B, num_cells, num_genes = scale_expression.shape
-            scale_expression_flat = scale_expression.view(-1, num_genes).contiguous()  # [B*num_cells, num_genes]
-            
-            # VQVAE编码
-            vq_result = scale_vqvae.encode_to_tokens(scale_expression_flat)
-            tokens = vq_result['tokens']  # [B*num_cells, 1] or [B*num_cells]
+            # VQVAE编码 - 直接处理[B, scale]格式
+            vq_result = scale_vqvae.encode_to_tokens(scale_expression)
+            tokens = vq_result['tokens']  # [B, 1] or [B]
             vq_loss = vq_result['loss']
             
-            # 确保tokens连续性并重塑回原始批次格式
+            # 确保tokens连续性并统一格式
             tokens = tokens.contiguous()
             if tokens.dim() == 2 and tokens.shape[1] == 1:
-                tokens = tokens.squeeze(1).contiguous()  # [B*num_cells]
-            tokens = tokens.view(B, num_cells).contiguous()  # [B, num_cells]
+                tokens = tokens.squeeze(1).contiguous()  # [B]
+            # 为VAR序列准备：每个样本每个尺度贡献1个token
+            tokens = tokens.unsqueeze(1).contiguous()  # [B, 1] - 每个尺度1个token
             
             all_tokens.append(tokens)
             all_vqvae_losses.append(vq_loss)
@@ -287,11 +310,12 @@ class VAR_ST_Complete(nn.Module):
         print(f"🔄 Stage 5: 重建验证")
         with torch.no_grad():
             # 从tokens重建多尺度表达
-            reconstructed_multiscale = self._decode_multiscale_from_tokens(all_tokens)
+            split_tokens = self._split_tokens_by_scale(combined_tokens)
+            reconstructed_multiscale = self._decode_multiscale_from_tokens(split_tokens)
             
-            # 从多尺度重建原始spots表达
-            reconstructed_expression = self.spatial_organizer.reconstruct_from_multiscale(
-                reconstructed_multiscale, positions, reconstruction_method='finest_scale'
+            # 从多尺度重建原始基因表达
+            reconstructed_expression = self.gene_organizer.reconstruct_from_multiscale(
+                reconstructed_multiscale, reconstruction_method='finest_scale'
             )
             reconstructed_expression = reconstructed_expression.contiguous()
         
@@ -299,23 +323,23 @@ class VAR_ST_Complete(nn.Module):
         total_vqvae_loss = sum(all_vqvae_losses) / len(all_vqvae_losses)
         var_loss = var_result['loss']
         
-        # 空间重建损失
-        spatial_recon_loss = F.mse_loss(reconstructed_expression, gene_expression)
+        # 基因重建损失
+        gene_recon_loss = F.mse_loss(reconstructed_expression, gene_expression)
         
         # 组合损失
-        total_loss = var_loss + 0.1 * total_vqvae_loss + 0.1 * spatial_recon_loss
+        total_loss = var_loss + 0.1 * total_vqvae_loss + 0.1 * gene_recon_loss
         
         print(f"📊 损失统计:")
         print(f"   - VAR损失: {var_loss.item():.4f}")
         print(f"   - VQVAE损失: {total_vqvae_loss.item():.4f}")
-        print(f"   - 空间重建损失: {spatial_recon_loss.item():.4f}")
+        print(f"   - 基因重建损失: {gene_recon_loss.item():.4f}")
         print(f"   - 总损失: {total_loss.item():.4f}")
         
         return {
             'loss': total_loss,
             'var_loss': var_loss,
             'vqvae_loss': total_vqvae_loss,
-            'spatial_recon_loss': spatial_recon_loss,
+            'gene_recon_loss': gene_recon_loss,
             'predictions': reconstructed_expression,
             'targets': gene_expression,
             'tokens': combined_tokens,
@@ -323,11 +347,95 @@ class VAR_ST_Complete(nn.Module):
             'predicted_expression': reconstructed_expression,
             'logits': reconstructed_expression
         }
+
+    def forward_multi_spot(
+        self,
+        gene_expression: torch.Tensor,  # [B, N, num_genes]
+        histology_features: torch.Tensor,  # [B, N, feature_dim] 
+        positions: Optional[torch.Tensor] = None,  # [B, N, 2]
+        class_labels: Optional[torch.Tensor] = None  # [B]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        多spot前向传播 - 独立预测每个spot的基因表达
+        
+        这个方法专门处理验证/测试时的多spot输入，
+        为每个spot独立进行基因多尺度预测。
+        
+        Args:
+            gene_expression: [B, N, num_genes] - 多个spots的基因表达
+            histology_features: [B, N, feature_dim] - 多个spots的组织学特征
+            positions: Optional[B, N, 2] - 空间位置(基因模式下不使用)
+            class_labels: Optional[B] - 条件类别(扩展到所有spots)
+        
+        Returns:
+            Dict包含多spot预测结果
+        """
+        B, N, num_genes = gene_expression.shape
+        device = gene_expression.device
+        
+        print(f"🌟 VAR-ST多spot前向传播:")
+        print(f"   - 输入shape: {gene_expression.shape}")
+        print(f"   - Batch size: {B}, Spots per sample: {N}")
+        print(f"   - 组织学特征: {histology_features.shape}")
+        
+        # 重塑输入：[B, N, *] -> [B*N, *] 以便独立处理每个spot
+        gene_expr_flat = gene_expression.view(B * N, num_genes).contiguous()  # [B*N, num_genes]
+        
+        # 处理组织学特征
+        if histology_features.dim() == 3:
+            hist_feat_flat = histology_features.view(B * N, -1).contiguous()  # [B*N, feature_dim]
+        else:
+            # 如果组织学特征是[B, feature_dim]，需要扩展到[B*N, feature_dim]
+            hist_feat_flat = histology_features.unsqueeze(1).expand(-1, N, -1).view(B * N, -1).contiguous()
+        
+        # 处理类别标签
+        if class_labels is not None:
+            if class_labels.dim() == 1 and class_labels.shape[0] == B:
+                # [B] -> [B*N]
+                class_labels_flat = class_labels.unsqueeze(1).expand(-1, N).view(B * N).contiguous()
+            else:
+                class_labels_flat = class_labels
+        else:
+            class_labels_flat = None
+        
+        print(f"   - 重塑后基因表达: {gene_expr_flat.shape}")
+        print(f"   - 重塑后组织学特征: {hist_feat_flat.shape}")
+        
+        # 调用单spot训练方法处理每个spot
+        spot_results = self.forward_training(
+            gene_expression=gene_expr_flat,
+            histology_features=hist_feat_flat,
+            positions=None,  # 基因模式下不使用空间位置
+            class_labels=class_labels_flat
+        )
+        
+        # 重塑输出：[B*N, *] -> [B, N, *]
+        predictions = spot_results['predictions']  # [B*N, num_genes]
+        predictions = predictions.view(B, N, num_genes).contiguous()  # [B, N, num_genes]
+        
+        targets = gene_expression  # 保持原始目标格式 [B, N, num_genes]
+        
+        print(f"   - 输出预测shape: {predictions.shape}")
+        print(f"   - 输出目标shape: {targets.shape}")
+        
+        # 返回多spot格式的结果
+        return {
+            'loss': spot_results['loss'],  # 标量损失
+            'var_loss': spot_results['var_loss'],
+            'vqvae_loss': spot_results['vqvae_loss'], 
+            'gene_recon_loss': spot_results['gene_recon_loss'],
+            'predictions': predictions,  # [B, N, num_genes]
+            'targets': targets,  # [B, N, num_genes]
+            'tokens': spot_results['tokens'],  # [B*N, total_tokens]
+            'multiscale_expressions': spot_results['multiscale_expressions'],
+            'predicted_expression': predictions,  # [B, N, num_genes]
+            'logits': predictions  # [B, N, num_genes]
+        }
     
     def forward_inference(
         self,
         histology_features: torch.Tensor,
-        positions: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.Tensor] = None,
         cfg_scale: float = 1.5,
         top_k: int = 50,
@@ -336,11 +444,11 @@ class VAR_ST_Complete(nn.Module):
         num_samples: int = 1
     ) -> Dict[str, torch.Tensor]:
         """
-        推理阶段：从组织学特征和空间位置生成基因表达预测
+        推理阶段：从组织学特征生成基因表达预测
         
         Args:
-            histology_features: [B, N, feature_dim] - 组织学特征
-            positions: [B, N, 2] - 空间坐标
+            histology_features: [B, feature_dim] - 组织学特征
+            positions: Optional[torch.Tensor] - 空间坐标(基因模式下不使用)
             class_labels: [B] - 条件类别(可选)
             cfg_scale: Classifier-free guidance缩放因子
             top_k, top_p, temperature: 采样参数
@@ -349,12 +457,20 @@ class VAR_ST_Complete(nn.Module):
         Returns:
             Dict包含生成的基因表达预测
         """
-        B, N, feature_dim = histology_features.shape
+        # 处理输入维度
+        if histology_features.dim() == 3:
+            B, N, feature_dim = histology_features.shape
+            if N == 1:
+                histology_features = histology_features.squeeze(1)  # [B, feature_dim]
+            else:
+                histology_features = histology_features.mean(dim=1)  # [B, feature_dim]
+            print(f"🔧 转换多spot特征: [B, N={N}, feature_dim] -> [B, feature_dim]")
+        
+        B, feature_dim = histology_features.shape
         device = histology_features.device
         
-        print(f"🔮 VAR-ST推理生成:")
+        print(f"🔮 VAR-ST推理生成 (基因多尺度模式):")
         print(f"   - 输入特征: {histology_features.shape}")
-        print(f"   - 空间位置: {positions.shape}")
         print(f"   - CFG scale: {cfg_scale}")
         
         # 处理组织学特征
@@ -364,7 +480,7 @@ class VAR_ST_Complete(nn.Module):
         
         # 生成类别标签
         if class_labels is None:
-            hist_stats = torch.mean(processed_hist.view(B, -1), dim=1) * 1000
+            hist_stats = torch.mean(processed_hist, dim=1) * 1000
             class_labels = hist_stats.long() % 1000
         
         print(f"   - 类别标签: {class_labels.shape}")
@@ -377,31 +493,38 @@ class VAR_ST_Complete(nn.Module):
             cfg=cfg_scale,
             top_k=top_k,
             top_p=top_p,
-            temperature=temperature,
-            generator=torch.Generator(device=device).manual_seed(42)
+            temperature=temperature
         )
+        
+        if isinstance(generated_tokens, list):
+            # 如果VAR返回list，转换为tensor
+            generated_tokens = torch.cat(generated_tokens, dim=1)  # [B*num_samples, total_tokens]
         
         print(f"   - 生成tokens: {generated_tokens.shape}")
         
-        # 分解tokens到不同尺度
-        split_tokens = self._split_tokens_by_scale(generated_tokens)
-        
         # 从tokens解码多尺度基因表达
-        print(f"🔧 从tokens解码多尺度基因表达...")
+        print(f"🔄 从tokens解码基因表达...")
+        split_tokens = self._split_tokens_by_scale(generated_tokens)
         decoded_multiscale = self._decode_multiscale_from_tokens(split_tokens)
         
         # 从多尺度重建最终基因表达
         print(f"🔄 从多尺度重建最终基因表达...")
-        final_expression = self.spatial_organizer.reconstruct_from_multiscale(
-            decoded_multiscale, positions, reconstruction_method='hierarchical'
+        final_expression = self.gene_organizer.reconstruct_from_multiscale(
+            decoded_multiscale, reconstruction_method='finest_scale'
         )
         
-        print(f"   - 最终预测: {final_expression.shape}")
+        # 重塑为原始批次大小
+        if num_samples > 1:
+            final_expression = final_expression.view(B, num_samples, -1)
+        
+        print(f"✅ 推理完成: {final_expression.shape}")
         
         return {
             'predictions': final_expression,
-            'tokens': generated_tokens,
-            'multiscale_expressions': decoded_multiscale
+            'generated_tokens': generated_tokens,
+            'multiscale_expressions': decoded_multiscale,
+            'predicted_expression': final_expression,
+            'logits': final_expression
         }
     
     def _decode_multiscale_from_tokens(
@@ -412,25 +535,23 @@ class VAR_ST_Complete(nn.Module):
         decoded_expressions = []
         
         for scale_idx, scale_tokens in enumerate(split_tokens):
-            scale = self.spatial_scales[scale_idx]
+            scale = self.gene_scales[scale_idx]
             scale_vqvae = self.vqvaes[scale_idx]
             
             # 确保scale_tokens连续性
             scale_tokens = scale_tokens.contiguous()
             
-            # 重塑为VQVAE期望的格式
-            B, num_cells = scale_tokens.shape
-            scale_tokens_flat = scale_tokens.view(-1).contiguous()  # [B*num_cells]
+            # 处理tokens格式：[B, 1] -> [B]
+            if scale_tokens.dim() == 2 and scale_tokens.shape[1] == 1:
+                scale_tokens = scale_tokens.squeeze(1).contiguous()  # [B]
             
             # VQVAE解码
-            decoded_flat = scale_vqvae.decode_from_tokens(scale_tokens_flat)  # [B*num_cells, num_genes]
-            decoded_flat = decoded_flat.contiguous()
-            
-            # 重塑回多尺度格式
-            num_genes = decoded_flat.shape[-1]
-            decoded = decoded_flat.view(B, num_cells, num_genes).contiguous()  # [B, num_cells, num_genes]
+            decoded = scale_vqvae.decode_from_tokens(scale_tokens)  # [B, scale]
+            decoded = decoded.contiguous()
             
             decoded_expressions.append(decoded)
+            
+            print(f"   - 解码尺度{scale_idx+1}: tokens{scale_tokens.shape} -> 表达{decoded.shape}")
         
         return decoded_expressions
     
@@ -455,17 +576,36 @@ class VAR_ST_Complete(nn.Module):
         """统一前向传播接口"""
         mode = inputs.get('mode', 'training')
         
+        # 检查输入数据格式
+        gene_expression = inputs.get('gene_expression')
+        histology_features = inputs.get('histology_features')
+        
+        # 智能模式检测
         if mode == 'training':
-            return self.forward_training(
-                gene_expression=inputs['gene_expression'],
-                histology_features=inputs['histology_features'],
-                positions=inputs['positions'],
-                class_labels=inputs.get('class_labels')
-            )
+            # 训练模式：优先使用forward_training
+            # 但如果检测到多spot输入，自动切换到多spot模式
+            if (gene_expression is not None and 
+                gene_expression.dim() == 3 and 
+                gene_expression.shape[1] > 1):
+                print(f"🔍 训练模式检测到多spot输入，自动使用多spot处理")
+                return self.forward_training(
+                    gene_expression=gene_expression,
+                    histology_features=histology_features,
+                    positions=inputs.get('positions'),
+                    class_labels=inputs.get('class_labels')
+                )
+            else:
+                return self.forward_training(
+                    gene_expression=gene_expression,
+                    histology_features=histology_features,
+                    positions=inputs.get('positions'),
+                    class_labels=inputs.get('class_labels')
+                )
         else:
+            # 推理模式：使用forward_inference
             return self.forward_inference(
-                histology_features=inputs['histology_features'],
-                positions=inputs['positions'],
+                histology_features=histology_features,
+                positions=inputs.get('positions'),
                 class_labels=inputs.get('class_labels'),
                 cfg_scale=inputs.get('cfg_scale', 1.5),
                 top_k=inputs.get('top_k', 50),

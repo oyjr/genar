@@ -434,13 +434,26 @@ class STDataset(Dataset):
         if self.mode == 'train':
             return self.cumlen[-1] if len(self.cumlen) > 0 else 0
         else:
-            return len(self.ids)
+            # 验证/测试模式：返回所有spots的总数，而不是slide数量
+            # 这样验证时也会逐个spot处理，保持与训练的一致性
+            if hasattr(self, 'val_cumlen'):
+                return self.val_cumlen[-1] if len(self.val_cumlen) > 0 else 0
+            else:
+                # 计算验证/测试模式的累积长度 - 动态加载数据计算长度
+                val_lengths = []
+                for slide_id in self.ids:
+                    # 动态加载ST数据来计算长度
+                    adata = self.load_st(slide_id, self.genes, **self.norm_param)
+                    val_lengths.append(len(adata))
+                self.val_cumlen = np.cumsum(val_lengths)
+                return self.val_cumlen[-1] if len(self.val_cumlen) > 0 else 0
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         if self.mode == 'train':
             return self._get_train_item(index)
         else:
-            return self._get_eval_item(index)
+            # 验证/测试模式：也使用单spot处理
+            return self._get_eval_item_single_spot(index)
 
     def _get_train_item(self, index: int) -> Dict[str, torch.Tensor]:
         """训练模式获取单个spot数据"""
@@ -508,8 +521,53 @@ class STDataset(Dataset):
                 'spot_idx': sample_idx
             }
 
+    def _get_eval_item_single_spot(self, index: int) -> Dict[str, torch.Tensor]:
+        """验证/测试模式获取单个spot数据 - 与训练保持一致"""
+        # 确保val_cumlen已初始化
+        if not hasattr(self, 'val_cumlen'):
+            val_lengths = []
+            for slide_id in self.ids:
+                # 动态加载ST数据来计算长度
+                adata = self.load_st(slide_id, self.genes, **self.norm_param)
+                val_lengths.append(len(adata))
+            self.val_cumlen = np.cumsum(val_lengths)
+        
+        # 找到对应的slide和样本索引
+        i = 0
+        while index >= self.val_cumlen[i]:
+            i += 1
+        
+        sample_idx = index
+        if i > 0:
+            sample_idx = index - self.val_cumlen[i-1]
+        
+        slide_id = self.int2id[i]
+        
+        # 加载单个spot的嵌入特征
+        features = self.load_emb(slide_id, sample_idx, 'first')  # [feature_dim]
+        
+        # 动态加载单个spot的基因表达
+        adata = self.load_st(slide_id, self.genes, **self.norm_param)
+        expression = adata[sample_idx].X
+        
+        if sparse.issparse(expression):
+            expression = expression.toarray().squeeze(0)
+        else:
+            expression = expression.squeeze(0)
+        
+        # 加载位置信息
+        positions = adata.obsm['positions'][sample_idx]  # [2]
+        
+        return {
+            'img': torch.FloatTensor(features),  # [feature_dim] - 单个spot
+            'target_genes': torch.FloatTensor(expression),  # [num_genes] - 单个spot
+            'positions': torch.FloatTensor(positions),  # [2] - 单个spot
+            'slide_id': slide_id,
+            'spot_idx': sample_idx
+        }
+
     def _get_eval_item(self, index: int) -> Dict[str, torch.Tensor]:
-        """验证/测试模式获取整个slide数据"""
+        """验证/测试模式获取整个slide数据 - 保留原方法以备需要"""
         slide_id = self.int2id[index]
         
         # 加载嵌入特征
@@ -533,4 +591,56 @@ class STDataset(Dataset):
             'slide_id': slide_id,
             'num_spots': adata.n_obs
         }
+
+    def get_full_slide_for_testing(self, slide_id: str) -> Dict[str, torch.Tensor]:
+        """
+        获取完整slide的所有spot数据用于测试
+        
+        Args:
+            slide_id: slide标识符
+            
+        Returns:
+            包含所有spot数据的字典，格式为：
+            {
+                'img': [num_spots, feature_dim],
+                'target_genes': [num_spots, num_genes],
+                'positions': [num_spots, 2],
+                'slide_id': str,
+                'num_spots': int
+            }
+        """
+        # 加载嵌入特征
+        features = self.load_emb(slide_id, None, 'first')  # [num_spots, feature_dim]
+        
+        # 加载ST数据
+        adata = self.load_st(slide_id, self.genes, **self.norm_param)
+        
+        # 加载基因表达
+        expression = adata.X
+        if sparse.issparse(expression):
+            expression = expression.toarray()
+        
+        # 加载位置信息
+        positions = adata.obsm['positions']  # [num_spots, 2]
+        
+        return {
+            'img': torch.FloatTensor(features),  # [num_spots, feature_dim]
+            'target_genes': torch.FloatTensor(expression),  # [num_spots, num_genes]
+            'positions': torch.FloatTensor(positions),  # [num_spots, 2]
+            'slide_id': slide_id,
+            'num_spots': adata.n_obs,
+            'adata': adata  # 保存adata用于后续分析
+        }
+
+    def get_test_slide_ids(self) -> List[str]:
+        """
+        获取测试模式的所有slide ID列表
+        
+        Returns:
+            测试slide的ID列表
+        """
+        if self.mode == 'test':
+            return self.ids
+        else:
+            return []
 

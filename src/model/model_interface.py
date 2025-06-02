@@ -14,6 +14,7 @@ from torchmetrics.regression import (
 
 from scipy.stats import pearsonr
 from datetime import datetime
+from typing import Dict, Any
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
@@ -312,147 +313,47 @@ class ModelInterface(pl.LightningModule):
 
     def _preprocess_inputs_var_st(self, inputs):
         """
-        为VAR_ST模型预处理输入数据 - 真正的空间多尺度模式
+        VAR-ST模型输入预处理 - 基因维度多尺度模式
         
-        VAR_ST现在需要的输入格式：
-        - gene_expression: [B, N, num_genes] (spots基因表达)
-        - histology_features: [B, N, feature_dim] (spots组织学特征)
-        - positions: [B, N, 2] (spots空间坐标)
-        - mode: 'training' 或 'inference'
+        期望输入：
+        - target_genes: [B, num_genes] (基因表达向量)
+        - img: [B, feature_dim] (组织学特征)
+        
+        不需要positions参数，因为基因多尺度在基因维度而非空间维度
         """
         processed = {}
         
-        # 基因表达数据处理
+        # 基因表达数据处理 - 直接使用，不做维度转换
         if 'target_genes' in inputs:
-            target_genes = inputs['target_genes']  # 可能是 [B, N, num_genes] 或 [B, num_genes]
+            target_genes = inputs['target_genes']
+            processed['gene_expression'] = target_genes
+            print(f"📊 基因表达数据: {target_genes.shape}")
             
-            if target_genes.dim() == 3:
-                # 多spots格式: [B, N, num_genes] - 直接使用
-                processed['gene_expression'] = target_genes
-                B, N, num_genes = target_genes.shape
-                print(f"📊 基因表达数据(多spots): {target_genes.shape}")
-                
-            elif target_genes.dim() == 2:
-                # 需要扩展为多spots格式: [B, num_genes] -> [B, 1, num_genes]
-                processed['gene_expression'] = target_genes.unsqueeze(1)
-                B, num_genes = target_genes.shape
-                N = 1  # 单spot
-                print(f"📊 基因表达数据转换: {target_genes.shape} -> {processed['gene_expression'].shape}")
-            else:
+            # 验证维度
+            if target_genes.dim() not in [2, 3]:
                 raise ValueError(f"不支持的target_genes维度: {target_genes.shape}")
         
-        # 组织学特征处理
+        # 组织学特征处理 - 直接使用，不做维度转换
         if 'img' in inputs:
             img_features = inputs['img']
-            print(f"🔍 原始img_features形状: {img_features.shape}")
+            processed['histology_features'] = img_features
+            print(f"🖼️  组织学特征: {img_features.shape}")
             
-            # 处理不同的输入维度
-            if img_features.dim() == 4:
-                # 4D: [B, C, N, feature_dim] -> 去掉多余维度
-                B, C, N, feature_dim = img_features.shape
-                if C == 1:
-                    img_features = img_features.squeeze(1)  # [B, N, feature_dim]
-                    print(f"  -> 移除通道维度: [B, C, N, feature_dim] -> [B, N, feature_dim]")
-                else:
-                    raise ValueError(f"不支持的通道数: {C}")
-            
-            if img_features.dim() == 3:
-                # 3D: [B, N, feature_dim] - 理想的多spots格式
-                processed['histology_features'] = img_features
-                B, N, feature_dim = img_features.shape
-                print(f"🖼️  组织学特征(多spots): {img_features.shape}")
-                    
-            elif img_features.dim() == 2:
-                # 2D: [B, feature_dim] - 需要扩展为多spots格式
-                processed['histology_features'] = img_features.unsqueeze(1)  # [B, 1, feature_dim]
-                B, feature_dim = img_features.shape
-                N = 1
-                print(f"🖼️  组织学特征转换: {img_features.shape} -> {processed['histology_features'].shape}")
-            else:
+            # 验证维度
+            if img_features.dim() not in [2, 3]:
                 raise ValueError(f"不支持的img_features维度: {img_features.shape}")
         else:
             raise ValueError("Missing histology features ('img' key not found in inputs)")
         
-        # 空间位置处理
+        # 空间位置处理 - 基因多尺度模式下可选
         if 'positions' in inputs:
-            positions = inputs['positions']
-            print(f"📍 原始positions形状: {positions.shape}")
-            
-            if positions.dim() == 3:
-                # 3D: [B, N, 2] - 理想格式
-                processed['positions'] = positions
-                print(f"📍 空间位置(多spots): {positions.shape}")
-                
-            elif positions.dim() == 2:
-                if positions.shape[1] == 2:
-                    # 2D: [B, 2] - 需要扩展为多spots格式
-                    processed['positions'] = positions.unsqueeze(1)  # [B, 1, 2]
-                    print(f"📍 空间位置转换: {positions.shape} -> {processed['positions'].shape}")
-                else:
-                    # 可能是 [N, 2]，需要添加batch维度
-                    processed['positions'] = positions.unsqueeze(0)  # [1, N, 2]
-                    print(f"📍 空间位置添加batch: {positions.shape} -> {processed['positions'].shape}")
-            else:
-                raise ValueError(f"不支持的positions维度: {positions.shape}")
-        else:
-            # 如果没有提供positions，生成默认的网格位置
-            if 'histology_features' in processed:
-                B, N, _ = processed['histology_features'].shape
-                # 生成 N×1 的网格位置
-                if N == 1:
-                    # 单spot：放在中心
-                    default_positions = torch.tensor([[[0.5, 0.5]]], dtype=torch.float32)
-                else:
-                    # 多spots：生成网格布局
-                    grid_size = int(np.ceil(np.sqrt(N)))
-                    coords = np.linspace(0.1, 0.9, grid_size)
-                    pos_list = []
-                    for i in range(N):
-                        row = i // grid_size
-                        col = i % grid_size
-                        if row < len(coords) and col < len(coords):
-                            pos_list.append([coords[col], coords[row]])
-                        else:
-                            pos_list.append([0.5, 0.5])  # 默认中心位置
-                    
-                    default_positions = torch.tensor(pos_list, dtype=torch.float32).unsqueeze(0)  # [1, N, 2]
-                    default_positions = default_positions.expand(B, -1, -1)  # [B, N, 2]
-                
-                processed['positions'] = default_positions
-                print(f"📍 生成默认空间位置: {processed['positions'].shape}")
-            else:
-                raise ValueError("Cannot determine spatial positions without histology features")
-        
-        # 确保所有维度一致
-        if 'gene_expression' in processed and 'histology_features' in processed:
-            gene_B, gene_N, _ = processed['gene_expression'].shape
-            hist_B, hist_N, _ = processed['histology_features'].shape
-            pos_B, pos_N, _ = processed['positions'].shape
-            
-            if not (gene_B == hist_B == pos_B and gene_N == hist_N == pos_N):
-                print(f"⚠️ 维度不一致:")
-                print(f"   - 基因表达: [B={gene_B}, N={gene_N}]")
-                print(f"   - 组织学特征: [B={hist_B}, N={hist_N}]")
-                print(f"   - 空间位置: [B={pos_B}, N={pos_N}]")
-                
-                # 尝试调整到一致的维度
-                max_B = max(gene_B, hist_B, pos_B)
-                max_N = max(gene_N, hist_N, pos_N)
-                
-                # 扩展batch维度
-                if gene_B < max_B:
-                    processed['gene_expression'] = processed['gene_expression'].expand(max_B, -1, -1)
-                if hist_B < max_B:
-                    processed['histology_features'] = processed['histology_features'].expand(max_B, -1, -1)
-                if pos_B < max_B:
-                    processed['positions'] = processed['positions'].expand(max_B, -1, -1)
-                
-                print(f"   -> 调整后维度: [B={max_B}, N={max_N}]")
+            processed['positions'] = inputs['positions']
+            print(f"📍 空间位置: {inputs['positions'].shape} (基因模式下不使用)")
         
         # 设置模式
         processed['mode'] = 'training' if 'target_genes' in inputs else 'inference'
         
-        print(f"✅ VAR_ST预处理完成:")
+        print(f"✅ VAR_ST预处理完成 (基因多尺度模式):")
         print(f"   - 模式: {processed['mode']}")
         for key, value in processed.items():
             if isinstance(value, torch.Tensor):
@@ -1357,10 +1258,11 @@ class ModelInterface(pl.LightningModule):
 
     def _postprocess_outputs_var_st(self, outputs, original_inputs):
         """
-        为VAR_ST模型后处理输出数据 - 真正的空间多尺度模式
+        为VAR_ST模型后处理输出数据 - 基因维度多尺度模式
         
-        新的VAR-ST模型输入输出都是 [B, N, num_genes] 格式，
-        基本不需要特殊后处理，但需要处理一些字段映射
+        支持单spot和多spot输出：
+        - 单spot: [B, num_genes] 
+        - 多spot: [B, N, num_genes]
         """
         processed = {}
         
@@ -1369,7 +1271,7 @@ class ModelInterface(pl.LightningModule):
             processed['loss'] = outputs['loss']
             processed['var_loss'] = outputs.get('var_loss', outputs['loss'])
             processed['vqvae_loss'] = outputs.get('vqvae_loss', torch.tensor(0.0))
-            processed['spatial_recon_loss'] = outputs.get('spatial_recon_loss', torch.tensor(0.0))
+            processed['gene_recon_loss'] = outputs.get('gene_recon_loss', torch.tensor(0.0))
             
             # 预测和目标数据 - 确保所有必要字段都被传递
             processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
@@ -1377,8 +1279,16 @@ class ModelInterface(pl.LightningModule):
             processed['logits'] = outputs.get('logits', outputs.get('predicted_expression', outputs.get('predictions')))
             processed['targets'] = outputs.get('targets', original_inputs['target_genes'])
             
+            # 智能输出显示
             if processed['predictions'] is not None:
-                print(f"🔄 训练模式输出: {processed['predictions'].shape}")
+                pred_shape = processed['predictions'].shape
+                if len(pred_shape) == 2:
+                    print(f"🔄 单spot训练输出: {pred_shape}")
+                elif len(pred_shape) == 3:
+                    B, N, G = pred_shape
+                    print(f"🔄 多spot训练输出: {pred_shape} (Batch={B}, Spots={N}, Genes={G})")
+                else:
+                    print(f"🔄 训练模式输出: {pred_shape}")
             
         else:
             # 推理模式：直接使用预测结果
@@ -1387,8 +1297,16 @@ class ModelInterface(pl.LightningModule):
             processed['predicted_expression'] = predictions
             processed['logits'] = predictions
             
+            # 智能输出显示
             if processed['predictions'] is not None:
-                print(f"🔄 推理模式输出: {processed['predictions'].shape}")
+                pred_shape = processed['predictions'].shape
+                if len(pred_shape) == 2:
+                    print(f"🔄 单spot推理输出: {pred_shape}")
+                elif len(pred_shape) == 3:
+                    B, N, G = pred_shape
+                    print(f"🔄 多spot推理输出: {pred_shape} (Batch={B}, Spots={N}, Genes={G})")
+                else:
+                    print(f"🔄 推理模式输出: {pred_shape}")
             
             # 复制其他字段
             if 'tokens' in outputs:
@@ -1397,3 +1315,235 @@ class ModelInterface(pl.LightningModule):
                 processed['multiscale_expressions'] = outputs['multiscale_expressions']
         
         return processed
+
+    def test_full_slide(self, slide_data: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+        """
+        对整个slide进行测试，逐spot预测后整合结果
+        
+        Args:
+            slide_data: 完整slide数据，包含：
+                - img: [num_spots, feature_dim]
+                - target_genes: [num_spots, num_genes]
+                - positions: [num_spots, 2]
+                - slide_id: str
+                - num_spots: int
+                
+        Returns:
+            包含预测结果和评价指标的字典
+        """
+        self.eval()  # 设置为评估模式
+        
+        # 获取slide信息
+        slide_id = slide_data['slide_id']
+        num_spots = slide_data['num_spots']
+        
+        print(f"🔬 开始测试slide: {slide_id}，共{num_spots}个spots")
+        logger.info(f"Testing full slide: {slide_id} with {num_spots} spots")
+        
+        # 准备结果容器
+        all_predictions = []
+        all_targets = []
+        
+        # 逐spot进行预测
+        with torch.no_grad():
+            for spot_idx in range(num_spots):
+                # 构造单个spot的batch数据
+                single_spot_batch = {
+                    'img': slide_data['img'][spot_idx:spot_idx+1],  # [1, feature_dim]
+                    'target_genes': slide_data['target_genes'][spot_idx:spot_idx+1],  # [1, num_genes]
+                    'positions': slide_data['positions'][spot_idx:spot_idx+1],  # [1, 2]
+                    'slide_id': slide_id,
+                    'spot_idx': spot_idx
+                }
+                
+                # 移动到正确的设备
+                for key, value in single_spot_batch.items():
+                    if isinstance(value, torch.Tensor):
+                        single_spot_batch[key] = value.to(self.device)
+                
+                # 预处理输入
+                processed_batch = self._preprocess_inputs(single_spot_batch)
+                
+                # 模型预测
+                results_dict = self.model(**processed_batch)
+                
+                # 后处理输出（如果是VAR_ST）
+                if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+                    results_dict = self._postprocess_outputs_var_st(results_dict, single_spot_batch)
+                
+                # 提取预测和目标
+                prediction, target = self._extract_predictions_and_targets(results_dict, single_spot_batch)
+                
+                # 收集结果
+                all_predictions.append(prediction.cpu().numpy())
+                all_targets.append(target.cpu().numpy())
+                
+                # 每100个spot显示一次进度
+                if (spot_idx + 1) % 100 == 0 or spot_idx == num_spots - 1:
+                    print(f"  📈 已处理 {spot_idx + 1}/{num_spots} spots")
+        
+        # 整合所有预测结果
+        predictions_array = np.vstack(all_predictions)  # [num_spots, num_genes]
+        targets_array = np.vstack(all_targets)  # [num_spots, num_genes]
+        
+        print(f"✅ Slide {slide_id} 测试完成")
+        print(f"   预测结果形状: {predictions_array.shape}")
+        print(f"   目标数据形状: {targets_array.shape}")
+        
+        # 计算完整的评价指标
+        metrics = self.calculate_evaluation_metrics(targets_array, predictions_array)
+        
+        # 打印评价结果
+        self.print_evaluation_results(metrics, f"Slide {slide_id}")
+        
+        return {
+            'predictions': predictions_array,
+            'targets': targets_array,
+            'metrics': metrics,
+            'slide_id': slide_id,
+            'num_spots': num_spots
+        }
+
+    def run_full_slide_testing(self) -> Dict[str, Any]:
+        """
+        运行完整的slide测试流程
+        
+        Returns:
+            包含所有slide测试结果的字典
+        """
+        print("🎯 开始整slide测试模式...")
+        logger.info("Starting full slide testing mode...")
+        
+        # 获取测试数据集
+        if not hasattr(self.trainer, 'datamodule'):
+            raise ValueError("No datamodule found in trainer")
+        
+        datamodule = self.trainer.datamodule
+        if not hasattr(datamodule, 'test_dataloader'):
+            raise ValueError("No test dataloader found")
+        
+        test_dataset = datamodule.test_dataloader().dataset
+        
+        # 获取原始dataset（可能被包装了）
+        original_dataset = test_dataset
+        while hasattr(original_dataset, 'dataset'):
+            original_dataset = original_dataset.dataset
+        
+        # 获取测试slide列表
+        test_slide_ids = original_dataset.get_test_slide_ids()
+        
+        if not test_slide_ids:
+            raise ValueError("No test slides found")
+        
+        print(f"📋 找到 {len(test_slide_ids)} 个测试slides: {test_slide_ids}")
+        
+        # 存储所有slide的结果
+        all_slide_results = {}
+        aggregated_predictions = []
+        aggregated_targets = []
+        
+        # 逐个测试每个slide
+        for slide_id in test_slide_ids:
+            print(f"\n{'='*60}")
+            print(f"🔬 测试Slide: {slide_id}")
+            print(f"{'='*60}")
+            
+            # 获取完整slide数据
+            slide_data = original_dataset.get_full_slide_for_testing(slide_id)
+            
+            # 进行测试
+            slide_results = self.test_full_slide(slide_data)
+            
+            # 保存结果
+            all_slide_results[slide_id] = slide_results
+            
+            # 累积所有数据用于总体评估
+            aggregated_predictions.append(slide_results['predictions'])
+            aggregated_targets.append(slide_results['targets'])
+            
+            # 保存单个slide的结果
+            if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
+                save_dir = os.path.join(self.config.GENERAL.log_path, 'test_results')
+            else:
+                save_dir = './logs/test_results'
+            
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"{slide_id}_results.txt")
+            self.save_evaluation_results(slide_results['metrics'], save_path, slide_id, "VAR_ST")
+        
+        # 计算所有slide的聚合结果
+        print(f"\n{'='*60}")
+        print("📊 计算聚合评价指标...")
+        print(f"{'='*60}")
+        
+        all_predictions = np.vstack(aggregated_predictions)
+        all_targets = np.vstack(aggregated_targets)
+        
+        overall_metrics = self.calculate_evaluation_metrics(all_targets, all_predictions)
+        self.print_evaluation_results(overall_metrics, "整体测试结果")
+        
+        # 保存整体结果
+        if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
+            save_dir = os.path.join(self.config.GENERAL.log_path, 'test_results')
+        else:
+            save_dir = './logs/test_results'
+        
+        save_path = os.path.join(save_dir, "overall_results.txt")
+        self.save_evaluation_results(overall_metrics, save_path, "ALL_SLIDES", "VAR_ST")
+        
+        # 生成可视化（如果启用）
+        enable_vis = self._get_visualization_setting()
+        if enable_vis and VISUALIZATION_AVAILABLE:
+            print("🎨 生成测试结果可视化...")
+            
+            # 获取基因名称和marker基因
+            gene_names = self._load_gene_names()
+            marker_genes = self.get_marker_genes_for_dataset(getattr(self.config, 'expr_name', 'default'))
+            
+            # 为每个slide生成可视化
+            for slide_id, slide_results in all_slide_results.items():
+                try:
+                    # 获取对应的adata
+                    slide_data = original_dataset.get_full_slide_for_testing(slide_id)
+                    adata = slide_data.get('adata', None)
+                    
+                    self.create_visualizations(
+                        phase=f"test_{slide_id}",
+                        y_true=slide_results['targets'],
+                        y_pred=slide_results['predictions'],
+                        metrics=slide_results['metrics'],
+                        gene_names=gene_names,
+                        marker_genes=marker_genes,
+                        adata=adata,
+                        slide_id=slide_id
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create visualization for slide {slide_id}: {e}")
+            
+            # 生成整体可视化
+            try:
+                self.create_visualizations(
+                    phase="test_overall",
+                    y_true=all_targets,
+                    y_pred=all_predictions,
+                    metrics=overall_metrics,
+                    gene_names=gene_names,
+                    marker_genes=marker_genes
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create overall visualization: {e}")
+        
+        print(f"\n🎉 整slide测试完成!")
+        print(f"  测试slides数量: {len(test_slide_ids)}")
+        print(f"  总spots数量: {all_predictions.shape[0]}")
+        print(f"  基因数量: {all_predictions.shape[1]}")
+        print(f"  整体PCC-10: {overall_metrics['PCC-10']:.4f}")
+        print(f"  整体MSE: {overall_metrics['MSE']:.4f}")
+        
+        return {
+            'slide_results': all_slide_results,
+            'overall_metrics': overall_metrics,
+            'overall_predictions': all_predictions,
+            'overall_targets': all_targets,
+            'test_slide_ids': test_slide_ids
+        }
