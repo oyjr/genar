@@ -154,7 +154,7 @@ class ModelInterface(pl.LightningModule):
         self._save_step_outputs('test', loss, logits, target_genes, batch_idx)
         
         return {'logits': logits, 'target_genes': target_genes}
-
+    
     def configure_optimizers(self):
         """
         Configure optimizer and learning rate scheduler with multi-GPU support.
@@ -1371,8 +1371,10 @@ class ModelInterface(pl.LightningModule):
             processed['vqvae_loss'] = outputs.get('vqvae_loss', torch.tensor(0.0))
             processed['spatial_recon_loss'] = outputs.get('spatial_recon_loss', torch.tensor(0.0))
             
-            # 预测和目标数据
+            # 预测和目标数据 - 确保所有必要字段都被传递
             processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
+            processed['predicted_expression'] = outputs.get('predicted_expression', outputs.get('predictions'))
+            processed['logits'] = outputs.get('logits', outputs.get('predicted_expression', outputs.get('predictions')))
             processed['targets'] = outputs.get('targets', original_inputs['target_genes'])
             
             if processed['predictions'] is not None:
@@ -1380,7 +1382,10 @@ class ModelInterface(pl.LightningModule):
             
         else:
             # 推理模式：直接使用预测结果
-            processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
+            predictions = outputs.get('predictions', outputs.get('predicted_expression'))
+            processed['predictions'] = predictions
+            processed['predicted_expression'] = predictions
+            processed['logits'] = predictions
             
             if processed['predictions'] is not None:
                 print(f"🔄 推理模式输出: {processed['predictions'].shape}")

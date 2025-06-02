@@ -249,13 +249,14 @@ class VAR_ST(nn.Module):
         # Process each scale in the multi-scale sequence
         for si, pn in enumerate(self.patch_nums[:-1]):  # Exclude last scale
             # Current scale tokens
-            cur_indices = gt_indices[si].view(B, -1)  # [B, pn*pn]
+            cur_indices = gt_indices[si].view(B, -1).contiguous()  # [B, pn*pn]
             cur_tokens = self.token_embed[si](cur_indices)  # [B, pn*pn, embed_dim]
-            cur_pos = self.pos_embed[si].expand(B, -1, -1)  # [B, pn*pn, embed_dim]
+            cur_pos = self.pos_embed[si].expand(B, -1, -1).contiguous()  # [B, pn*pn, embed_dim]
             cur_tokens = cur_tokens + cur_pos
+            cur_tokens = cur_tokens.contiguous()
             
             # Concatenate with previous sequence
-            x = torch.cat([x, cur_tokens], dim=1)  # [B, seq_len, embed_dim]
+            x = torch.cat([x, cur_tokens], dim=1).contiguous()  # [B, seq_len, embed_dim]
             
             # Apply transformer blocks with adaptive conditioning
             for block in self.blocks:
@@ -266,13 +267,14 @@ class VAR_ST(nn.Module):
             next_len = next_pn * next_pn
             
             # Extract representations for next scale prediction
-            pred_repr = x[:, -next_len:]  # [B, next_len, embed_dim]
+            pred_repr = x[:, -next_len:].contiguous()  # [B, next_len, embed_dim]
             pred_repr = self.head_nm(pred_repr, conditioning)
             logits = self.head[si + 1](pred_repr)  # [B, next_len, vocab_size]
+            logits = logits.contiguous()
             
             # Compute cross-entropy loss with ground truth
-            gt_next = gt_indices[si + 1].view(B, -1)  # [B, next_len]
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), gt_next.view(-1))
+            gt_next = gt_indices[si + 1].view(B, -1).contiguous()  # [B, next_len]
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), gt_next.reshape(-1))
             total_loss += loss
         
         return total_loss / (len(self.patch_nums) - 1)
@@ -363,19 +365,20 @@ class VAR_ST(nn.Module):
             # Sample tokens
             if top_k > 0 or top_p > 0:
                 indices = sample_with_top_k_top_p_(logits, top_k=top_k, top_p=top_p, rng=rng)
-                indices = indices.squeeze(-1)  # [B, cur_len]
+                indices = indices.squeeze(-1).contiguous()  # [B, cur_len]
             else:
-                indices = torch.multinomial(F.softmax(logits, dim=-1).view(-1, logits.size(-1)), 
-                                          num_samples=1, generator=rng).view(logits.shape[0], -1)
+                logits_softmax = F.softmax(logits, dim=-1).contiguous()
+                indices = torch.multinomial(logits_softmax.reshape(-1, logits.size(-1)), 
+                                          num_samples=1, generator=rng).reshape(logits.shape[0], -1).contiguous()
             
-            generated_indices.append(indices.view(B, pn, pn))
+            generated_indices.append(indices.reshape(B, pn, pn).contiguous())
             
             # Add generated tokens to sequence for next scale
             if si < len(self.patch_nums) - 1:
                 gen_tokens = self.token_embed[si](indices)  # [B, cur_len, embed_dim]
-                gen_pos = self.pos_embed[si].expand(B, -1, -1)
-                gen_tokens = gen_tokens + gen_pos
-                x = torch.cat([x, gen_tokens], dim=1)
+                gen_pos = self.pos_embed[si].expand(B, -1, -1).contiguous()
+                gen_tokens = (gen_tokens + gen_pos).contiguous()
+                x = torch.cat([x, gen_tokens], dim=1).contiguous()
         
         return generated_indices
     
@@ -484,26 +487,33 @@ class VAR(nn.Module):
         B = tokens.shape[0]
         device = tokens.device
         
+        # 确保输入tokens是连续的
+        tokens = tokens.contiguous()
+        
         # 分解tokens到不同尺度
         scale_tokens = []
         start_idx = 0
         for scale in self.patch_nums:
             end_idx = start_idx + scale
             if end_idx <= tokens.shape[1]:
-                scale_tokens.append(tokens[:, start_idx:end_idx])
+                # 确保切片后的张量是连续的
+                scale_token = tokens[:, start_idx:end_idx].contiguous()
+                scale_tokens.append(scale_token)
             else:
                 # 填充不足的tokens
                 remaining = end_idx - tokens.shape[1]
                 if start_idx < tokens.shape[1]:
-                    partial_tokens = tokens[:, start_idx:]
+                    partial_tokens = tokens[:, start_idx:].contiguous()
                     pad_tokens = torch.zeros(B, remaining, dtype=torch.long, device=device)
-                    scale_tokens.append(torch.cat([partial_tokens, pad_tokens], dim=1))
+                    scale_token = torch.cat([partial_tokens, pad_tokens], dim=1).contiguous()
+                    scale_tokens.append(scale_token)
                 else:
-                    scale_tokens.append(torch.zeros(B, scale, dtype=torch.long, device=device))
+                    scale_token = torch.zeros(B, scale, dtype=torch.long, device=device).contiguous()
+                    scale_tokens.append(scale_token)
             start_idx = end_idx
         
         # 初始化序列
-        start_token = self.pos_start.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)  # [B, 1, embed_dim]
+        start_token = self.pos_start.unsqueeze(0).unsqueeze(0).expand(B, 1, -1).contiguous()  # [B, 1, embed_dim]
         sequence = start_token
         
         total_loss = 0.0
@@ -512,20 +522,21 @@ class VAR(nn.Module):
         # 对每个尺度进行自回归训练
         for i in range(len(scale_tokens) - 1):
             # 当前尺度的tokens
-            current_tokens = scale_tokens[i]  # [B, scale_i]
+            current_tokens = scale_tokens[i]  # [B, scale_i] - 已经是连续的
             
             # Token embedding
             token_emb = self.token_embed[i](current_tokens)  # [B, scale_i, embed_dim]
             
             # Position embedding
-            pos_indices = torch.arange(self.patch_nums[i], device=device).unsqueeze(0).expand(B, -1)
+            pos_indices = torch.arange(self.patch_nums[i], device=device).unsqueeze(0).expand(B, -1).contiguous()
             pos_emb = self.pos_embed[i](pos_indices)  # [B, scale_i, embed_dim]
             
             # 组合embedding
             current_repr = token_emb + pos_emb  # [B, scale_i, embed_dim]
+            current_repr = current_repr.contiguous()
             
             # 添加到序列
-            sequence = torch.cat([sequence, current_repr], dim=1)  # [B, seq_len, embed_dim]
+            sequence = torch.cat([sequence, current_repr], dim=1).contiguous()  # [B, seq_len, embed_dim]
             
             # Transformer处理
             x = sequence
@@ -537,19 +548,20 @@ class VAR(nn.Module):
             
             # 修复：使用序列的最后hidden state来预测所有下一尺度的tokens
             # 获取最后一个hidden state并扩展到预测所有next_scale个tokens
-            last_hidden = x[:, -1:, :]  # [B, 1, embed_dim] - 取最后一个位置
-            pred_input = last_hidden.expand(-1, next_scale, -1)  # [B, next_scale, embed_dim]
+            last_hidden = x[:, -1:, :].contiguous()  # [B, 1, embed_dim] - 取最后一个位置
+            pred_input = last_hidden.expand(-1, next_scale, -1).contiguous()  # [B, next_scale, embed_dim]
             pred_input = self.norm(pred_input)
             
             # 输出预测
             logits = self.heads[i + 1](pred_input)  # [B, next_scale, vocab_size]
+            logits = logits.contiguous()
             
             # 计算loss
-            target_tokens = scale_tokens[i + 1]  # [B, next_scale]
+            target_tokens = scale_tokens[i + 1]  # [B, next_scale] - 已经是连续的
             
-            # 确保维度匹配
-            logits_flat = logits.view(-1, self.vocab_size)  # [B*next_scale, vocab_size]
-            target_flat = target_tokens.view(-1)  # [B*next_scale]
+            # 确保维度匹配 - 使用reshape代替view以提高健壮性
+            logits_flat = logits.reshape(-1, self.vocab_size)  # [B*next_scale, vocab_size]
+            target_flat = target_tokens.reshape(-1)  # [B*next_scale]
             
             print(f"🔍 Loss计算 - 尺度{i}->{i+1}:")
             print(f"   - logits: {logits.shape} -> {logits_flat.shape}")
@@ -595,7 +607,7 @@ class VAR(nn.Module):
         device = next(self.parameters()).device
         
         # 初始化序列
-        start_token = self.pos_start.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+        start_token = self.pos_start.unsqueeze(0).unsqueeze(0).expand(B, 1, -1).contiguous()
         sequence = start_token
         
         all_generated = []
@@ -608,17 +620,18 @@ class VAR(nn.Module):
                 for block in self.blocks:
                     x = block(x)
                 
-                pred_input = x[:, -1:].expand(-1, scale, -1)  # [B, scale, embed_dim]
+                pred_input = x[:, -1:].expand(-1, scale, -1).contiguous()  # [B, scale, embed_dim]
             else:
                 # 后续尺度：基于之前的序列预测
                 x = sequence
                 for block in self.blocks:
                     x = block(x)
                 
-                pred_input = x[:, -scale:]  # [B, scale, embed_dim]
+                pred_input = x[:, -scale:].contiguous()  # [B, scale, embed_dim]
             
             pred_input = self.norm(pred_input)
             logits = self.heads[i](pred_input)  # [B, scale, vocab_size]
+            logits = logits.contiguous()
             
             # 应用温度
             if temperature != 1.0:
@@ -642,19 +655,19 @@ class VAR(nn.Module):
                     logits[indices_to_remove] = float('-inf')
             
             # 采样tokens
-            probs = F.softmax(logits, dim=-1)
-            tokens = torch.multinomial(probs.view(-1, self.vocab_size), 1, generator=generator)
-            tokens = tokens.view(B, scale)  # [B, scale]
+            probs = F.softmax(logits, dim=-1).contiguous()
+            tokens = torch.multinomial(probs.reshape(-1, self.vocab_size), 1, generator=generator)
+            tokens = tokens.reshape(B, scale).contiguous()  # [B, scale]
             
             all_generated.append(tokens)
             
             # 更新序列（除了最后一个尺度）
             if i < len(self.patch_nums) - 1:
                 token_emb = self.token_embed[i](tokens)
-                pos_indices = torch.arange(scale, device=device).unsqueeze(0).expand(B, -1)
+                pos_indices = torch.arange(scale, device=device).unsqueeze(0).expand(B, -1).contiguous()
                 pos_emb = self.pos_embed[i](pos_indices)
-                current_repr = token_emb + pos_emb
-                sequence = torch.cat([sequence, current_repr], dim=1)
+                current_repr = (token_emb + pos_emb).contiguous()
+                sequence = torch.cat([sequence, current_repr], dim=1).contiguous()
         
         # 连接所有生成的tokens
-        return torch.cat(all_generated, dim=1)  # [B, total_tokens] 
+        return torch.cat(all_generated, dim=1).contiguous()  # [B, total_tokens] 

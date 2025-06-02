@@ -129,7 +129,7 @@ DEFAULT_CONFIG = {
         }
     },
     'MULTI_GPU': {
-        'find_unused_parameters': False,
+        'find_unused_parameters': True,
         'accumulate_grad_batches': 1
     }
 }

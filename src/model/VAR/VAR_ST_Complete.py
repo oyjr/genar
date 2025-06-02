@@ -206,6 +206,11 @@ class VAR_ST_Complete(nn.Module):
         print(f"   - 组织学特征: {histology_features.shape}")
         print(f"   - 空间位置: {positions.shape}")
         
+        # 确保输入张量连续性
+        gene_expression = gene_expression.contiguous()
+        histology_features = histology_features.contiguous() 
+        positions = positions.contiguous()
+        
         # 动态适配组织学特征维度
         actual_hist_dim = histology_features.shape[-1]
         if actual_hist_dim != self.base_histology_dim:
@@ -213,13 +218,14 @@ class VAR_ST_Complete(nn.Module):
             print(f"   - 自动适配: {'UNI编码器(1024维)' if actual_hist_dim == 1024 else 'CONCH编码器(512维)'}")
         
         histology_processor = self._get_histology_processor(actual_hist_dim)
-        processed_hist = histology_processor(histology_features)  # [B, N, base_hist_dim]
+        processed_hist = histology_processor(histology_features).contiguous()  # [B, N, base_hist_dim]
         
         # 生成类别标签 (如果没有提供)
         if class_labels is None:
             # 使用组织学特征的统计量作为类别标签
             hist_stats = torch.mean(processed_hist.view(B, -1), dim=1) * 1000
             class_labels = hist_stats.long() % 1000  # [B]
+            class_labels = class_labels.contiguous()
         
         print(f"   - 类别标签: {class_labels.shape}")
         
@@ -240,19 +246,23 @@ class VAR_ST_Complete(nn.Module):
             
             print(f"   - 编码尺度 {scale}×{scale}: {scale_expression.shape}")
             
+            # 确保scale_expression连续性
+            scale_expression = scale_expression.contiguous()
+            
             # 重塑为批量处理格式
             B, num_cells, num_genes = scale_expression.shape
-            scale_expression_flat = scale_expression.view(-1, num_genes)  # [B*num_cells, num_genes]
+            scale_expression_flat = scale_expression.view(-1, num_genes).contiguous()  # [B*num_cells, num_genes]
             
             # VQVAE编码
             vq_result = scale_vqvae.encode_to_tokens(scale_expression_flat)
             tokens = vq_result['tokens']  # [B*num_cells, 1] or [B*num_cells]
             vq_loss = vq_result['loss']
             
-            # 重塑回原始批次格式
+            # 确保tokens连续性并重塑回原始批次格式
+            tokens = tokens.contiguous()
             if tokens.dim() == 2 and tokens.shape[1] == 1:
-                tokens = tokens.squeeze(1)  # [B*num_cells]
-            tokens = tokens.view(B, num_cells)  # [B, num_cells]
+                tokens = tokens.squeeze(1).contiguous()  # [B*num_cells]
+            tokens = tokens.view(B, num_cells).contiguous()  # [B, num_cells]
             
             all_tokens.append(tokens)
             all_vqvae_losses.append(vq_loss)
@@ -261,7 +271,7 @@ class VAR_ST_Complete(nn.Module):
         
         # Stage 3: 组合tokens序列
         print(f"🔗 Stage 3: 组合tokens序列")
-        combined_tokens = torch.cat(all_tokens, dim=1)  # [B, total_tokens]
+        combined_tokens = torch.cat(all_tokens, dim=1).contiguous()  # [B, total_tokens]
         print(f"   - 组合tokens: {combined_tokens.shape}")
         
         # Stage 4: VAR自回归训练
@@ -283,6 +293,7 @@ class VAR_ST_Complete(nn.Module):
             reconstructed_expression = self.spatial_organizer.reconstruct_from_multiscale(
                 reconstructed_multiscale, positions, reconstruction_method='finest_scale'
             )
+            reconstructed_expression = reconstructed_expression.contiguous()
         
         # 计算总损失
         total_vqvae_loss = sum(all_vqvae_losses) / len(all_vqvae_losses)
@@ -308,7 +319,9 @@ class VAR_ST_Complete(nn.Module):
             'predictions': reconstructed_expression,
             'targets': gene_expression,
             'tokens': combined_tokens,
-            'multiscale_expressions': multiscale_expressions
+            'multiscale_expressions': multiscale_expressions,
+            'predicted_expression': reconstructed_expression,
+            'logits': reconstructed_expression
         }
     
     def forward_inference(
@@ -402,16 +415,20 @@ class VAR_ST_Complete(nn.Module):
             scale = self.spatial_scales[scale_idx]
             scale_vqvae = self.vqvaes[scale_idx]
             
+            # 确保scale_tokens连续性
+            scale_tokens = scale_tokens.contiguous()
+            
             # 重塑为VQVAE期望的格式
             B, num_cells = scale_tokens.shape
-            scale_tokens_flat = scale_tokens.view(-1)  # [B*num_cells]
+            scale_tokens_flat = scale_tokens.view(-1).contiguous()  # [B*num_cells]
             
             # VQVAE解码
             decoded_flat = scale_vqvae.decode_from_tokens(scale_tokens_flat)  # [B*num_cells, num_genes]
+            decoded_flat = decoded_flat.contiguous()
             
             # 重塑回多尺度格式
             num_genes = decoded_flat.shape[-1]
-            decoded = decoded_flat.view(B, num_cells, num_genes)  # [B, num_cells, num_genes]
+            decoded = decoded_flat.view(B, num_cells, num_genes).contiguous()  # [B, num_cells, num_genes]
             
             decoded_expressions.append(decoded)
         
@@ -419,13 +436,16 @@ class VAR_ST_Complete(nn.Module):
     
     def _split_tokens_by_scale(self, combined_tokens: torch.Tensor) -> List[torch.Tensor]:
         """将组合的tokens序列分割回各个尺度"""
+        # 确保输入tokens连续性
+        combined_tokens = combined_tokens.contiguous()
+        
         B = combined_tokens.shape[0]
         split_tokens = []
         start_idx = 0
         
         for scale_idx, tokens_count in enumerate(self.tokens_per_scale):
             end_idx = start_idx + tokens_count
-            scale_tokens = combined_tokens[:, start_idx:end_idx]  # [B, tokens_count]
+            scale_tokens = combined_tokens[:, start_idx:end_idx].contiguous()  # [B, tokens_count]
             split_tokens.append(scale_tokens)
             start_idx = end_idx
         
