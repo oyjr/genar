@@ -275,4 +275,23 @@ class GenePseudoImageAdapter(nn.Module):
         elif direction == 'image_to_gene':
             return self.pseudo_image_to_genes(x)
         else:
-            raise ValueError(f"不支持的转换方向: {direction}") 
+            raise ValueError(f"不支持的转换方向: {direction}")
+
+    def reverse_transform(self, pseudo_images: torch.Tensor) -> torch.Tensor:
+        """
+        从伪图像反向转换为基因表达
+        
+        Args:
+            pseudo_images: 伪图像 [B, 1, target_size, target_size]
+            
+        Returns:
+            基因表达 [B, num_genes]
+        """
+        B = pseudo_images.shape[0]
+        
+        # 确保输入格式正确
+        if pseudo_images.dim() != 4 or pseudo_images.shape[1] != 1:
+            raise ValueError(f"期望输入形状为 [B, 1, H, W]，得到 {pseudo_images.shape}")
+        
+        # 使用现有的pseudo_image_to_genes方法
+        return self.pseudo_image_to_genes(pseudo_images) 

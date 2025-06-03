@@ -65,6 +65,31 @@ MODELS = {
         'var_depth': 16,
         'var_embed_dim': 1024,
         'var_num_heads': 16,
+    },
+    'TWO_STAGE_VAR_ST': {
+        'model_name': 'TWO_STAGE_VAR_ST',
+        'num_genes': 200,
+        'histology_feature_dim': 1024,  # 依赖编码器
+        'spatial_coord_dim': 2,
+        # Stage 1 VQVAE 配置
+        'vqvae_config': {
+            'vocab_size': 4096,
+            'embed_dim': 128,
+            'beta': 0.25,
+            'hierarchical_loss_weight': 0.1,
+            'vq_loss_weight': 0.25
+        },
+        # Stage 2 VAR Transformer 配置
+        'var_config': {
+            'vocab_size': 4096,
+            'embed_dim': 640,
+            'num_heads': 8,
+            'num_layers': 12,
+            'feedforward_dim': 2560,
+            'dropout': 0.1,
+            'max_sequence_length': 1500,
+            'condition_embed_dim': 640
+        }
     }
 }
 
@@ -113,16 +138,16 @@ DEFAULT_CONFIG = {
     },
     'CALLBACKS': {
         'early_stopping': {
-            'monitor': 'val_loss',
+            'monitor': 'val_loss',  # 动态更新：Stage1用val_mse, Stage2用val_accuracy
             'patience': 10000,  # 默认设置很大值，实际禁用早停
-            'mode': 'min',
+            'mode': 'min',      # 动态更新：Stage1用min, Stage2用max
             'min_delta': 0.0
         },
         'model_checkpoint': {
-            'monitor': 'val_loss',
+            'monitor': 'val_loss',  # 动态更新：Stage1用val_mse, Stage2用val_accuracy  
             'save_top_k': 1,
-            'mode': 'min',
-            'filename': 'epoch={epoch}-val_loss={val_loss:.4f}'
+            'mode': 'min',          # 动态更新：Stage1用min, Stage2用max
+            'filename': 'best-epoch={epoch:02d}-{val_mse:.4f}'  # 动态更新：Stage1和Stage2使用不同命名
         },
         'learning_rate_monitor': {
             'logging_interval': 'epoch'
@@ -203,6 +228,12 @@ Examples:
     parser.add_argument('--seed', type=int,
                         help='随机种子 (默认: 2021)')
     
+    # === 两阶段VAR-ST参数 ===
+    parser.add_argument('--training_stage', type=int, choices=[1, 2], default=1,
+                        help='VAR-ST训练阶段 (1: VQVAE, 2: VAR Transformer)')
+    parser.add_argument('--stage1_ckpt', type=str,
+                        help='Stage 1 VQVAE checkpoint路径 (Stage 2训练时必需)')
+    
     # === 向后兼容参数 (保留最少必要的) ===
     parser.add_argument('--config', type=str,
                         help='[已弃用] 请使用 --dataset 参数替代')
@@ -259,6 +290,20 @@ def build_config_from_args(args):
     # 更新模型配置
     config.MODEL = Dict(model_info)
     config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
+    
+    # 特殊处理两阶段VAR-ST模型
+    if args.model == 'TWO_STAGE_VAR_ST':
+        config.MODEL.training_stage = args.training_stage
+        config.MODEL.stage1_ckpt_path = args.stage1_ckpt
+        config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
+        
+        # 检查Stage 2训练的必需参数
+        if args.training_stage == 2 and not args.stage1_ckpt:
+            raise ValueError("Stage 2训练需要指定 --stage1_ckpt 参数")
+        
+        print(f"   - 两阶段训练: Stage {args.training_stage}")
+        if args.stage1_ckpt:
+            print(f"   - Stage 1 Checkpoint: {args.stage1_ckpt}")
     
     # 更新训练参数
     if args.epochs:

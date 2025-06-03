@@ -156,20 +156,47 @@ def load_callbacks(cfg: Dict):
     
     Mycallbacks = []
     
+    # 🔧 根据模型类型和训练阶段设置不同的监控策略
+    model_name = getattr(cfg.MODEL, 'model_name', '')
+    training_stage = getattr(cfg.MODEL, 'training_stage', 1)
+    
+    # 动态设置监控指标和checkpoint命名
+    if model_name == 'TWO_STAGE_VAR_ST':
+        if training_stage == 1:
+            # Stage 1: VQVAE训练 - 监控基因重建质量
+            default_monitor = 'val_mse'
+            default_mode = 'min'
+            checkpoint_filename = 'stage1-best-epoch={epoch:02d}-val_mse={val_mse:.4f}'
+            print(f"🔧 Stage 1 (VQVAE): 监控指标={default_monitor}, 模式={default_mode}")
+        elif training_stage == 2:
+            # Stage 2: VAR训练 - 监控token预测准确率
+            default_monitor = 'val_accuracy'
+            default_mode = 'max'
+            checkpoint_filename = 'stage2-best-epoch={epoch:02d}-val_acc={val_accuracy:.4f}'
+            print(f"🔧 Stage 2 (VAR): 监控指标={default_monitor}, 模式={default_mode}")
+        else:
+            raise ValueError(f"不支持的训练阶段: {training_stage}")
+    else:
+        # 其他模型保持原有设置
+        default_monitor = 'val_loss'
+        default_mode = 'min'
+        checkpoint_filename = 'best-epoch={epoch:02d}-{val_mse:.4f}'
+        print(f"🔧 标准模型: 监控指标={default_monitor}, 模式={default_mode}")
+    
     # 处理early stopping配置
     if 'early_stopping' in cfg.CALLBACKS:
         early_stopping_cfg = cfg.CALLBACKS.early_stopping
         
         # 处理字典和Namespace两种类型
         if isinstance(early_stopping_cfg, dict):
-            monitor = early_stopping_cfg['monitor']
+            monitor = early_stopping_cfg.get('monitor', default_monitor)
             patience = early_stopping_cfg['patience']
-            mode = early_stopping_cfg['mode']
+            mode = early_stopping_cfg.get('mode', default_mode)
             min_delta = early_stopping_cfg.get('min_delta', 0.0)
         else:
-            monitor = early_stopping_cfg.monitor
+            monitor = getattr(early_stopping_cfg, 'monitor', default_monitor)
             patience = early_stopping_cfg.patience
-            mode = early_stopping_cfg.mode
+            mode = getattr(early_stopping_cfg, 'mode', default_mode)
             min_delta = getattr(early_stopping_cfg, 'min_delta', 0.0)
             
         early_stopping = EarlyStopping(
@@ -179,6 +206,7 @@ def load_callbacks(cfg: Dict):
             min_delta=float(min_delta)  # 确保是浮点数
         )
         Mycallbacks.append(early_stopping)
+        print(f"   ✅ Early Stopping: {monitor} (patience={patience})")
     
     # 处理model checkpoint配置
     if 'model_checkpoint' in cfg.CALLBACKS:
@@ -186,13 +214,13 @@ def load_callbacks(cfg: Dict):
         
         # 处理字典和Namespace两种类型
         if isinstance(ckpt_cfg, dict):
-            monitor = ckpt_cfg['monitor']
+            monitor = ckpt_cfg.get('monitor', default_monitor)
             save_top_k = ckpt_cfg['save_top_k']
-            mode = ckpt_cfg['mode']
+            mode = ckpt_cfg.get('mode', default_mode)
         else:
-            monitor = ckpt_cfg.monitor
+            monitor = getattr(ckpt_cfg, 'monitor', default_monitor)
             save_top_k = ckpt_cfg.save_top_k
-            mode = ckpt_cfg.mode
+            mode = getattr(ckpt_cfg, 'mode', default_mode)
             
         # 确保目录存在
         os.makedirs(cfg.GENERAL.log_path, exist_ok=True)
@@ -202,9 +230,10 @@ def load_callbacks(cfg: Dict):
             monitor=str(monitor),  # 确保是字符串
             save_top_k=int(save_top_k),  # 确保是整数
             mode=str(mode),  # 确保是字符串
-            filename='best-epoch={epoch:02d}-{val_mse:.4f}'  # 简化格式，删除多余的val_mse前缀
+            filename=checkpoint_filename  # 使用动态生成的文件名
         )
         Mycallbacks.append(model_checkpoint)
+        print(f"   ✅ Model Checkpoint: {monitor} -> {checkpoint_filename}")
     
     return Mycallbacks
 

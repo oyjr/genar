@@ -403,46 +403,88 @@ class SelfAttention(nn.Module):
         self.using_flash = flash_if_available and flash_attn_func is not None
         self.using_xform = flash_if_available and memory_efficient_attention is not None
         
-        # Only used during inference
-        self.caching, self.cached_k, self.cached_v = False, None, None
+        # KV缓存机制 (用于推理)
+        self.caching = False
+        self.cached_k = None
+        self.cached_v = None
     
     def kv_caching(self, enable: bool): 
-        self.caching, self.cached_k, self.cached_v = enable, None, None
+        """启用/禁用KV缓存"""
+        self.caching = enable
+        self.cached_k = None
+        self.cached_v = None
     
     def forward(self, x, attn_bias):
+        """
+        前向传播
+        
+        Args:
+            x: 输入特征 [B, L, C]
+            attn_bias: 注意力偏置/mask [1, 1, L, L] 或 None
+        """
         B, L, C = x.shape
         
-        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
+        # QKV投影
+        qkv = F.linear(
+            input=x, 
+            weight=self.mat_qkv.weight, 
+            bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))
+        ).view(B, L, 3, self.num_heads, self.head_dim)
+        
         main_type = qkv.dtype
         
+        # 选择attention实现
         using_flash = self.using_flash and attn_bias is None and qkv.dtype != torch.float32
         if using_flash or self.using_xform: 
-            q, k, v = qkv.unbind(dim=2); dim_cat = 1
+            q, k, v = qkv.unbind(dim=2)  # q/k/v: [B, L, num_heads, head_dim]
+            dim_cat = 1   # 在序列长度维度拼接
         else: 
-            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); dim_cat = 2
+            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)  # q/k/v: [B, num_heads, L, head_dim]
+            dim_cat = 2   # 在序列长度维度拼接
         
+        # L2归一化 (如果启用)
         if self.attn_l2_norm:
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
             if using_flash or self.using_xform: 
-                scale_mul = scale_mul.transpose(1, 2)
+                scale_mul = scale_mul.transpose(1, 2)  # 1H11 to 11H1
             q = F.normalize(q, dim=-1).mul(scale_mul)
             k = F.normalize(k, dim=-1)
         
+        # KV缓存处理
         if self.caching:
             if self.cached_k is None: 
-                self.cached_k = k; self.cached_v = v
+                self.cached_k = k
+                self.cached_v = v
             else: 
                 k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat)
                 v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
         
+        # 注意力计算
         dropout_p = self.attn_drop if self.training else 0.0
-        if using_flash:
-            oup = flash_attn_func(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), dropout_p=dropout_p, softmax_scale=self.scale).view(B, L, C)
-        elif self.using_xform:
-            oup = memory_efficient_attention(q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), attn_bias=None if attn_bias is None else attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1), p=dropout_p, scale=self.scale).view(B, L, C)
-        else:
-            oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
         
+        if using_flash:
+            # Flash Attention
+            oup = flash_attn_func(
+                q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type), 
+                dropout_p=dropout_p, softmax_scale=self.scale
+            ).view(B, L, C)
+        elif self.using_xform:
+            # XFormers Memory Efficient Attention
+            attn_bias_xform = None
+            if attn_bias is not None:
+                attn_bias_xform = attn_bias.to(dtype=main_type).expand(B, self.num_heads, -1, -1)
+            oup = memory_efficient_attention(
+                q.to(dtype=main_type), k.to(dtype=main_type), v.to(dtype=main_type),
+                attn_bias=attn_bias_xform, p=dropout_p, scale=self.scale
+            ).view(B, L, C)
+        else:
+            # 标准注意力
+            oup = slow_attn(
+                query=q, key=k, value=v, scale=self.scale, 
+                attn_mask=attn_bias, dropout_p=dropout_p
+            ).transpose(1, 2).reshape(B, L, C)
+        
+        # 输出投影
         return self.proj_drop(self.proj(oup))
     
     def extra_repr(self) -> str:
@@ -478,7 +520,7 @@ class AdaLNSelfAttn(nn.Module):
         if self.enable_histology_injection:
             self.histology_proj = nn.Linear(histology_dim, embed_dim)
             self.histology_gate = nn.Sequential(
-                nn.Linear(embed_dim + histology_dim, embed_dim),
+                nn.Linear(embed_dim + embed_dim, embed_dim),  # 2*embed_dim -> embed_dim
                 nn.Sigmoid()
             )
             print(f"   ✅ Block {block_idx}: 启用组织学条件注入 (histology_dim={histology_dim} → embed_dim={embed_dim})")
@@ -489,10 +531,29 @@ class AdaLNSelfAttn(nn.Module):
         if self.enable_histology_injection and histology_condition is not None:
             B, L, embed_dim = x.shape
             
-            histology_proj = self.histology_proj(histology_condition)
+            # 检查histology_condition的维度
+            if histology_condition.shape[-1] == self.histology_proj.in_features:
+                # 原始维度，直接投影
+                histology_proj = self.histology_proj(histology_condition)
+            elif histology_condition.shape[-1] == embed_dim:
+                # 已经是embed_dim，直接使用
+                histology_proj = histology_condition
+            else:
+                # 维度不匹配，跳过注入
+                histology_proj = torch.zeros(B, embed_dim, device=x.device, dtype=x.dtype)
+            
             histology_expanded = histology_proj.unsqueeze(1).expand(-1, L, -1)
             
-            histology_condition_expanded = histology_condition.unsqueeze(1).expand(-1, L, -1)
+            # 对于gate，使用原始的histology_condition或零向量
+            if histology_condition.shape[-1] >= embed_dim:
+                histology_for_gate = histology_condition[:, :embed_dim]  # 截取或使用前embed_dim维
+            else:
+                # 如果维度不够，用零填充
+                padding = torch.zeros(B, embed_dim - histology_condition.shape[-1], 
+                                    device=x.device, dtype=x.dtype)
+                histology_for_gate = torch.cat([histology_condition, padding], dim=-1)
+            
+            histology_condition_expanded = histology_for_gate.unsqueeze(1).expand(-1, L, -1)
             gate_input = torch.cat([x, histology_condition_expanded], dim=-1)
             gate = self.histology_gate(gate_input)
             
