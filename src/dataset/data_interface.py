@@ -12,12 +12,39 @@ class DataInterface(pl.LightningDataModule):
         super().__init__()
         self.config = config
         
+        # 🆕 检测VAR-ST模式 - 修复配置访问方式
+        model_name = ''
+        if hasattr(config, 'MODEL') and hasattr(config.MODEL, 'model_name'):
+            model_name = config.MODEL.model_name
+        elif hasattr(config, 'model_name'):
+            model_name = config.model_name
+        
+        is_var_st = model_name.upper() == 'VAR_ST'
+        
+        # 强制VAR-ST模型使用196基因模式
+        if is_var_st:
+            use_var_st_genes = True
+            var_st_gene_count = 196
+            print(f"🧬 检测到VAR_ST模型，强制启用196基因模式")
+        else:
+            use_var_st_genes = getattr(config, 'use_var_st_genes', False)
+            var_st_gene_count = getattr(config, 'var_st_gene_count', 196)
+        
         print(f"初始化DataInterface:")
         print(f"  - 数据集名称: STDataset")
         print(f"  - 表达谱名称: {config.expr_name}")
         print(f"  - 数据路径: {config.data_path}")
         print(f"  - 编码器: {config.encoder_name}")
         print(f"  - 使用增强: {config.use_augmented}")
+        print(f"  - 🧬 检测到模型名称: {model_name}")
+        print(f"  - 🆕 VAR-ST基因模式: {use_var_st_genes}")
+        
+        if use_var_st_genes:
+            print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count}")
+        
+        # 存储配置以便后续使用
+        self.use_var_st_genes = use_var_st_genes
+        self.var_st_gene_count = var_st_gene_count
 
     def setup(self, stage=None):
         """
@@ -30,7 +57,7 @@ class DataInterface(pl.LightningDataModule):
         # 统一使用STDataset
         dataset_class = getattr(dataset, 'STDataset')
         
-        # 基础参数配置
+        # 基础参数配置 - 🆕 添加VAR-ST基因支持
         base_params = {
             'data_path': self.config.data_path,
             'expr_name': self.config.expr_name,
@@ -39,6 +66,8 @@ class DataInterface(pl.LightningDataModule):
             'encoder_name': self.config.encoder_name,
             'use_augmented': self.config.use_augmented,
             'normalize': self.config.DATA.normalize,
+            'use_var_st_genes': self.use_var_st_genes,  # 🆕 VAR-ST基因模式
+            'var_st_gene_count': self.var_st_gene_count,  # 🆕 VAR-ST基因数量
         }
         
         print(f"基础参数配置: {base_params}")
@@ -73,6 +102,8 @@ class DataInterface(pl.LightningDataModule):
         print("\n=== 数据集信息总结 ===")
         if hasattr(self, 'train_dataset'):
             print(f"训练数据集: {len(self.train_dataset)} 个样本")
+            if self.use_var_st_genes:
+                print(f"🧬 使用VAR-ST模式: 前{self.var_st_gene_count}个基因")
         if hasattr(self, 'val_dataset'):
             print(f"验证数据集: {len(self.val_dataset)} 个样本")
         if hasattr(self, 'test_dataset'):

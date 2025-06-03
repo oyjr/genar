@@ -12,6 +12,9 @@ VAR-ST 快速开始脚本
     # 多GPU训练
     python quick_start_var_st.py --gpus 4
     
+    # 指定特定GPU卡训练
+    python quick_start_var_st.py --gpu-ids 1,2,3
+    
     # 自定义参数
     python quick_start_var_st.py --gpus 2 --epochs 50 --batch-size 4
 
@@ -21,6 +24,7 @@ VAR-ST 快速开始脚本
 import subprocess
 import sys
 import argparse
+import os
 
 
 def main():
@@ -36,6 +40,9 @@ def main():
     # 多GPU训练
     python quick_start_var_st.py --gpus 4
     
+    # 指定特定GPU卡训练 (卡1,2,3)
+    python quick_start_var_st.py --gpu-ids 1,2,3
+    
     # 自定义参数
     python quick_start_var_st.py --gpus 2 --epochs 50 --batch-size 4 --lr 2e-4
     
@@ -49,6 +56,8 @@ def main():
                         help='数据集名称 (默认: PRAD)')
     parser.add_argument('--gpus', type=int, default=1,
                         help='GPU数量 (默认: 1)')
+    parser.add_argument('--gpu-ids', type=str,
+                        help='指定特定的GPU卡，用逗号分隔，如: 1,2,3 (如果指定此参数，会覆盖--gpus参数)')
     parser.add_argument('--epochs', type=int, default=100,
                         help='训练轮数 (默认: 100)')
     parser.add_argument('--batch-size', type=int, default=8,
@@ -61,10 +70,24 @@ def main():
     # 解析参数
     args = parser.parse_args()
     
+    # 处理GPU配置
+    gpu_count = args.gpus
+    gpu_display = f"{args.gpus}"
+    
+    if args.gpu_ids:
+        # 如果指定了具体的GPU卡
+        gpu_list = [int(x.strip()) for x in args.gpu_ids.split(',')]
+        gpu_count = len(gpu_list)
+        gpu_display = f"{gpu_count} (卡: {args.gpu_ids})"
+        
+        # 设置CUDA_VISIBLE_DEVICES环境变量
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
+        print(f"🔧 设置CUDA_VISIBLE_DEVICES={args.gpu_ids}")
+    
     print("🚀 VAR-ST 空间转录组学模型训练")
     print("=" * 50)
     print(f"📊 数据集: {args.dataset}")
-    print(f"💻 GPU数量: {args.gpus}")
+    print(f"💻 GPU: {gpu_display}")
     print(f"🔄 训练轮数: {args.epochs}")
     print(f"📦 批次大小: {args.batch_size}")
     print(f"📈 学习率: {args.lr}")
@@ -76,7 +99,7 @@ def main():
         'python', 'src/main.py',
         '--dataset', args.dataset,
         '--model', 'VAR_ST',  # 使用VAR_ST模型
-        '--gpus', str(args.gpus),
+        '--gpus', str(gpu_count),  # 使用计算出的GPU数量
         '--epochs', str(args.epochs),
         '--batch_size', str(args.batch_size),
         '--lr', str(args.lr),
@@ -84,7 +107,7 @@ def main():
     ]
     
     # 多GPU时自动启用同步BatchNorm
-    if args.gpus > 1:
+    if gpu_count > 1:
         cmd.append('--sync-batchnorm')
         print(f"✅ 多GPU训练，已启用同步BatchNorm")
     

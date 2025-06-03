@@ -245,6 +245,7 @@ class VAR_ST(nn.Module):
         x = sos
         
         total_loss = 0.0
+        losses_per_scale = []
         
         # Process each scale in the multi-scale sequence
         for si, pn in enumerate(self.patch_nums[:-1]):  # Exclude last scale
@@ -274,10 +275,17 @@ class VAR_ST(nn.Module):
             
             # Compute cross-entropy loss with ground truth
             gt_next = gt_indices[si + 1].view(B, -1).contiguous()  # [B, next_len]
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), gt_next.reshape(-1))
-            total_loss += loss
+            scale_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), gt_next.reshape(-1))
+            losses_per_scale.append(scale_loss)
+            total_loss += scale_loss
         
-        return total_loss / (len(self.patch_nums) - 1)
+        # Average loss
+        if len(losses_per_scale) > 0:
+            avg_loss = total_loss / len(losses_per_scale)
+        else:
+            avg_loss = total_loss
+        
+        return avg_loss
     
     def autoregressive_infer_cfg(
         self,
@@ -387,197 +395,154 @@ class VAR_ST(nn.Module):
         return self.forward_for_loss(indices, class_labels)
 
 
-class VAR(nn.Module):
+class VAR_ST_Gene(VAR_ST):
     """
-    简化的VAR模型 - 专门用于单spot基因表达vectors
+    基因维度多尺度的VAR_ST - 专门用于基因表达生成
     
-    与VAR_ST不同，这个版本针对基因表达向量的多尺度建模，
-    不需要复杂的空间位置编码。
+    继承完整VAR_ST的所有高级特性:
+    - AdaLN自适应层归一化
+    - Classifier-Free Guidance (CFG)
+    - 条件生成控制
+    - 高级采样策略
+    
+    针对基因维度多尺度的关键修改:
+    - patch_nums对应基因特征数量 [1, 4, 16, 64, 200]
+    - 位置编码适配基因维度 (不是空间pn*pn)
+    - Token序列处理适配单spot基因向量
     """
     
     def __init__(
         self,
-        vocab_size: int = 8192,            # VQVAE codebook size
-        depth: int = 16,                   # Number of transformer blocks
-        embed_dim: int = 1024,             # Transformer embedding dimension
-        num_heads: int = 16,               # Number of attention heads
-        patch_nums: Tuple[int, ...] = (1, 4, 16, 64, 256),  # Gene scales
-        rope_theta: float = 10000.0,       # RoPE theta parameter
-        dropout: float = 0.0,              # Dropout rate
-        drop_path_rate: float = 0.1,       # Drop path rate
+        gene_scales: List[int] = [1, 4, 16, 64, 200],
+        vae_embed_dim: int = 8192,          # VQVAE最大codebook size
+        num_classes: int = 1000,            # 条件类别数
+        depth: int = 16,                    # Transformer层数
+        embed_dim: int = 1024,              # 嵌入维度
+        num_heads: int = 16,                # 注意力头数
         **kwargs
     ):
-        super().__init__()
-        
-        self.vocab_size = vocab_size
-        self.embed_dim = embed_dim
-        self.patch_nums = patch_nums
-        
-        print(f"🚀 初始化简化VAR模型:")
-        print(f"  - 词汇表大小: {vocab_size}")
-        print(f"  - 嵌入维度: {embed_dim}")
-        print(f"  - 基因尺度: {patch_nums}")
-        
-        # Token embeddings for different gene scales
-        self.token_embed = nn.ModuleList([
-            nn.Embedding(vocab_size, embed_dim) for _ in patch_nums
-        ])
-        
-        # Positional embeddings for different scales
-        self.pos_embed = nn.ModuleList([
-            nn.Embedding(scale, embed_dim) for scale in patch_nums
-        ])
-        
-        # Start token
-        self.pos_start = nn.Parameter(torch.randn(embed_dim))
-        
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=embed_dim * 4,
-                dropout=dropout,
-                batch_first=True
-            ) for _ in range(depth)
-        ])
-        
-        # Output heads for each scale
-        self.heads = nn.ModuleList([
-            nn.Linear(embed_dim, vocab_size) for _ in patch_nums
-        ])
-        
-        # Layer norm
-        self.norm = nn.LayerNorm(embed_dim)
-        
-        self.init_weights()
-    
-    def init_weights(self):
-        """Initialize parameters"""
-        nn.init.normal_(self.pos_start, std=0.02)
-        
-        for embed in self.token_embed:
-            nn.init.normal_(embed.weight, std=0.02)
-        
-        for embed in self.pos_embed:
-            nn.init.normal_(embed.weight, std=0.02)
-        
-        for head in self.heads:
-            nn.init.normal_(head.weight, std=0.02)
-    
-    def forward_training(
-        self,
-        tokens: torch.Tensor,
-        class_labels: Optional[torch.Tensor] = None,
-        cfg: float = 1.0,
-        cond_drop_prob: float = 0.1
-    ) -> Dict[str, torch.Tensor]:
         """
-        训练前向传播
+        初始化基因维度VAR_ST
         
         Args:
-            tokens: [B, total_tokens] - 连接的所有尺度tokens
-            class_labels: [B] - 类别标签（暂时不用）
-            cfg: CFG scale
-            cond_drop_prob: 条件dropout概率
+            gene_scales: 基因多尺度特征数量 [1, 4, 16, 64, 200]
+            vae_embed_dim: VQVAE词汇表大小
+            其他参数与原始VAR_ST相同
+        """
+        # 设置基因尺度为patch_nums
+        kwargs['patch_nums'] = tuple(gene_scales)
+        kwargs['vae_embed_dim'] = vae_embed_dim
+        kwargs['num_classes'] = num_classes
+        kwargs['depth'] = depth
+        kwargs['embed_dim'] = embed_dim
+        kwargs['num_heads'] = num_heads
+        
+        print(f"🧬 初始化基因维度VAR_ST:")
+        print(f"  - 基因尺度: {gene_scales}")
+        print(f"  - 词汇表大小: {vae_embed_dim}")
+        print(f"  - 条件类别数: {num_classes}")
+        
+        # 调用父类初始化 (但会被下面的修改覆盖)
+        super().__init__(**kwargs)
+        
+        # 🔧 关键修改: 重写位置编码以适配基因维度
+        # 原始VAR_ST: pos_embed为 [1, pn*pn, embed_dim] (空间维度)
+        # 基因VAR_ST: pos_embed为 [1, 1, embed_dim] (基因维度，每个尺度1个token)
+        self.pos_embed = nn.ParameterList([
+            nn.Parameter(torch.empty(1, 1, embed_dim))  # 每个尺度只有1个token
+            for _ in gene_scales
+        ])
+        
+        # 重新初始化位置编码
+        for pos_emb in self.pos_embed:
+            nn.init.trunc_normal_(pos_emb, std=0.02)
+        
+        print(f"  - 位置编码适配: 基因维度 (每个尺度1个token)")
+        print(f"  - 位置编码形状: {[tuple(pos.shape) for pos in self.pos_embed]}")
+        
+        # 存储基因尺度信息
+        self.gene_scales = gene_scales
+        self.num_gene_scales = len(gene_scales)
+        
+        print(f"✅ 基因维度VAR_ST初始化完成")
+    
+    def forward_for_loss(
+        self, 
+        gt_tokens: List[torch.Tensor],  # 修改: 基因tokens格式
+        class_labels: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        基因维度的训练前向传播
+        
+        Args:
+            gt_tokens: List of gene tokens for each scale
+                      每个元素: [B, 1] - 每个样本每个尺度1个token
+            class_labels: [B] - 条件类别标签
         
         Returns:
-            Dict包含训练loss
+            loss: 自回归预测损失
         """
-        B = tokens.shape[0]
-        device = tokens.device
+        B = gt_tokens[0].shape[0]
         
-        # 确保输入tokens是连续的
-        tokens = tokens.contiguous()
+        # 获取条件信号
+        conditioning = self.get_conditioning(B, class_labels)
         
-        # 分解tokens到不同尺度
-        scale_tokens = []
-        start_idx = 0
-        for scale in self.patch_nums:
-            end_idx = start_idx + scale
-            if end_idx <= tokens.shape[1]:
-                # 确保切片后的张量是连续的
-                scale_token = tokens[:, start_idx:end_idx].contiguous()
-                scale_tokens.append(scale_token)
-            else:
-                # 填充不足的tokens
-                remaining = end_idx - tokens.shape[1]
-                if start_idx < tokens.shape[1]:
-                    partial_tokens = tokens[:, start_idx:].contiguous()
-                    pad_tokens = torch.zeros(B, remaining, dtype=torch.long, device=device)
-                    scale_token = torch.cat([partial_tokens, pad_tokens], dim=1).contiguous()
-                    scale_tokens.append(scale_token)
-                else:
-                    scale_token = torch.zeros(B, scale, dtype=torch.long, device=device).contiguous()
-                    scale_tokens.append(scale_token)
-            start_idx = end_idx
+        # 应用共享自适应线性层
+        if hasattr(self.shared_ada_lin, 'weight'):
+            conditioning = self.shared_ada_lin(conditioning)
         
         # 初始化序列
-        start_token = self.pos_start.unsqueeze(0).unsqueeze(0).expand(B, 1, -1).contiguous()  # [B, 1, embed_dim]
-        sequence = start_token
+        sos = self.pos_start.unsqueeze(0).expand(B, 1, -1)  # [B, 1, embed_dim]
+        x = sos
         
         total_loss = 0.0
-        num_predictions = 0
+        losses_per_scale = []
         
-        # 对每个尺度进行自回归训练
-        for i in range(len(scale_tokens) - 1):
-            # 当前尺度的tokens
-            current_tokens = scale_tokens[i]  # [B, scale_i] - 已经是连续的
+        # 🔧 修改: 适配基因维度的token处理
+        for si, gene_scale in enumerate(self.gene_scales[:-1]):  # 排除最后一个尺度
+            # 当前尺度的tokens: [B, 1] -> [B]
+            cur_tokens = gt_tokens[si].squeeze(-1) if gt_tokens[si].dim() == 2 else gt_tokens[si]
+            cur_tokens = cur_tokens.contiguous()  # [B]
             
-            # Token embedding
-            token_emb = self.token_embed[i](current_tokens)  # [B, scale_i, embed_dim]
+            # Token嵌入: [B] -> [B, 1, embed_dim]
+            cur_token_emb = self.token_embed[si](cur_tokens).unsqueeze(1)
             
-            # Position embedding
-            pos_indices = torch.arange(self.patch_nums[i], device=device).unsqueeze(0).expand(B, -1).contiguous()
-            pos_emb = self.pos_embed[i](pos_indices)  # [B, scale_i, embed_dim]
+            # 位置嵌入: [1, 1, embed_dim] -> [B, 1, embed_dim]
+            cur_pos_emb = self.pos_embed[si].expand(B, -1, -1)
             
-            # 组合embedding
-            current_repr = token_emb + pos_emb  # [B, scale_i, embed_dim]
-            current_repr = current_repr.contiguous()
+            # 组合嵌入
+            cur_repr = cur_token_emb + cur_pos_emb  # [B, 1, embed_dim]
             
             # 添加到序列
-            sequence = torch.cat([sequence, current_repr], dim=1).contiguous()  # [B, seq_len, embed_dim]
+            x = torch.cat([x, cur_repr], dim=1).contiguous()  # [B, seq_len, embed_dim]
             
             # Transformer处理
-            x = sequence
             for block in self.blocks:
-                x = block(x)
+                x = block(x, conditioning, attn_bias=None)
             
             # 预测下一个尺度
-            next_scale = self.patch_nums[i + 1]
+            next_scale_idx = si + 1
+            next_gene_scale = self.gene_scales[next_scale_idx]
             
-            # 修复：使用序列的最后hidden state来预测所有下一尺度的tokens
-            # 获取最后一个hidden state并扩展到预测所有next_scale个tokens
-            last_hidden = x[:, -1:, :].contiguous()  # [B, 1, embed_dim] - 取最后一个位置
-            pred_input = last_hidden.expand(-1, next_scale, -1).contiguous()  # [B, next_scale, embed_dim]
-            pred_input = self.norm(pred_input)
-            
-            # 输出预测
-            logits = self.heads[i + 1](pred_input)  # [B, next_scale, vocab_size]
+            # 🔧 修改: 基因维度的预测
+            # 使用最后的表示来预测下一尺度的单个token
+            pred_repr = x[:, -1:].contiguous()  # [B, 1, embed_dim] - 最后一个位置
+            pred_repr = self.head_nm(pred_repr, conditioning)
+            logits = self.head[next_scale_idx](pred_repr)  # [B, 1, vocab_size]
             logits = logits.contiguous()
             
-            # 计算loss
-            target_tokens = scale_tokens[i + 1]  # [B, next_scale] - 已经是连续的
+            # 计算损失
+            gt_next = gt_tokens[next_scale_idx].squeeze(-1) if gt_tokens[next_scale_idx].dim() == 2 else gt_tokens[next_scale_idx]
+            gt_next = gt_next.contiguous()  # [B]
             
-            # 确保维度匹配 - 使用reshape代替view以提高健壮性
-            logits_flat = logits.reshape(-1, self.vocab_size)  # [B*next_scale, vocab_size]
-            target_flat = target_tokens.reshape(-1)  # [B*next_scale]
-            
-            print(f"🔍 Loss计算 - 尺度{i}->{i+1}:")
-            print(f"   - logits: {logits.shape} -> {logits_flat.shape}")
-            print(f"   - targets: {target_tokens.shape} -> {target_flat.shape}")
-            
-            loss = F.cross_entropy(logits_flat, target_flat)
-            total_loss += loss
-            num_predictions += 1
+            scale_loss = F.cross_entropy(logits.squeeze(1), gt_next)  # [B, vocab_size] vs [B]
+            losses_per_scale.append(scale_loss)
+            total_loss += scale_loss
         
-        # 平均loss
-        avg_loss = total_loss / max(1, num_predictions)
+        # 平均损失
+        avg_loss = total_loss / len(losses_per_scale) if losses_per_scale else total_loss
         
-        return {
-            'loss': avg_loss,
-            'num_predictions': num_predictions
-        }
+        return avg_loss
     
     def autoregressive_infer_cfg(
         self,
@@ -587,87 +552,115 @@ class VAR(nn.Module):
         top_k: int = 50,
         top_p: float = 0.9,
         temperature: float = 1.0,
-        generator: Optional[torch.Generator] = None
-    ) -> torch.Tensor:
+        more_smooth: bool = False,
+        rng: Optional[torch.Generator] = None,
+    ) -> List[torch.Tensor]:
         """
-        自回归推理生成
+        基因维度的自回归推理生成
         
         Args:
             B: batch size
-            class_labels: 类别标签（暂时不用）
-            cfg: CFG scale
-            top_k: top-k采样
-            top_p: top-p采样
-            temperature: 采样温度
-            generator: 随机数生成器
+            class_labels: [B] - 条件类别标签
+            cfg: Classifier-free guidance缩放因子
+            其他参数: 采样控制参数
         
         Returns:
-            生成的tokens [B, total_tokens]
+            List[torch.Tensor]: 每个基因尺度的生成tokens
+                               每个元素: [B] - 每个样本每个尺度1个token
         """
-        device = next(self.parameters()).device
+        # CFG设置
+        if cfg != 1.0:
+            if class_labels is not None:
+                class_labels_cfg = torch.cat([class_labels, torch.zeros_like(class_labels)], dim=0)
+            else:
+                device = next(self.parameters()).device
+                class_labels_cfg = torch.cat([
+                    torch.zeros(B, dtype=torch.long, device=device),
+                    torch.zeros(B, dtype=torch.long, device=device)
+                ], dim=0)
+            B_cfg = B * 2
+        else:
+            class_labels_cfg = class_labels
+            B_cfg = B
+        
+        # 获取条件
+        conditioning = self.get_conditioning(B_cfg, class_labels_cfg)
+        if hasattr(self.shared_ada_lin, 'weight'):
+            conditioning = self.shared_ada_lin(conditioning)
         
         # 初始化序列
-        start_token = self.pos_start.unsqueeze(0).unsqueeze(0).expand(B, 1, -1).contiguous()
-        sequence = start_token
+        sos = self.pos_start.unsqueeze(0).expand(B_cfg, 1, -1)
+        x = sos
         
-        all_generated = []
+        generated_tokens = []
         
-        # 为每个尺度生成tokens
-        for i, scale in enumerate(self.patch_nums):
-            if i == 0:
-                # 第一个尺度：从start token预测
-                x = sequence
-                for block in self.blocks:
-                    x = block(x)
-                
-                pred_input = x[:, -1:].expand(-1, scale, -1).contiguous()  # [B, scale, embed_dim]
+        # 🔧 修改: 基因维度的自回归生成
+        for si, gene_scale in enumerate(self.gene_scales):
+            if si == 0:
+                # 第一个尺度: 从起始token预测
+                pred_repr = x  # [B_cfg, 1, embed_dim]
             else:
-                # 后续尺度：基于之前的序列预测
-                x = sequence
-                for block in self.blocks:
-                    x = block(x)
-                
-                pred_input = x[:, -scale:].contiguous()  # [B, scale, embed_dim]
+                # 后续尺度: 使用累积序列的最后位置
+                pred_repr = x[:, -1:].contiguous()  # [B_cfg, 1, embed_dim]
             
-            pred_input = self.norm(pred_input)
-            logits = self.heads[i](pred_input)  # [B, scale, vocab_size]
-            logits = logits.contiguous()
+            # Transformer处理
+            for block in self.blocks:
+                if si == 0:
+                    pred_repr = block(pred_repr, conditioning, attn_bias=None)
+                else:
+                    # 对整个序列处理，但只取最后的表示
+                    full_repr = block(x, conditioning, attn_bias=None)
+                    pred_repr = full_repr[:, -1:].contiguous()
             
-            # 应用温度
+            # 生成当前尺度的token
+            pred_repr = self.head_nm(pred_repr, conditioning)
+            logits = self.head[si](pred_repr)  # [B_cfg, 1, vocab_size]
+            
+            # CFG应用
+            if cfg != 1.0:
+                logits_cond, logits_uncond = logits.chunk(2, dim=0)
+                logits = logits_uncond + cfg * (logits_cond - logits_uncond)
+                logits = logits[:B]  # 只保留条件部分
+            
+            # 温度缩放
+            if more_smooth:
+                logits = logits / 1.5
             if temperature != 1.0:
                 logits = logits / temperature
             
             # 采样
             if top_k > 0 or top_p > 0:
-                # Top-k/top-p采样
-                if top_k > 0:
-                    top_k_actual = min(top_k, logits.size(-1))
-                    indices_to_remove = logits < torch.topk(logits, top_k_actual)[0][..., -1, None]
-                    logits[indices_to_remove] = float('-inf')
+                tokens = sample_with_top_k_top_p_(logits, top_k=top_k, top_p=top_p, rng=rng)
+                tokens = tokens.squeeze(-1).contiguous()  # [B]
+            else:
+                probs = F.softmax(logits.squeeze(1), dim=-1)  # [B, vocab_size]
+                tokens = torch.multinomial(probs, num_samples=1, generator=rng).squeeze(-1)  # [B]
+            
+            generated_tokens.append(tokens)
+            
+            # 添加生成的token到序列 (除了最后一个尺度)
+            if si < len(self.gene_scales) - 1:
+                # Token嵌入
+                gen_token_emb = self.token_embed[si](tokens).unsqueeze(1)  # [B, 1, embed_dim]
                 
-                if top_p > 0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-                    logits[indices_to_remove] = float('-inf')
-            
-            # 采样tokens
-            probs = F.softmax(logits, dim=-1).contiguous()
-            tokens = torch.multinomial(probs.reshape(-1, self.vocab_size), 1, generator=generator)
-            tokens = tokens.reshape(B, scale).contiguous()  # [B, scale]
-            
-            all_generated.append(tokens)
-            
-            # 更新序列（除了最后一个尺度）
-            if i < len(self.patch_nums) - 1:
-                token_emb = self.token_embed[i](tokens)
-                pos_indices = torch.arange(scale, device=device).unsqueeze(0).expand(B, -1).contiguous()
-                pos_emb = self.pos_embed[i](pos_indices)
-                current_repr = (token_emb + pos_emb).contiguous()
-                sequence = torch.cat([sequence, current_repr], dim=1).contiguous()
+                # 位置嵌入  
+                gen_pos_emb = self.pos_embed[si].expand(B, -1, -1)  # [B, 1, embed_dim]
+                
+                # 组合并添加到序列
+                gen_repr = (gen_token_emb + gen_pos_emb).contiguous()  # [B, 1, embed_dim]
+                
+                # 🔍 调试信息
+                print(f"  Debug scale {si}: x.shape={x.shape}, gen_repr.shape={gen_repr.shape}, B={B}, cfg={cfg}")
+                
+                # 确保x的维度正确：如果使用CFG，需要特别处理
+                if cfg != 1.0:
+                    # CFG模式：x是[B_cfg, seq_len, embed_dim]，需要只取前B个
+                    x_cond = x[:B].contiguous()  # [B, seq_len, embed_dim]
+                    print(f"  CFG mode: x_cond.shape={x_cond.shape}")
+                    x_new = torch.cat([x_cond, gen_repr], dim=1).contiguous()  # [B, seq_len+1, embed_dim]
+                    # 复制给unconditional部分
+                    x = torch.cat([x_new, x_new], dim=0).contiguous()  # [B_cfg, seq_len+1, embed_dim]
+                else:
+                    x = torch.cat([x, gen_repr], dim=1).contiguous()  # [B, seq_len+1, embed_dim]
         
-        # 连接所有生成的tokens
-        return torch.cat(all_generated, dim=1).contiguous()  # [B, total_tokens] 
+        return generated_tokens 

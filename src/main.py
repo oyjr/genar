@@ -56,9 +56,9 @@ MODELS = {
     },
     'VAR_ST': {
         'model_name': 'VAR_ST',
-        'num_genes': 200,
+        'num_genes': 196,  # 🆕 固定使用196个基因 (14x14)
         # VAR-ST 特定参数来自配置文件
-        'spatial_size': 16,
+        'spatial_size': 64,  # 🔧 修复：使用64×64 padding策略，解决VQVAE下采样问题
         'vae_ch': 128,
         'vae_embed_dim': 256,
         'vae_num_embeddings': 1024,
@@ -85,14 +85,14 @@ DEFAULT_CONFIG = {
             'persistent_workers': True
         },
         'val_dataloader': {
-            'batch_size': 1,
+            'batch_size': 32,  # 🔧 进一步增加验证批次大小，显著加速验证
             'num_workers': 4,
             'pin_memory': True,
             'shuffle': False,
             'persistent_workers': True
         },
         'test_dataloader': {
-            'batch_size': 1,
+            'batch_size': 32,  # 🔧 同步增加测试批次大小
             'num_workers': 4,
             'pin_memory': True,
             'shuffle': False,
@@ -355,7 +355,7 @@ def main(config):
         max_epochs=config.TRAINING.num_epochs,
         logger=logger,
         callbacks=callbacks,
-        precision='16-mixed',
+        precision=32,
         strategy=strategy_config,
         sync_batchnorm=config.sync_batchnorm,
         accumulate_grad_batches=accumulate_grad_batches,

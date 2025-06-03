@@ -21,7 +21,9 @@ class STDataset(Dataset):
                  encoder_name: str = 'uni',    # 编码器类型
                  use_augmented: bool = False,  # 是否使用增强
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
-                 normalize: bool = True):      # 数据归一化 (STEm方式: log2(+1))
+                 normalize: bool = True,       # 数据归一化 (STEm方式: log2(+1))
+                 use_var_st_genes: bool = False,  # 🆕 是否使用VAR-ST的196基因模式
+                 var_st_gene_count: int = 196):   # 🆕 VAR-ST模式的基因数量
         """
         空间转录组学数据集
         
@@ -37,6 +39,10 @@ class STDataset(Dataset):
                 - True: 每个spot变成7个训练样本 (真正的数据增强)
                 - False: 只使用第一个增强版本 (原图)
             normalize: 是否进行数据归一化 (STEm方式: log2(+1))
+            use_var_st_genes: 🆕 是否使用VAR-ST基因模式
+                - True: 使用前196个基因 (适合VAR模型的14x14空间排列)
+                - False: 使用数据集原生的基因列表 (如PRAD的200基因)
+            var_st_gene_count: 🆕 VAR-ST模式使用的基因数量 (默认196 = 14x14)
         """
         super(STDataset, self).__init__()
         
@@ -62,6 +68,8 @@ class STDataset(Dataset):
         self.encoder_name = encoder_name
         self.use_augmented = use_augmented
         self.expand_augmented = expand_augmented
+        self.use_var_st_genes = use_var_st_genes  # 🆕 VAR-ST基因模式
+        self.var_st_gene_count = var_st_gene_count  # 🆕 VAR-ST基因数量
         self.norm_param = {'normalize': normalize}
         
         # 构建路径
@@ -79,6 +87,10 @@ class STDataset(Dataset):
         print(f"  - 数据集名称: {expr_name}")
         print(f"  - 编码器: {encoder_name}")
         print(f"  - 使用增强: {use_augmented}")
+        print(f"  - 🆕 VAR-ST基因模式: {use_var_st_genes}")
+        
+        if self.use_var_st_genes:
+            print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count} (前{var_st_gene_count}个基因)")
         
         if self.expand_augmented:
             print(f"  - 🚀 增强模式: 7倍样本展开 (每个spot变成7个训练样本)")
@@ -90,7 +102,7 @@ class STDataset(Dataset):
         print(f"  - ST目录: {self.st_dir}")
         print(f"  - 嵌入目录: {self.emb_dir}")
         
-        # 加载基因列表
+        # 加载基因列表 - 🆕 支持VAR-ST模式
         self.genes = self.load_gene_list()
         print(f"  - 加载基因数量: {len(self.genes)}")
         
@@ -110,7 +122,9 @@ class STDataset(Dataset):
         print(f"✅ STDataset初始化完成")
 
     def load_gene_list(self) -> List[str]:
-        """从selected_gene_list.txt读取基因列表"""
+        """从基因列表文件读取基因列表 - 🆕 支持VAR-ST模式"""
+        
+        # 总是从数据集原生基因列表开始
         gene_file = f"{self.processed_dir}/selected_gene_list.txt"
         
         if not os.path.exists(gene_file):
@@ -118,13 +132,25 @@ class STDataset(Dataset):
         
         try:
             with open(gene_file, 'r', encoding='utf-8') as f:
-                genes = [line.strip() for line in f.readlines() if line.strip()]
+                all_genes = [line.strip() for line in f.readlines() if line.strip()]
             
-            if len(genes) == 0:
+            if len(all_genes) == 0:
                 raise ValueError(f"基因列表为空: {gene_file}")
             
-            print(f"从{gene_file}加载{len(genes)}个基因")
-            return genes
+            if self.use_var_st_genes:
+                # VAR-ST模式：使用前N个基因
+                if len(all_genes) < self.var_st_gene_count:
+                    print(f"⚠️  警告: 数据集只有{len(all_genes)}个基因，少于VAR-ST需要的{self.var_st_gene_count}个")
+                    selected_genes = all_genes  # 使用所有可用基因
+                else:
+                    selected_genes = all_genes[:self.var_st_gene_count]  # 使用前N个基因
+                
+                print(f"VAR-ST模式: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因")
+                return selected_genes
+            else:
+                # 标准模式：使用所有基因
+                print(f"标准模式: 使用数据集原生的{len(all_genes)}个基因")
+                return all_genes
             
         except UnicodeDecodeError as e:
             raise ValueError(f"基因列表文件编码错误: {gene_file}, 错误: {e}")
@@ -196,7 +222,6 @@ class STDataset(Dataset):
         # 预加载ST数据
         self.adata_dict = {}
         for slide_id in self.ids:
-            print(f"加载{slide_id}的ST数据...")
             self.adata_dict[slide_id] = self.load_st(slide_id, self.genes, **self.norm_param)
         
         if self.expand_augmented:
@@ -207,7 +232,6 @@ class STDataset(Dataset):
             self.expanded_adata_dict = {}
             
             for slide_id in self.ids:
-                print(f"展开{slide_id}的增强数据...")
                 
                 # 加载3D嵌入数据
                 emb = self.load_emb(slide_id, None, 'all')  # [num_spots, 7, feature_dim]
@@ -247,10 +271,10 @@ class STDataset(Dataset):
                     self.expanded_emb_dict[slide_id] = expanded_emb
                     self.expanded_adata_dict[slide_id] = expanded_adata
                     
-                    print(f"  {slide_id}: {num_spots} spots -> {num_spots*num_augs} 增强样本")
+
                 else:
                     # 如果不是3D格式，保持原样
-                    print(f"  {slide_id}: 非3D格式，保持原始{emb.shape[0]}个样本")
+
                     self.expanded_emb_dict[slide_id] = emb
                     self.expanded_adata_dict[slide_id] = original_adata
             
@@ -324,11 +348,9 @@ class STDataset(Dataset):
                 # 3D tensor: [num_spots, num_augmentations, feature_dim]
                 if mode == 'first':
                     # 使用第一个增强版本（原图）
-                    print(f"检测到3D增强嵌入格式: {emb.shape} -> 使用第一个增强版本")
                     emb = emb[:, 0, :]  # [num_spots, feature_dim]
                 elif mode == 'all':
                     # 返回所有增强版本 (用于expand_augmented)
-                    print(f"检测到3D增强嵌入格式: {emb.shape} -> 保留所有增强版本")
                     pass  # 保持原始3D格式
                 else:
                     raise ValueError(f"不支持的模式: {mode}，只支持 'first' 或 'all'")
@@ -373,8 +395,7 @@ class STDataset(Dataset):
         
         if not os.path.exists(st_file):
             raise FileNotFoundError(f"ST文件不存在: {st_file}")
-        
-        print(f"加载ST数据: {st_file}")
+    
         
         try:
             adata = sc.read_h5ad(st_file)
@@ -394,7 +415,6 @@ class STDataset(Dataset):
             
             # 基因过滤
             if genes is not None:
-                print(f"过滤基因，从{adata.n_vars}个基因中选择{len(genes)}个目标基因")
                 
                 common_genes = list(set(genes).intersection(set(adata.var_names)))
                 if len(common_genes) < len(genes):
@@ -402,14 +422,13 @@ class STDataset(Dataset):
                     print(f"警告: {len(missing_genes)}个基因在{slide_id}中不存在: {missing_genes[:5]}...")
                 
                 adata = adata[:, common_genes].copy()
-                print(f"过滤后保留{adata.n_vars}个基因")
-            
+
             # 数据归一化 - 遵循STEm的简单标准化方式
             if kwargs.get('normalize', True):
-                print("执行数据归一化 (遵循STEm方式)...")
+
                 
                 # STEm方式: 只使用log2(+1)变换
-                print("  - log2(+1)变换 (STEm标准)")
+
                 if sparse.issparse(adata.X):
                     X = adata.X.toarray()
                 else:
@@ -419,12 +438,12 @@ class STDataset(Dataset):
                 X = np.log2(X + 1)
                 adata.X = sparse.csr_matrix(X) if sparse.issparse(adata.X) else X
                 
-                print(f"  - 标准化完成，数据范围: [{X.min():.4f}, {X.max():.4f}]")
+
             
             # 保存标准化后的坐标
             adata.obsm['positions'] = coords
             
-            print(f"ST数据加载完成: {adata.n_obs} spots, {adata.n_vars} genes")
+
             return adata
             
         except Exception as e:

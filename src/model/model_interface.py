@@ -19,6 +19,7 @@ from typing import Dict, Any
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import BasePredictionWriter
 import torch.nn.functional as F
+from addict import Dict as AddictDict
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
@@ -95,6 +96,17 @@ class ModelInterface(pl.LightningModule):
 
         self.log('train_loss', loss, on_epoch=True, logger=True, sync_dist=True)
                 
+        # 🔇 Debug: 显示预测形状（简化输出，只在主进程显示）
+        is_main_process = int(os.environ.get('LOCAL_RANK', 0)) == 0
+        if is_main_process and hasattr(logits, 'shape'):
+            pred_shape = logits.shape
+            # 🔄 大幅减少输出频率：每100步输出一次
+            if not hasattr(self, '_debug_step_count'):
+                self._debug_step_count = 0
+            self._debug_step_count += 1
+            if self._debug_step_count % 100 == 0:
+                print(f"🔄 单spot训练: {pred_shape} (Step {self._debug_step_count})")
+        
         return loss
 
 
@@ -241,23 +253,32 @@ class ModelInterface(pl.LightningModule):
     
 
     def _init_metrics(self):
-        # 从基因列表文件获取基因数量，如果不存在则使用默认值
-        if hasattr(self.config, 'data_path'):
-            gene_file = f"{self.config.data_path}processed_data/selected_gene_list.txt"
-            try:
-                with open(gene_file, 'r') as f:
-                    genes = [line.strip() for line in f.readlines() if line.strip()]
-                num_outputs = len(genes)
-                logger.info(f"从基因列表文件获取基因数量: {num_outputs}")
-            except FileNotFoundError:
-                num_outputs = 200  # 默认值
-                logger.warning(f"无法读取基因列表文件，使用默认基因数量: {num_outputs}")
-            except Exception as e:
-                num_outputs = 200  # 默认值
-                logger.error(f"读取基因列表文件时出错: {e}，使用默认基因数量: {num_outputs}")
+        # 检测是否为VAR_ST模型
+        model_name = getattr(self.config, 'model_name', '') or getattr(self.config.MODEL, 'model_name', '') if hasattr(self.config, 'MODEL') else ''
+        is_var_st = model_name.upper() == 'VAR_ST'
+        
+        if is_var_st:
+            # VAR-ST模型使用196个基因
+            num_outputs = 196
+            logger.info(f"VAR_ST模型使用固定基因数量: {num_outputs}")
         else:
-            num_outputs = 200  # 默认值
-            logger.warning(f"配置中无数据路径，使用默认基因数量: {num_outputs}")
+            # 其他模型从基因列表文件获取基因数量
+            if hasattr(self.config, 'data_path'):
+                gene_file = f"{self.config.data_path}processed_data/selected_gene_list.txt"
+                try:
+                    with open(gene_file, 'r') as f:
+                        genes = [line.strip() for line in f.readlines() if line.strip()]
+                    num_outputs = len(genes)
+                    logger.info(f"从基因列表文件获取基因数量: {num_outputs}")
+                except FileNotFoundError:
+                    num_outputs = 200  # 默认值
+                    logger.warning(f"无法读取基因列表文件，使用默认基因数量: {num_outputs}")
+                except Exception as e:
+                    num_outputs = 200  # 默认值
+                    logger.error(f"读取基因列表文件时出错: {e}，使用默认基因数量: {num_outputs}")
+            else:
+                num_outputs = 200  # 默认值
+                logger.warning(f"配置中无数据路径，使用默认基因数量: {num_outputs}")
 
         metrics = {
             'mse': MeanSquaredError(num_outputs=num_outputs),
@@ -313,11 +334,11 @@ class ModelInterface(pl.LightningModule):
 
     def _preprocess_inputs_var_st(self, inputs):
         """
-        VAR-ST模型输入预处理 - 基因维度多尺度模式
+        VAR_ST模型的输入预处理（基因多尺度版本）
         
-        期望输入：
-        - target_genes: [B, num_genes] (基因表达向量)
-        - img: [B, feature_dim] (组织学特征)
+        关键变化：
+        - 196基因 → 14×14伪图像
+        - 基因多尺度 (1,2,3,4,5) → 55 tokens
         
         不需要positions参数，因为基因多尺度在基因维度而非空间维度
         """
@@ -327,7 +348,8 @@ class ModelInterface(pl.LightningModule):
         if 'target_genes' in inputs:
             target_genes = inputs['target_genes']
             processed['gene_expression'] = target_genes
-            print(f"📊 基因表达数据: {target_genes.shape}")
+            # 🔇 简化输出：只在debug模式显示
+            # print(f"📊 基因表达数据: {target_genes.shape}")
             
             # 验证维度
             if target_genes.dim() not in [2, 3]:
@@ -337,7 +359,8 @@ class ModelInterface(pl.LightningModule):
         if 'img' in inputs:
             img_features = inputs['img']
             processed['histology_features'] = img_features
-            print(f"🖼️  组织学特征: {img_features.shape}")
+            # 🔇 简化输出：只在debug模式显示
+            # print(f"🖼️  组织学特征: {img_features.shape}")
             
             # 验证维度
             if img_features.dim() not in [2, 3]:
@@ -348,16 +371,18 @@ class ModelInterface(pl.LightningModule):
         # 空间位置处理 - 基因多尺度模式下可选
         if 'positions' in inputs:
             processed['positions'] = inputs['positions']
-            print(f"📍 空间位置: {inputs['positions'].shape} (基因模式下不使用)")
+            # 🔇 简化输出：只在debug模式显示
+            # print(f"📍 空间位置: {inputs['positions'].shape} (基因模式下不使用)")
         
         # 设置模式
         processed['mode'] = 'training' if 'target_genes' in inputs else 'inference'
         
-        print(f"✅ VAR_ST预处理完成 (基因多尺度模式):")
-        print(f"   - 模式: {processed['mode']}")
-        for key, value in processed.items():
-            if isinstance(value, torch.Tensor):
-                print(f"   - {key}: {value.shape}")
+        # 🔇 大幅简化预处理完成输出
+        # print(f"✅ VAR_ST预处理完成 (基因多尺度模式):")
+        # print(f"   - 模式: {processed['mode']}")
+        # for key, value in processed.items():
+        #     if isinstance(value, torch.Tensor):
+        #         print(f"   - {key}: {value.shape}")
         
         return processed
 
@@ -864,8 +889,12 @@ class ModelInterface(pl.LightningModule):
             # 获取模型初始化参数
             class_args = inspect.getfullargspec(Model.__init__).args[1:]
             
-            # 处理model_config，支持Namespace和dict两种类型
-            if hasattr(self.model_config, '__dict__'):
+            # 🔧 修复：正确处理addict.Dict对象
+            if isinstance(self.model_config, AddictDict):
+                # 对于addict.Dict，直接使用dict()转换
+                model_config_dict = dict(self.model_config)
+                inkeys = model_config_dict.keys()
+            elif hasattr(self.model_config, '__dict__'):
                 # Namespace对象，转换为字典
                 model_config_dict = vars(self.model_config)
                 inkeys = model_config_dict.keys()
@@ -1069,6 +1098,13 @@ class ModelInterface(pl.LightningModule):
             metrics: Dictionary containing evaluation metrics
             prefix: Optional prefix for the output (e.g., "Val", "Test")
         """
+        # 🔧 在分布式训练中，只在主进程输出评估结果
+        import os
+        is_main_process = int(os.environ.get('LOCAL_RANK', 0)) == 0
+        
+        if not is_main_process:
+            return  # 非主进程直接返回，不输出
+        
         if prefix:
             print(f"\n========== {prefix} 评估结果 ==========")
         else:
@@ -1270,8 +1306,8 @@ class ModelInterface(pl.LightningModule):
             # 训练模式：直接使用模型输出
             processed['loss'] = outputs['loss']
             processed['var_loss'] = outputs.get('var_loss', outputs['loss'])
-            processed['vqvae_loss'] = outputs.get('vqvae_loss', torch.tensor(0.0))
-            processed['gene_recon_loss'] = outputs.get('gene_recon_loss', torch.tensor(0.0))
+            processed['vqvae_loss'] = outputs.get('vqvae_loss', torch.tensor(0.0, requires_grad=True))
+            processed['gene_recon_loss'] = outputs.get('gene_recon_loss', torch.tensor(0.0, requires_grad=True))
             
             # 预测和目标数据 - 确保所有必要字段都被传递
             processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
@@ -1279,40 +1315,27 @@ class ModelInterface(pl.LightningModule):
             processed['logits'] = outputs.get('logits', outputs.get('predicted_expression', outputs.get('predictions')))
             processed['targets'] = outputs.get('targets', original_inputs['target_genes'])
             
-            # 智能输出显示
-            if processed['predictions'] is not None:
+            # 只在每100个step时显示详细信息，其余时候保持简洁
+            if not hasattr(self, '_step_count'):
+                self._step_count = 0
+            self._step_count += 1
+            
+            # 🔧 在分布式训练中，只在主进程输出，并大幅减少输出频率
+            import os
+            is_main_process = int(os.environ.get('LOCAL_RANK', 0)) == 0
+            
+            if processed['predictions'] is not None and is_main_process and self._step_count % 500 == 1:
                 pred_shape = processed['predictions'].shape
                 if len(pred_shape) == 2:
-                    print(f"🔄 单spot训练输出: {pred_shape}")
+                    print(f"🔄 单spot训练: {pred_shape} (Step {self._step_count})")
                 elif len(pred_shape) == 3:
                     B, N, G = pred_shape
-                    print(f"🔄 多spot训练输出: {pred_shape} (Batch={B}, Spots={N}, Genes={G})")
-                else:
-                    print(f"🔄 训练模式输出: {pred_shape}")
-            
+                    print(f"🔄 多spot训练: Batch={B}, Spots={N}, Genes={G} (Step {self._step_count})")
         else:
-            # 推理模式：直接使用预测结果
-            predictions = outputs.get('predictions', outputs.get('predicted_expression'))
-            processed['predictions'] = predictions
-            processed['predicted_expression'] = predictions
-            processed['logits'] = predictions
-            
-            # 智能输出显示
-            if processed['predictions'] is not None:
-                pred_shape = processed['predictions'].shape
-                if len(pred_shape) == 2:
-                    print(f"🔄 单spot推理输出: {pred_shape}")
-                elif len(pred_shape) == 3:
-                    B, N, G = pred_shape
-                    print(f"🔄 多spot推理输出: {pred_shape} (Batch={B}, Spots={N}, Genes={G})")
-                else:
-                    print(f"🔄 推理模式输出: {pred_shape}")
-            
-            # 复制其他字段
-            if 'tokens' in outputs:
-                processed['tokens'] = outputs['tokens']
-            if 'multiscale_expressions' in outputs:
-                processed['multiscale_expressions'] = outputs['multiscale_expressions']
+            # 推理模式：处理预测输出
+            processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression', outputs.get('logits')))
+            processed['predicted_expression'] = processed['predictions']
+            processed['logits'] = processed['predictions']
         
         return processed
 
