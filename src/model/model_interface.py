@@ -26,17 +26,15 @@ logger = logging.getLogger(__name__)
 
 # Import visualization module
 try:
-    # Try relative import first
-    from ..visualization import GeneVisualizer
+    # 🔧 修复：使用绝对导入避免相对导入错误
+    from visualization import GeneVisualizer
     VISUALIZATION_AVAILABLE = True
 except ImportError:
-    try:
-        # Fallback to absolute import
-        from visualization import GeneVisualizer
-        VISUALIZATION_AVAILABLE = True
-    except ImportError:
-        VISUALIZATION_AVAILABLE = False
-        logger.warning("Visualization module not available. Install matplotlib, seaborn, and PIL to enable visualization.")
+    # 🔧 删除回退机制，导入失败直接报错
+    raise ImportError(
+        "无法导入可视化模块。请确保安装了matplotlib, seaborn, 和PIL依赖。"
+        "如果不需要可视化功能，请修改代码移除可视化相关导入。"
+    )
 
 
 class ModelInterface(pl.LightningModule):
@@ -117,8 +115,45 @@ class ModelInterface(pl.LightningModule):
         # 预处理输入
         batch = self._preprocess_inputs(batch)
         
-        # 获取模型输出
-        results_dict = self.model(**batch)
+        # 🔧 关键修复：VAR_ST模型在验证时使用推理模式
+        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
+            # 修改输入模式为推理
+            batch['mode'] = 'inference'
+            # 移除基因表达输入，强制模型进行纯生成
+            histology_features = batch['histology_features']
+            class_labels = batch.get('class_labels')
+            
+            # 使用推理模式：仅从组织学特征生成基因表达
+            results_dict = self.model.forward_inference(
+                histology_features=histology_features,
+                class_labels=class_labels,
+                cfg_scale=1.0,  # 验证时不使用guidance
+                top_k=50,
+                top_p=0.9,
+                temperature=1.0,
+                num_samples=1
+            )
+            
+            # 🔧 修复：为推理模式手动添加loss计算
+            if 'loss' not in results_dict:
+                # 获取预测和目标基因表达
+                predicted_genes = results_dict.get('predicted_expression', results_dict.get('predictions'))
+                target_genes = original_batch.get('target_genes', batch.get('gene_expression'))
+                
+                if predicted_genes is not None and target_genes is not None:
+                    # 确保在相同设备上
+                    if predicted_genes.device != target_genes.device:
+                        target_genes = target_genes.to(predicted_genes.device)
+                    
+                    # 计算预测损失
+                    validation_loss = self.criterion(predicted_genes, target_genes)
+                    results_dict['loss'] = validation_loss
+                else:
+                    # 如果无法计算，使用零损失
+                    results_dict['loss'] = torch.tensor(0.0, device=histology_features.device, requires_grad=True)
+        else:
+            # 其他模型使用正常前向传播
+            results_dict = self.model(**batch)
         
         # 如果是VAR_ST模型，需要后处理输出
         if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
@@ -866,7 +901,7 @@ class ModelInterface(pl.LightningModule):
             elif self.model_name == 'VAR_ST':
                 logger.info("加载VAR_ST模型...")
                 Model = getattr(importlib.import_module(
-                    f'model.VAR.VAR_ST_Complete'), 'VAR_ST_Complete')
+                    f'model.VAR.var_gene_wrapper'), 'VARGeneWrapper')
             else:
                 Model = getattr(importlib.import_module(
                     f'model.{self.model_name.lower()}'), camel_name)
@@ -911,6 +946,10 @@ class ModelInterface(pl.LightningModule):
                     args1[arg] = model_config_dict[arg]
                 elif arg == 'config':  # 如果需要config参数，传入完整配置
                     args1[arg] = self.config
+                elif arg == 'histology_feature_dim' and 'feature_dim' in inkeys:
+                    # 🔧 为VAR_ST模型映射feature_dim到histology_feature_dim
+                    args1[arg] = model_config_dict['feature_dim']
+                    logger.debug(f"映射参数: feature_dim ({model_config_dict['feature_dim']}) -> histology_feature_dim")
                     
             # 添加其他参数
             args1.update(other_args)

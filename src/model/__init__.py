@@ -1,10 +1,10 @@
 from .model_interface import ModelInterface
 from .MFBP.MFBP import MFBP
-from .VAR.VAR_ST_Complete import VAR_ST_Complete
+from .VAR.var_gene_wrapper import VARGeneWrapper
 
 MODELS = {
     'MFBP': MFBP,
-    'VAR_ST': VAR_ST_Complete,
+    'VAR_ST': VARGeneWrapper,
 }
 
-__all__ = ['MFBP', 'VAR_ST_Complete', 'MODELS']
+__all__ = ['MFBP', 'VARGeneWrapper', 'MODELS']

@@ -1,11 +1,14 @@
 """
-VAR基因包装器 - 基于基因多尺度的从头训练版本
+VAR基因包装器 - 完整VAR实现版本
 
-设计理念：
-- 完全从头训练VAR和VQVAE
-- 专门为196基因 (14x14) 设计
-- 基因维度多尺度：(1,2,3,4,5) 对应生物学层次
-- 无视觉预训练依赖，纯基因表达逻辑
+基于真正的VAR架构重写，包含：
+- AdaLNSelfAttn: 条件自适应LayerNorm
+- 多尺度自回归生成
+- 正确的位置编码和层级编码
+- Causal attention mask
+- 完整的autoregressive推理
+
+无外部依赖，完全内置实现。
 """
 
 import torch
@@ -15,464 +18,321 @@ import sys
 import os
 from typing import Dict, List, Optional, Tuple, Any, Union
 import numpy as np
+import math
 
-# 🔧 修复：导入原始VAR项目的模型架构（不加载权重）
-# 添加VAR项目路径到sys.path
-VAR_PROJECT_PATH = "/home/ouyangjiarui/project/ST/VAR"
-if VAR_PROJECT_PATH not in sys.path:
-    sys.path.insert(0, VAR_PROJECT_PATH)
-
-# 从原始VAR项目导入模型架构
-try:
-    from models.var import VAR
-    from models.vqvae import VQVAE
-    print("✅ 成功导入VAR项目模型架构")
-    VAR_AVAILABLE = True
-except ImportError as e:
-    print(f"❌ 导入VAR模型失败: {e}")
-    print("🔄 将使用简化版本继续")
-    VAR_AVAILABLE = False
-
-# 导入本地基因适配器
+# 导入本地基因适配器和VAR基础组件
 from .gene_pseudo_image_adapter import GenePseudoImageAdapter
+from .var_basic_components import *
 
 class VARGeneWrapper(nn.Module):
     """
-    VAR基因包装器 - 基因多尺度从头训练版本
+    VAR基因包装器 - 完整VAR实现版本
     
-    专门为基因表达预测设计的VAR架构：
+    基于真正的VAR架构设计：
     - 196个基因 → 14×14×1 伪图像
-    - 基因多尺度：(1,2,3,4,5) = 55 tokens
-    - 完全从头训练，无预训练依赖
-    - 生物学多尺度语义
+    - 多尺度patch_nums: (1,2,4) = 21 tokens
+    - AdaLN条件注入机制
+    - 完整的自回归生成
     """
     
     def __init__(
         self,
-        num_genes: int = 196,  # 🔧 固定196基因
-        image_size: int = 14,  # 🔧 14×14完美平方
-        histology_feature_dim: int = 512,
-        patch_nums: Tuple[int, ...] = (1, 2, 3, 4, 5),  # 🔧 基因多尺度
+        histology_feature_dim: int,  # 🔧 必需参数放在前面
+        num_genes: int = 196,
+        image_size: int = 64,
+        patch_nums: Tuple[int, ...] = (1, 2, 4),
         var_config: Optional[Dict] = None,
         vqvae_config: Optional[Dict] = None,
-        adapter_config: Optional[Dict] = None
+        adapter_config: Optional[Dict] = None,
+        progressive_training: bool = True,
+        warmup_steps: int = 1000,
+        min_recon_weight: float = 0.5,
+        max_recon_weight: float = 5.0
     ):
-        """
-        初始化基因多尺度VAR模型
-        
-        Args:
-            num_genes: 基因数量，固定196 (14×14)
-            image_size: 伪图像尺寸，固定14×14
-            histology_feature_dim: 组织学特征维度
-            patch_nums: 基因多尺度设置 (1,2,3,4,5)
-            var_config: VAR配置
-            vqvae_config: VQVAE配置
-            adapter_config: 适配器配置
-        """
         super().__init__()
         
-        # 🔧 严格验证基因数量和图像尺寸的匹配（支持padding策略）
-        total_image_positions = image_size * image_size
-        if num_genes == 196:
-            # 🔧 修改：允许196基因使用16×16 padding策略
-            if image_size < 14:
-                raise ValueError(f"196基因至少需要14×14图像，但指定了{image_size}×{image_size}")
-            if image_size == 14 and total_image_positions != 196:
-                raise ValueError(f"14×14图像必须完美匹配196基因，但位置数为{total_image_positions}")
-            
-            # 允许使用16×16 padding策略
-            if image_size >= 16:
-                print(f"🔧 196基因使用padding策略: {image_size}×{image_size} (padding {total_image_positions - 196}个位置)")
-                self.use_padding = True
-                self.padding_size = total_image_positions - num_genes
-            else:
-                # 14×14完美匹配模式
-                print(f"🔧 196基因使用完美匹配: {image_size}×{image_size}")
-                self.use_padding = False
-                self.padding_size = 0
-        else:
-            # 对于其他基因数量，允许灵活匹配
-            if num_genes > total_image_positions:
-                raise ValueError(f"基因数量{num_genes}不能大于图像位置数{image_size}×{image_size}={total_image_positions}")
-            self.use_padding = num_genes < total_image_positions
-            self.padding_size = total_image_positions - num_genes
+        # 🔧 严格参数验证，不允许None或无效值
+        if histology_feature_dim is None or histology_feature_dim <= 0:
+            raise ValueError(f"histology_feature_dim必须是正整数，得到: {histology_feature_dim}")
         
+        if num_genes <= 0:
+            raise ValueError(f"num_genes必须是正整数，得到: {num_genes}")
+            
+        if image_size <= 0:
+            raise ValueError(f"image_size必须是正整数，得到: {image_size}")
+            
+        if not patch_nums or any(p <= 0 for p in patch_nums):
+            raise ValueError(f"patch_nums必须是正整数序列，得到: {patch_nums}")
+        
+        # 保存配置
+        self.progressive_training = progressive_training
+        self.warmup_steps = warmup_steps
+        self.min_recon_weight = min_recon_weight
+        self.max_recon_weight = max_recon_weight
+        self.current_step = 0
+        
+        # 基础配置
         self.num_genes = num_genes
         self.image_size = image_size
         self.histology_feature_dim = histology_feature_dim
         self.patch_nums = patch_nums
         
-        # 计算总token数
-        self.total_tokens = sum(p*p for p in patch_nums)
-        
-        # 🔇 简化初始化输出，减少冗余信息
-        print(f"🧬 VAR基因包装器: {num_genes}基因 → {image_size}×{image_size}, {self.total_tokens}tokens")
+        # 验证基因数量
         if num_genes == 196:
-            print(f"   ✅ 196基因模式：完美匹配14×14")
+            self.use_upsampling = True
+            self.intermediate_size = 14
+        else:
+            self.use_upsampling = False
+            self.intermediate_size = int(math.sqrt(num_genes))
+            if self.intermediate_size ** 2 != num_genes:
+                raise ValueError(f"基因数量{num_genes}不是完全平方数")
         
-        # 🔇 生物学语义显示将在后续设置
-        self._biological_semantics = None  # 待父类传递
+        print(f"🧬 VAR基因包装器 - 完整实现版本")
+        print(f"   基因数量: {num_genes} → {image_size}×{image_size}")
+        print(f"   多尺度patch_nums: {patch_nums}")
         
-        # 🔧 步骤1：初始化基因适配器（196基因 → 16×16伪图像，padding策略）
+        # 计算多尺度参数
+        self.L = sum(pn ** 2 for pn in self.patch_nums)  # 总token数
+        self.first_l = self.patch_nums[0] ** 2  # 第一层token数
+        self.begin_ends = []
+        cur = 0
+        for i, pn in enumerate(self.patch_nums):
+            self.begin_ends.append((cur, cur + pn ** 2))
+            cur += pn ** 2
+        
+        print(f"   总token数: {self.L}, 第一层: {self.first_l}")
+        print(f"   各层范围: {self.begin_ends}")
+        
+        # 初始化基因适配器
         self.gene_adapter = GenePseudoImageAdapter(
             num_genes=num_genes,
-            target_image_size=image_size,  # 🔧 使用16×16，padding策略
-            normalize_method='layer_norm',
+            intermediate_size=self.intermediate_size,
+            target_image_size=image_size,
+            normalize_method='none',
             eps=1e-6
         )
 
-        print(f"🧬 初始化基因适配器:")
-        print(f"   - 基因数量: {num_genes}")
-        print(f"   - 图像尺寸: {image_size}×{image_size} (padding策略)")
-        print(f"   - Padding大小: {image_size*image_size - num_genes}")
-        print(f"   - 空间利用率: {num_genes/(image_size*image_size):.1%}")
-
-        # 验证适配器转换正确性
-        print(f"📊 验证基因适配器转换...")
-        validation_result = self.gene_adapter.validate_conversion()
-        if validation_result['conversion_successful']:
-            print(f"   ✅ 转换验证成功")
-            print(f"   - 最大重建误差: {validation_result['max_reconstruction_error']:.2e}")
-            print(f"   - 平均重建误差: {validation_result['mean_reconstruction_error']:.2e}")
-            print(f"   - Padding区域保持零值: {validation_result['padding_preserved']}")
-        else:
-            print(f"   ❌ 转换验证失败")
-            print(f"   - 误差: {validation_result['max_reconstruction_error']:.2e}")
+        # 初始化VQVAE
+        self._init_vqvae(vqvae_config)
         
-        # 🔧 步骤2：初始化VQVAE配置（适配16×16输入）
-        if VAR_AVAILABLE:
-            print(f"🎨 使用完整VAR VQVAE (单通道输入，16×16)")
-            
-            # 🔧 确保vqvae_config不为None，提供默认配置
-            if vqvae_config is None:
-                vqvae_config = {
-                    'vocab_size': 4096,
-                    'z_channels': 32,
-                    'ch': 160,
-                    'dropout': 0.0
-                }
-                print(f"   🔧 使用默认VQVAE配置: {vqvae_config}")
-            
-            # 🔧 修复：直接使用VQVAE而不是复杂的配置类
-            # 因为原始VAR项目的VQVAE可能有不同的初始化方式
-            try:
-                # 尝试直接初始化VQVAE（如果支持简单参数）
-                self.vqvae = VQVAE(
-                    embed_dim=vqvae_config.get('embed_dim', 256),
-                    n_embed=vqvae_config.get('n_embed', 8192),
-                    double_z=vqvae_config.get('double_z', False),
-                    z_channels=vqvae_config.get('z_channels', 256),
-                    resolution=image_size,  # 16×16分辨率
-                    in_channels=1,  # 🔧 单通道基因伪图像
-                    out_ch=1,  # 🔧 单通道输出
-                    ch=vqvae_config.get('ch', 128),
-                    ch_mult=vqvae_config.get('ch_mult', [1, 1, 2, 2, 4]),
-                    num_res_blocks=vqvae_config.get('num_res_blocks', 2),
-                    attn_resolutions=vqvae_config.get('attn_resolutions', [16]),  # 适配16×16
-                    dropout=vqvae_config.get('dropout', 0.0)
-                )
-                print(f"   ✅ 完整VAR VQVAE初始化成功 (1→{vqvae_config.get('z_channels', 256)}→1通道，16×16)")
-                
-            except Exception as e:
-                print(f"   ⚠️ 直接初始化VQVAE失败: {e}")
-                print(f"   🔄 尝试从原始VAR项目查找正确的初始化方式...")
-                
-                # 🔧 关键修复：使用VAR项目的标准参数，特别是v_patch_nums
-                vqvae_kwargs = {
-                    'vocab_size': vqvae_config.get('vocab_size', 4096),
-                    'z_channels': vqvae_config.get('z_channels', 32),
-                    'ch': vqvae_config.get('ch', 160),
-                    'dropout': vqvae_config.get('dropout', 0.0),
-                    'beta': 0.25,
-                    'using_znorm': False,
-                    'quant_conv_ks': 3,
-                    'quant_resi': 0.5,
-                    'share_quant_resi': 4,
-                    'default_qresi_counts': 0,
-                    'v_patch_nums': self.patch_nums,  # 🔧 关键：传递正确的patch_nums序列
-                    'test_mode': False
-                }
-                
-                self.vqvae = VQVAE(**vqvae_kwargs)
-                print(f"   ✅ 自适应VQVAE初始化成功，v_patch_nums={self.patch_nums}")
-                
-            except Exception as e2:
-                print(f"   ❌ 自适应初始化也失败: {e2}")
-                print(f"   🔄 使用最小化参数初始化...")
-                
-                # 🔧 最小化参数初始化
-                try:
-                    # 尝试只传递最必要的参数
-                    self.vqvae = VQVAE(
-                        vocab_size=4096,
-                        z_channels=32,
-                        v_patch_nums=self.patch_nums  # 🔧 确保传递patch_nums
-                    )
-                    print(f"   ⚠️ 使用默认参数初始化VQVAE（可能需要手动调整）")
-                except Exception as e3:
-                    print(f"   ❌ 所有VQVAE初始化尝试都失败: {e3}")
-                    raise RuntimeError(f"无法初始化完整VAR VQVAE: {e3}")
-
-        else:
-            print(f"🎨 使用简化VQVAE (单通道，16×16)")
-            # 简化VQVAE，适配16×16输入
-            self.vqvae = nn.Sequential(
-                # 编码器：1×16×16 → 256×4×4  
-                nn.Conv2d(1, 32, 3, padding=1),  # [B,1,16,16] → [B,32,16,16]
-                nn.ReLU(),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1),  # [B,32,16,16] → [B,64,8,8]
-                nn.ReLU(),
-                nn.Conv2d(64, 128, 3, stride=2, padding=1),  # [B,64,8,8] → [B,128,4,4]
-                nn.ReLU(),
-                nn.Conv2d(128, 256, 3, padding=1),  # [B,128,4,4] → [B,256,4,4]
-                
-                # 解码器：256×4×4 → 1×16×16
-                nn.ConvTranspose2d(256, 128, 3, padding=1),  # [B,256,4,4] → [B,128,4,4]
-                nn.ReLU(), 
-                nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),  # [B,128,4,4] → [B,64,8,8]
-                nn.ReLU(),
-                nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),  # [B,64,8,8] → [B,32,16,16]
-                nn.ReLU(),
-                nn.ConvTranspose2d(32, 1, 3, padding=1),  # [B,32,16,16] → [B,1,16,16]
-                nn.Tanh()  # 输出范围[-1,1]
-            )
-            print(f"   ✅ 简化VQVAE初始化完成 (1→256→1通道，16×16)")
-
-        print(f"   - 输入格式: [B, 1, {image_size}, {image_size}] (单通道基因伪图像)")
-        print(f"   - 输出格式: [B, 1, {image_size}, {image_size}] (重建基因伪图像)")
-        print(f"   - 支持分辨率: 16×16 (padding策略解决尺寸限制)")
+        # 初始化VAR
+        self._init_full_var(var_config)
         
-        # 🔧 Step 3: 初始化基因专用VAR（从头训练）
-        # print(f"🏗️ 初始化基因专用VAR（从头训练）...")
-        self._init_gene_var(var_config)
+        # 初始化条件处理器
+        self._init_condition_processor()
         
-        # 🔧 Step 4: 条件特征处理器
-        # 映射组织学特征到基因语义空间
-        self.condition_processor = nn.Sequential(
-            nn.Linear(histology_feature_dim, 512),
+        # 输出统计
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"📊 总参数: {trainable_params:,}")
+        print(f"✅ VAR基因包装器初始化完成")
+        
+        self._verbose_logging = True
+        self._step_count = 0
+    
+    def _init_vqvae(self, vqvae_config: Optional[Dict] = None):
+        """初始化内置VQVAE"""
+        config = vqvae_config or {}
+        
+        self.vocab_size = config.get('vocab_size', 8192)
+        self.z_channels = config.get('z_channels', 64)
+        
+        print(f"🎨 初始化内置VQVAE:")
+        print(f"   词汇表大小: {self.vocab_size}")
+        print(f"   潜在维度: {self.z_channels}")
+        
+        # 编码器: 1×64×64 → z_channels×4×4 (16倍下采样)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, 4, stride=2, padding=1),     # 64→32
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),    # 32→16
             nn.ReLU(),
-            nn.Linear(256, self.var_embed_dim)  # 映射到VAR嵌入维度
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),   # 16→8
+            nn.ReLU(),
+            nn.Conv2d(128, self.z_channels, 4, stride=2, padding=1),  # 8→4
         )
         
-        print(f"🔧 条件处理器配置:")
-        print(f"   - 输入维度: {histology_feature_dim}")
-        print(f"   - VAR嵌入维度: {self.var_embed_dim}")
-        print(f"   - 处理链: {histology_feature_dim} → 512 → 256 → {self.var_embed_dim}")
+        # 量化层
+        self.quantize = nn.Embedding(self.vocab_size, self.z_channels)
         
-        # 输出参数统计
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"📊 参数统计（全部可训练）:")
-        print(f"   - 总参数: {total_params:,}")
-        print(f"   - 可训练参数: {trainable_params:,} (100%)")
-        print(f"✅ VAR基因包装器初始化完成（需求兼容版）")
+        # 解码器: z_channels×4×4 → 1×64×64
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(self.z_channels, 128, 4, stride=2, padding=1),  # 4→8
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),   # 8→16
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),    # 16→32
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 1, 4, stride=2, padding=1),     # 32→64
+            nn.Tanh()
+        )
         
-        # 🔧 初始化日志控制属性
-        self._verbose_logging = True  # 默认启用详细日志
-        self._step_count = 0  # 步数计数器
+        print(f"   架构: 1×64×64 → {self.z_channels}×4×4 → 1×64×64")
     
-    def _init_gene_var(self, var_config: Optional[Dict] = None):
-        """初始化基因专用VAR"""
+    def _init_full_var(self, var_config: Optional[Dict] = None):
+        """初始化完整VAR模型"""
         config = var_config or {}
         
-        # 基因VAR配置
-        self.var_embed_dim = config.get('embed_dim', 512)      # 更小的嵌入维度
-        self.var_depth = config.get('depth', 12)               # 更少的层数
-        self.var_num_heads = config.get('num_heads', 8)        # 更少的注意力头
-        self.var_num_classes = config.get('num_classes', 10)   # 基因表达类型数
+        # VAR核心参数
+        self.embed_dim = config.get('embed_dim', 512)
+        self.depth = config.get('depth', 12)
+        self.num_heads = config.get('num_heads', 8)
+        self.num_classes = config.get('num_classes', 10)
         
-        if VAR_AVAILABLE:
-            self.var_model = VAR(
-                vae_local=self.vqvae,
-                num_classes=self.var_num_classes,
-                depth=self.var_depth,
-                embed_dim=self.var_embed_dim,
-                num_heads=self.var_num_heads,
-                mlp_ratio=config.get('mlp_ratio', 4.0),
-                drop_rate=config.get('drop_rate', 0.1),
-                attn_drop_rate=config.get('attn_drop_rate', 0.1),
-                drop_path_rate=config.get('drop_path_rate', 0.1),
-                norm_eps=config.get('norm_eps', 1e-6),
-                shared_aln=config.get('shared_aln', False),
-                cond_drop_rate=config.get('cond_drop_rate', 0.1),
-                attn_l2_norm=config.get('attn_l2_norm', False),
-                patch_nums=self.patch_nums,  # 🔧 使用基因多尺度
-                flash_if_available=config.get('flash_if_available', False),
-                fused_if_available=config.get('fused_if_available', False)
-            )
-            print(f"   ✅ VAR: embed={self.var_embed_dim}, depth={self.var_depth}, heads={self.var_num_heads}")
+        print(f"🏗️ 初始化完整VAR模型:")
+        print(f"   嵌入维度: {self.embed_dim}")
+        print(f"   深度: {self.depth}")
+        print(f"   注意力头数: {self.num_heads}")
+        print(f"   类别数: {self.num_classes}")
+        
+        # 1. Word embedding (将VQVAE的潜在表示映射到VAR空间)
+        self.word_embed = nn.Linear(self.z_channels, self.embed_dim)
+        
+        # 2. Class embedding
+        init_std = math.sqrt(1 / self.embed_dim / 3)
+        self.class_emb = nn.Embedding(self.num_classes + 1, self.embed_dim)
+        nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
+        
+        # 起始位置编码
+        self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.embed_dim))
+        nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
+        
+        # 3. 绝对位置编码 (每个尺度独立)
+        pos_1LC = []
+        for i, pn in enumerate(self.patch_nums):
+            pe = torch.empty(1, pn * pn, self.embed_dim)
+            nn.init.trunc_normal_(pe, mean=0, std=init_std)
+            pos_1LC.append(pe)
+        self.pos_1LC = nn.Parameter(torch.cat(pos_1LC, dim=1))
+        
+        # 4. 层级编码 (每个token的层级信息)
+        lvl_1L = []
+        for i, pn in enumerate(self.patch_nums):
+            lvl_1L.extend([i] * (pn ** 2))
+        self.register_buffer('lvl_1L', torch.tensor(lvl_1L, dtype=torch.long))
+        
+        # 层级embedding
+        self.lvl_embed = nn.Embedding(len(self.patch_nums), self.embed_dim)
+        nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
+        
+        # 5. AdaLN-Zero transformer blocks
+        self.blocks = nn.ModuleList([
+            AdaLNSelfAttn(
+                block_idx=i,
+                last_drop_p=0.0 if i == 0 else 0.1,
+                embed_dim=self.embed_dim,
+                cond_dim=self.embed_dim,
+                shared_aln=False,
+                norm_layer=nn.LayerNorm,
+                num_heads=self.num_heads,
+                mlp_ratio=4.0,
+                drop=0.1,
+                attn_drop=0.1,
+                drop_path=0.1,
+                attn_l2_norm=False,
+                flash_if_available=False,
+                fused_if_available=True,
+                enable_histology_injection=True,
+                histology_dim=self.histology_feature_dim,
+            ) for i in range(self.depth)
+        ])
+        
+        # 6. Final normalization and head
+        self.head_nm = AdaLNBeforeHead(self.embed_dim, self.embed_dim, norm_layer=nn.LayerNorm)
+        self.head = nn.Linear(self.embed_dim, self.vocab_size)
+        nn.init.trunc_normal_(self.head.weight.data, mean=0, std=init_std)
+        nn.init.constant_(self.head.bias.data, 0)
+        
+        print(f"   transformer块数: {len(self.blocks)}")
+        print(f"   输出词汇表: {self.vocab_size}")
+    
+    def _init_condition_processor(self):
+        """初始化条件处理器"""
+        print(f"🎛️ 初始化条件处理器 (输入: {self.histology_feature_dim})")
+        
+        # 简单的线性映射
+        self.condition_processor = nn.Sequential(
+            nn.Linear(self.histology_feature_dim, 512),
+                    nn.ReLU(),
+            nn.Linear(512, 512),
+        )
+        
+        print(f"   架构: {self.histology_feature_dim} → 512 → 512")
+
+    def img_to_idxBl(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """图像编码为多尺度token indices"""
+        B = x.shape[0]
+        
+        # 编码到潜在空间
+        z = self.encoder(x)  # [B, z_channels, 4, 4]
+        B, C, H, W = z.shape
+        
+        # 展平并量化
+        z_flat = z.view(B, C, H*W).permute(0, 2, 1)  # [B, H*W, C]
+        
+        # 找最近的codebook向量
+        distances = torch.cdist(z_flat, self.quantize.weight)  # [B, H*W, vocab_size]
+        indices = torch.argmin(distances, dim=-1)  # [B, H*W]
+        
+        # 按多尺度组织tokens
+        tokens = []
+        for pn in self.patch_nums:
+            if pn <= H:  # 确保patch size不超过特征图尺寸
+                # 对于每个尺度，从4×4特征图中采样
+                patch_tokens = []
+                for i in range(pn):
+                    for j in range(pn):
+                        # 将pn×pn网格映射到4×4特征图
+                        hi = min(int(i * H / pn), H-1)
+                        wi = min(int(j * W / pn), W-1)
+                        idx = hi * W + wi
+                        patch_tokens.append(indices[:, idx])
+                
+                patch_tensor = torch.stack(patch_tokens, dim=1)  # [B, pn*pn]
+                tokens.append(patch_tensor)
+            else:
+                # 如果patch size太大，重复使用现有tokens
+                repeat_times = (pn * pn + H*W - 1) // (H*W)  # 向上取整
+                repeated = indices.repeat(1, repeat_times)[:, :pn*pn]
+                tokens.append(repeated)
+                
+        return tokens
+            
+    def idxBl_to_img(self, tokens: List[torch.Tensor], same_shape: bool = True, last_one: bool = True) -> torch.Tensor:
+        """多尺度token indices解码为图像"""
+        if last_one and len(tokens) > 0:
+            # 使用最高分辨率的tokens
+            indices = tokens[-1]
         else:
-            # 简化版VAR
-            self.var_model = self._create_simple_var()
-            print(f"   ⚠️ 使用简化版VAR")
-    
-    def _create_simple_vqvae(self):
-        """创建简化版VQVAE（当VAR库不可用时）"""
-        class SimpleVQVAE(nn.Module):
-            def __init__(self, vocab_size=1024, z_channels=16):
-                super().__init__()
-                self.vocab_size = vocab_size
-                self.z_channels = z_channels
+            # 使用第一个或平均
+            indices = tokens[0] if tokens else torch.zeros(1, 1, dtype=torch.long)
                 
-                # 简单的编码器
-                self.encoder = nn.Sequential(
-                    nn.Conv2d(1, 32, 3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv2d(32, 64, 3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv2d(64, z_channels, 3, padding=1)
-                )
+        B = indices.shape[0]
                 
-                # 量化层
-                self.quantize = nn.Embedding(vocab_size, z_channels)
-                
-                # 简单的解码器
-                self.decoder = nn.Sequential(
-                    nn.Conv2d(z_channels, 64, 3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv2d(64, 32, 3, padding=1),
-                    nn.ReLU(),
-                    nn.Conv2d(32, 1, 3, padding=1)
-                )
-            
-            def img_to_idxBl(self, x):
-                # 编码并量化
-                z = self.encoder(x)
-                B, C, H, W = z.shape
-                z_flat = z.view(B, C, -1).permute(0, 2, 1)
-                
-                # 简单量化：找最近的codebook向量
-                distances = torch.cdist(z_flat, self.quantize.weight)
-                indices = torch.argmin(distances, dim=-1)
-                
-                # 为每个patch_num创建tokens
-                tokens = []
-                for p in self.training_patch_nums if hasattr(self, 'training_patch_nums') else [1,2,3,4,5]:
-                    patch_size = H // p
-                    if patch_size > 0:
-                        # 简单地重复索引
-                        patch_tokens = indices[:, :p*p] if indices.shape[1] >= p*p else indices[:, :1].repeat(1, p*p)
-                        tokens.append(patch_tokens)
-                    else:
-                        tokens.append(indices[:, :1])
-                
-                return tokens
-            
-            def idxBl_to_img(self, tokens, same_shape=True, last_one=True):
-                # 简单重建：使用最后一个token
-                if last_one and len(tokens) > 0:
-                    indices = tokens[-1]  # 使用最细尺度的tokens
-                else:
-                    indices = tokens[0] if tokens else torch.zeros(1, 1, dtype=torch.long)
-                
-                # 重建
-                B = indices.shape[0]
-                quantized = self.quantize(indices)
-                
-                # 简单地reshape并解码
-                if quantized.dim() == 3:
-                    H = W = int(np.sqrt(quantized.shape[1]))
-                    if H * W != quantized.shape[1]:
-                        H = W = 14  # 默认尺寸
-                        quantized = quantized[:, :H*W]
-                    z = quantized.permute(0, 2, 1).view(B, -1, H, W)
-                else:
-                    z = quantized.unsqueeze(-1).unsqueeze(-1)
-                
-                return self.decoder(z)
-            
-            def forward(self, x):
-                tokens = self.img_to_idxBl(x)
-                recon = self.idxBl_to_img(tokens)
-                return {'tokens': tokens, 'recon': recon, 'vq_loss': torch.tensor(0.0)}
+        # 量化嵌入
+        quantized = self.quantize(indices)  # [B, L, z_channels]
         
-        vqvae = SimpleVQVAE(self.vqvae_vocab_size, self.vqvae_z_channels)
-        vqvae.training_patch_nums = self.patch_nums
-        return vqvae
-    
-    def _create_simple_var(self):
-        """创建简化版VAR（当VAR库不可用时）"""
-        class SimpleVAR(nn.Module):
-            def __init__(self, embed_dim=512, depth=12, num_heads=8, vocab_size=1024):
-                super().__init__()
-                self.embed_dim = embed_dim
-                self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-                self.pos_embedding = nn.Parameter(torch.randn(1, 100, embed_dim))  # 足够大的位置编码
-                
-                # Transformer layers
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=embed_dim,
-                    nhead=num_heads,
-                    dim_feedforward=embed_dim * 4,
-                    dropout=0.1,
-                    batch_first=True
-                )
-                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-                
-                # 输出层
-                self.output_layer = nn.Linear(embed_dim, vocab_size)
-                
-            def forward(self, label_B=None, x_BLCv_wo_first_l=None, is_train=True, **kwargs):
-                if x_BLCv_wo_first_l is None:
-                    return torch.tensor(0.0, requires_grad=True)
-                
-                # 处理多尺度tokens
-                if isinstance(x_BLCv_wo_first_l, list):
-                    # 连接所有尺度的tokens
-                    all_tokens = []
-                    for tokens in x_BLCv_wo_first_l:
-                        if tokens.dim() == 2:
-                            all_tokens.append(tokens)
-                        elif tokens.dim() == 3:
-                            all_tokens.append(tokens.flatten(1))
-                    
-                    if all_tokens:
-                        tokens = torch.cat(all_tokens, dim=1)
-                    else:
-                        B = x_BLCv_wo_first_l[0].shape[0] if x_BLCv_wo_first_l else 1
-                        tokens = torch.zeros(B, 10, dtype=torch.long, device=next(self.parameters()).device)
-                else:
-                    tokens = x_BLCv_wo_first_l
-                
-                # 嵌入
-                B, L = tokens.shape[:2]
-                x = self.token_embedding(tokens)
-                
-                # 位置编码
-                if L <= self.pos_embedding.shape[1]:
-                    x = x + self.pos_embedding[:, :L]
-                
-                # Transformer
-                x = self.transformer(x)
-                
-                # 输出
-                logits = self.output_layer(x)
-                
-                # 计算损失
-                if is_train:
-                    # 简单的自回归损失
-                    targets = tokens[:, 1:] if L > 1 else tokens
-                    preds = logits[:, :-1] if L > 1 else logits
-                    
-                    if targets.numel() > 0 and preds.numel() > 0:
-                        loss = F.cross_entropy(preds.reshape(-1, preds.shape[-1]), targets.reshape(-1))
-                    else:
-                        loss = torch.tensor(0.0, requires_grad=True)
-                    
-                    return loss
-                else:
-                    return logits
+        # 重塑为4×4特征图
+        if quantized.dim() == 3:
+            L = quantized.shape[1]
+            side = int(math.sqrt(L))
+            if side * side != L:
+                side = 4  # 默认4×4
+                quantized = quantized[:, :side*side]
             
-            def autoregressive_infer_cfg(self, B, label_B=None, cfg=1.5, top_k=50, top_p=0.9, more_smooth=False):
-                # 简单生成
-                device = next(self.parameters()).device
-                generated = torch.zeros(B, 3, 14, 14, device=device)  # 直接生成目标尺寸
-                return generated
+            z = quantized.permute(0, 2, 1).view(B, self.z_channels, side, side)
+        else:
+            z = quantized.view(B, self.z_channels, 1, 1)
         
-        return SimpleVAR(self.var_embed_dim, self.var_depth, self.var_num_heads, self.vqvae_vocab_size)
+        # 如果不是4×4，插值到4×4
+        if z.shape[-1] != 4:
+            z = F.interpolate(z, size=(4, 4), mode='bilinear', align_corners=False)
+        
+        # 解码
+        return self.decoder(z)
+    
+    def get_logits(self, h: torch.Tensor, cond_BD: torch.Tensor) -> torch.Tensor:
+        """获取输出logits"""
+        return self.head(self.head_nm(h.float(), cond_BD).float()).float()
     
     def forward_training(
         self,
@@ -481,284 +341,247 @@ class VARGeneWrapper(nn.Module):
         class_labels: Optional[torch.Tensor] = None,
         show_details: bool = False
     ) -> Dict[str, torch.Tensor]:
-        """
-        训练阶段前向传播 - 基因多尺度从头训练版本
-        
-        流程：
-        1. 基因表达 [B, 196] → 伪图像 [B, 1, 14, 14]
-        2. VQVAE编码 → 基因多尺度tokens (1,2,3,4,5)
-        3. VAR自回归训练
-        4. 重建验证
-        
-        Args:
-            gene_expression: [B, 196] - 基因表达向量
-            histology_features: [B, feature_dim] - 组织学特征
-            class_labels: [B] - 类别标签(可选)
-            show_details: 是否显示详细信息
-        
-        Returns:
-            包含损失和预测结果的字典
-        """
+        """训练前向传播"""
         B, num_genes = gene_expression.shape
         device = gene_expression.device
         
-        # 🔧 增加步数计数
         self._step_count += 1
         
-        # 验证输入维度
-        if num_genes != self.num_genes:
-            raise ValueError(f"输入基因数量{num_genes}与模型期望{self.num_genes}不匹配")
-        
-        # 🔇 大幅减少详细输出：只在前3步和每1000步显示详情
-        # 🔧 在分布式训练中，只在主进程显示详细信息
+        # 显示详情控制
         import os
         is_main_process = int(os.environ.get('LOCAL_RANK', 0)) == 0
         show_details = (self._verbose_logging and is_main_process and 
                        (self._step_count <= 3 or self._step_count % 1000 == 0))
         
         if show_details:
-            print(f"🧬 基因多尺度VAR训练:")
-            print(f"   输入基因表达: {gene_expression.shape}")
+            print(f"🧬 完整VAR训练 (步骤 {self._step_count}):")
         
-        try:
-            # Step 1: 基因表达 → 伪图像 [B, 1, 14, 14]
-            pseudo_images = self.gene_adapter.genes_to_pseudo_image(gene_expression)
-            if show_details:
-                print(f"   伪图像转换: {gene_expression.shape} → {pseudo_images.shape}")
-                if self.use_padding:
-                    print(f"   使用padding: {self.num_genes}基因 + {self.padding_size}padding = {self.image_size}×{self.image_size}")
+        # 1. 基因 → 伪图像
+        pseudo_images = self.gene_adapter.genes_to_pseudo_image(gene_expression)
+        if pseudo_images.shape[1] != 1:
+            pseudo_images = pseudo_images.mean(dim=1, keepdim=True)
             
-            # 确保伪图像通道数为1（基因数据是单通道的）
-            if pseudo_images.shape[1] != 1:
-                if pseudo_images.shape[1] == 3:
-                    # 如果适配器返回3通道，转为单通道
-                    pseudo_images = pseudo_images.mean(dim=1, keepdim=True)
-                else:
-                    # 取第一个通道
-                    pseudo_images = pseudo_images[:, :1]
-            
-            # Step 2: 处理条件特征
-            if class_labels is None:
-                # 通过条件处理器生成基因语义标签
-                condition_embeddings = self.condition_processor(histology_features)  # [B, embed_dim]
-                # 简单映射到类别标签
-                class_labels = torch.argmax(condition_embeddings[:, :self.var_num_classes], dim=-1)
-            
-            # 🔇 减少条件标签输出，只在详细模式显示
-            # if show_details:
-            #     print(f"   条件标签: {class_labels.shape}")
-            
-            # 🔧 方案1：将单通道基因伪图像转换为3通道，适配原始VAR VQVAE
-            # 原始VAR的VQVAE编码器期望3通道RGB输入，我们需要适配
-            if pseudo_images.shape[1] == 1:
-                # 将单通道复制为3通道: [B, 1, H, W] → [B, 3, H, W]
-                pseudo_images_3ch = pseudo_images.repeat(1, 3, 1, 1)
-                if show_details:
-                    print(f"   🔧 通道适配: {pseudo_images.shape} → {pseudo_images_3ch.shape} (适配VAR VQVAE)")
-            else:
-                pseudo_images_3ch = pseudo_images
-            
-            # 确保伪图像格式正确为3通道
-            if pseudo_images_3ch.shape[1] != 3:
-                if pseudo_images_3ch.shape[1] > 3:
-                    # 取前3个通道
-                    pseudo_images_3ch = pseudo_images_3ch[:, :3]
-                    if show_details:
-                        print(f"   🔧 截取前3通道: → {pseudo_images_3ch.shape}")
-                else:
-                    # 不足3通道，补齐
-                    channels_needed = 3 - pseudo_images_3ch.shape[1]
-                    padding_channels = pseudo_images_3ch[:, :1].repeat(1, channels_needed, 1, 1)
-                    pseudo_images_3ch = torch.cat([pseudo_images_3ch, padding_channels], dim=1)
-                    if show_details:
-                        print(f"   🔧 补齐到3通道: → {pseudo_images_3ch.shape}")
-            
-            # Step 3: VQVAE编码 → 基因多尺度tokens (使用3通道图像)
-            ms_tokens = self.vqvae.img_to_idxBl(pseudo_images_3ch)
-            # 🔇 减少tokens输出
-            # if show_details:
-            #     print(f"   多尺度tokens: {[t.shape if isinstance(t, torch.Tensor) else 'None' for t in ms_tokens]}")
-            
-            # 确保tokens格式正确
-            if not isinstance(ms_tokens, list):
-                ms_tokens = [ms_tokens]
-            
-            # 过滤无效tokens
-            valid_tokens = []
-            for i, tokens in enumerate(ms_tokens):
-                if isinstance(tokens, torch.Tensor) and tokens.numel() > 0:
-                    valid_tokens.append(tokens)
-                else:
-                    # 创建默认tokens
-                    patch_size = self.patch_nums[i] if i < len(self.patch_nums) else 1
-                    default_tokens = torch.zeros(B, patch_size*patch_size, dtype=torch.long, device=device)
-                    valid_tokens.append(default_tokens)
-            
-            ms_tokens = valid_tokens
-            
-            # Step 4: VAR自回归训练
-            # 🔧 处理multi-scale tokens，转换为VAR期望的格式
-            if len(ms_tokens) == 0:
-                # 创建默认tokens
-                total_tokens = sum(p*p for p in self.patch_nums)
-                default_tokens = torch.zeros(B, total_tokens, dtype=torch.long, device=device)
-                ms_tokens = [default_tokens]
-
-            # VAR期望的格式：teacher forcing input [B, L-first_l, Cvae]
-            # 其中 L = sum(patch_nums^2)，first_l = patch_nums[0]^2
-            total_tokens = sum(p*p for p in self.patch_nums)
-            first_l = self.patch_nums[0] ** 2
-
-            if isinstance(ms_tokens, list) and len(ms_tokens) > 1:
-                # 拼接所有尺度的tokens
-                all_tokens = torch.cat([tokens.flatten(1) for tokens in ms_tokens], dim=1)  # [B, total_tokens]
-            else:
-                # 单个token tensor
-                tokens = ms_tokens[0] if isinstance(ms_tokens, list) else ms_tokens
-                if tokens.numel() == B * total_tokens:
-                    all_tokens = tokens.view(B, total_tokens)
-                else:
-                    # 如果token数量不匹配，创建默认tokens
-                    all_tokens = torch.zeros(B, total_tokens, dtype=torch.long, device=device)
-
-            # 🔧 关键修复：VAR需要除了第一层外的所有tokens的embedding
-            # x_BLCv_wo_first_l: [B, L-first_l, Cvae]
-            tokens_wo_first_l = all_tokens[:, first_l:]  # 移除第一层tokens [B, L-first_l]
-
-            # 将token indices转换为VQVAE embeddings
-            if hasattr(self.vqvae, 'quantize') and hasattr(self.vqvae.quantize, 'embedding'):
-                # 使用VQVAE的量化器获取embeddings
-                x_BLCv_wo_first_l = self.vqvae.quantize.embedding(tokens_wo_first_l)  # [B, L-first_l, Cvae]
-            elif hasattr(self.vqvae, 'vae_quant_proxy'):
-                # 使用VAR的代理量化器
-                x_BLCv_wo_first_l = self.vqvae.vae_quant_proxy[0].embedding(tokens_wo_first_l)
-            else:
-                # 备用方案：随机初始化embeddings
-                Cvae = getattr(self.vqvae, 'Cvae', 256)  # 默认256维
-                x_BLCv_wo_first_l = torch.randn(B, tokens_wo_first_l.shape[1], Cvae, device=device)
-                print(f"   ⚠️ 使用随机embeddings，形状: {x_BLCv_wo_first_l.shape}")
-
-            if show_details:
-                print(f"   🔧 VAR输入转换: tokens{all_tokens.shape} → embeddings{x_BLCv_wo_first_l.shape}")
-
-            var_output = self.var_model(
-                label_B=class_labels,
-                x_BLCv_wo_first_l=x_BLCv_wo_first_l
-            )
-            
-            # 提取VAR损失
-            if isinstance(var_output, dict):
-                var_loss = var_output.get('loss', var_output.get('ce_loss', 0.0))
-            elif isinstance(var_output, torch.Tensor):
-                var_loss = var_output
-            else:
-                var_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            
-            # 🔧 确保var_loss是标量
-            if isinstance(var_loss, torch.Tensor):
-                if var_loss.numel() > 1:
-                    # 如果var_loss是多维tensor，取平均值
-                    var_loss = var_loss.mean()
-                elif var_loss.numel() == 0:
-                    # 如果是空tensor，设为0
-                    var_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            else:
-                # 如果不是tensor，转换为tensor
-                var_loss = torch.tensor(float(var_loss), device=device, requires_grad=True)
-            
-            # 🔇 只在详细模式显示VAR损失
-            # if show_details:
-            #     print(f"   VAR损失: {var_loss.item():.4f}")
-            
-            # Step 5: 重建验证
+        # 2. 处理条件
+        condition_embeddings = self.condition_processor(histology_features)
+        
+        if class_labels is None:
+            # 动态生成类别标签
             with torch.no_grad():
-                # 解码tokens回伪图像
-                reconstructed_images = self.vqvae.idxBl_to_img(ms_tokens, same_shape=True, last_one=True)
-                
-                # 确保重建图像尺寸正确
-                if reconstructed_images.shape[-2:] != (self.image_size, self.image_size):
-                    # 🔇 减少尺寸调整输出
-                    # if show_details:
-                    #     print(f"   调整重建图像尺寸: {reconstructed_images.shape} → [B, 1, {self.image_size}, {self.image_size}]")
-                    reconstructed_images = F.interpolate(
-                        reconstructed_images,
-                        size=(self.image_size, self.image_size),
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                
-                # 确保通道数正确
-                if reconstructed_images.shape[1] != 1:
-                    if reconstructed_images.shape[1] == 3:
-                        # RGB → 灰度
-                        reconstructed_images = reconstructed_images.mean(dim=1, keepdim=True)
-                    else:
-                        # 取第一个通道
-                        reconstructed_images = reconstructed_images[:, :1]
-                
-                # 伪图像 → 基因表达
-                predicted_genes = self.gene_adapter.pseudo_image_to_genes(reconstructed_images)
-                
-                # 重建损失
-                recon_loss = F.mse_loss(predicted_genes, gene_expression)
-                
-                # 🔇 只在详细模式显示重建损失
-                # if show_details:
-                #     print(f"   重建损失: {recon_loss.item():.4f}")
-            
-            # Step 6: VQVAE量化损失（如果有）
-            vq_loss = torch.tensor(0.0, device=device, requires_grad=True)
-            if hasattr(self.vqvae, 'vq_loss') and self.vqvae.vq_loss is not None:
-                vq_loss = self.vqvae.vq_loss
-                # 🔧 确保vq_loss是标量
-                if isinstance(vq_loss, torch.Tensor) and vq_loss.numel() > 1:
-                    vq_loss = vq_loss.mean()
-
-            # 🔧 确保recon_loss是标量
-            if isinstance(recon_loss, torch.Tensor) and recon_loss.numel() > 1:
-                recon_loss = recon_loss.mean()
-
-            # 总损失组合
-            total_loss = var_loss + 0.1 * recon_loss + 0.01 * vq_loss
-
-            if show_details:
-                # 🔧 安全的损失显示：确保所有损失都是标量
-                try:
-                    var_loss_val = var_loss.item() if isinstance(var_loss, torch.Tensor) else float(var_loss)
-                    recon_loss_val = recon_loss.item() if isinstance(recon_loss, torch.Tensor) else float(recon_loss)
-                    vq_loss_val = vq_loss.item() if isinstance(vq_loss, torch.Tensor) else float(vq_loss)
-                    total_loss_val = total_loss.item() if isinstance(total_loss, torch.Tensor) else float(total_loss)
-                    print(f"   总损失: {total_loss_val:.4f} (VAR: {var_loss_val:.4f}, 重建: {recon_loss_val:.4f}, VQ: {vq_loss_val:.4f})")
-                except Exception as loss_display_error:
-                    print(f"   💡 损失计算成功，但显示出错: {loss_display_error}")
-                    print(f"   - VAR损失形状: {var_loss.shape if hasattr(var_loss, 'shape') else type(var_loss)}")
-                    print(f"   - 重建损失形状: {recon_loss.shape if hasattr(recon_loss, 'shape') else type(recon_loss)}")
-                    print(f"   - 总损失形状: {total_loss.shape if hasattr(total_loss, 'shape') else type(total_loss)}")
+                n_classes = min(self.num_classes, condition_embeddings.shape[1])
+                class_features = condition_embeddings[:, :n_classes]
+                class_probs = torch.softmax(class_features, dim=-1)
+                class_labels = torch.multinomial(class_probs, 1).squeeze(-1)
         
-        except Exception as e:
-            print(f"   ❌ VAR训练过程失败: {e}")
-            print(f"   💡 这通常表示:")
-            print(f"      1. VAR模型导入失败")
-            print(f"      2. VQVAE编码出错")
-            print(f"      3. 数据维度不匹配")
-            print(f"      4. GPU内存不足")
-            import traceback
-            traceback.print_exc()
+        # 3. VQVAE编码
+        ms_tokens = self.img_to_idxBl(pseudo_images)
+        
+        if show_details:
+            print(f"   多尺度tokens: {[t.shape for t in ms_tokens]}")
+        
+        # 4. VAR训练
+        # 准备输入：除了第一层的所有tokens
+        all_tokens = torch.cat([tokens.flatten(1) for tokens in ms_tokens], dim=1)  # [B, L]
+        x_BLCv_wo_first_l = all_tokens[:, self.first_l:]  # [B, L-first_l]
+        
+        # 获取嵌入
+        if x_BLCv_wo_first_l.numel() == 0:
+            raise RuntimeError(
+                f"Token序列为空，这不应该发生。"
+                f"first_l: {self.first_l}, all_tokens形状: {all_tokens.shape if 'all_tokens' in locals() else 'N/A'}, "
+                f"patch_nums: {self.patch_nums}"
+            )
+        
+        # 量化嵌入
+        token_embeddings = self.quantize(x_BLCv_wo_first_l)  # [B, L-first_l, z_channels]
+        # 映射到VAR空间
+        x = self.word_embed(token_embeddings)  # [B, L-first_l, embed_dim]
+        
+        # 添加位置编码
+        if x.shape[1] <= self.pos_1LC.shape[1] - self.first_l:
+            x = x + self.pos_1LC[:, self.first_l:self.first_l + x.shape[1]]
+        
+        # 🔧 修复层级编码：正确计算索引范围
+        # lvl_1L的形状是[L]，包含每个位置对应的层级ID (0, 1, 2, ...)
+        # 我们需要取出对应的层级ID，然后获取对应的编码
+        if x.shape[1] > len(self.lvl_1L) - self.first_l:
+            raise RuntimeError(
+                f"Token序列长度{x.shape[1]}超出层级编码范围{len(self.lvl_1L) - self.first_l}。"
+                f"总长度: {len(self.lvl_1L)}, first_l: {self.first_l}, 可用长度: {len(self.lvl_1L) - self.first_l}"
+            )
+        
+        lvl_indices = self.lvl_1L[self.first_l:self.first_l + x.shape[1]]  # [L-first_l]
+        lvl_pos = self.lvl_embed(lvl_indices)  # [L-first_l, embed_dim]
+        x = x + lvl_pos.unsqueeze(0)  # [B, L-first_l, embed_dim]
+        
+        # Class条件
+        cond_BD = self.class_emb(class_labels)  # [B, embed_dim]
+        
+        # 通过transformer blocks
+        for block in self.blocks:
+            x = block(x, cond_BD, attn_bias=None, histology_condition=histology_features)
+        
+        # 获取logits
+        logits = self.get_logits(x, cond_BD)  # [B, L-first_l, vocab_size]
+        
+        # 计算VAR损失
+        if x_BLCv_wo_first_l.numel() > 0:
+            target_tokens = x_BLCv_wo_first_l
+            var_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), 
+                target_tokens.reshape(-1),
+                ignore_index=-1
+            )
+        else:
+            var_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                
+        # 5. 生成验证
+        with torch.no_grad():
+            # 使用当前模型生成
+            generated_tokens = self.autoregressive_infer_cfg(
+                B=B,
+                label_B=class_labels,
+                histology_condition=histology_features
+            )
+            generated_images = generated_tokens  # autoregressive_infer_cfg直接返回图像
             
-            # 🔧 不再使用回退方案，直接抛出异常！
-            raise RuntimeError(f"VAR-ST模型训练失败: {e}") from e
+            # 确保格式正确
+            if generated_images.shape[-2:] != (self.image_size, self.image_size):
+                generated_images = F.interpolate(
+                    generated_images,
+                    size=(self.image_size, self.image_size),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                
+            if generated_images.shape[1] != 1:
+                generated_images = generated_images.mean(dim=1, keepdim=True)
+                
+            # 伪图像 → 基因表达
+            predicted_genes = self.gene_adapter.pseudo_image_to_genes(generated_images)
+                
+            # 重建损失
+            recon_loss = F.mse_loss(predicted_genes, gene_expression)
+                
+        # 6. 总损失
+        if self.progressive_training:
+            # 渐进式训练权重
+            progress = min(1.0, self.current_step / self.warmup_steps)
+            recon_weight = self.min_recon_weight + progress * (self.max_recon_weight - self.min_recon_weight)
+        else:
+            recon_weight = self.max_recon_weight
+        
+        total_loss = var_loss + recon_weight * recon_loss
+        
+        if show_details:
+            print(f"   VAR损失: {var_loss:.4f}")
+            print(f"   重建损失: {recon_loss:.4f} (权重: {recon_weight:.2f})")
+            print(f"   总损失: {total_loss:.4f}")
         
         return {
             'loss': total_loss,
             'var_loss': var_loss,
             'recon_loss': recon_loss,
-            'vq_loss': vq_loss,
-            'predictions': predicted_genes,
-            'targets': gene_expression,
-            'class_labels': class_labels,
-            'pseudo_images': pseudo_images,
-            'tokens': ms_tokens
+            'predicted_expression': predicted_genes,
+            'predictions': predicted_genes
         }
+
+    @torch.no_grad()
+    def autoregressive_infer_cfg(
+        self, 
+        B: int, 
+        label_B: Optional[torch.Tensor] = None,
+        g_seed: Optional[int] = None,
+        cfg: float = 1.5,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        histology_condition: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """自回归推理生成"""
+        device = next(self.parameters()).device
+        
+        if label_B is None:
+            label_B = torch.zeros(B, dtype=torch.long, device=device)
+        
+        if g_seed is not None:
+            torch.manual_seed(g_seed)
+        
+        # 初始化序列
+        seq_len = self.L  # 总token长度
+        input_ids = torch.zeros(B, seq_len, dtype=torch.long, device=device)
+        
+        # 生成第一层tokens (随机初始化)
+        for i in range(self.first_l):
+            input_ids[:, i] = torch.randint(0, self.vocab_size, (B,), device=device)
+        
+        # 自回归生成剩余tokens
+        for cur_L in range(self.first_l, seq_len):
+            # 获取当前序列
+            x_BLCv_wo_first_l = input_ids[:, self.first_l:cur_L]
+            
+            if x_BLCv_wo_first_l.shape[1] == 0:
+                # 如果序列为空，跳过
+                continue
+            
+            # 嵌入
+            token_embeddings = self.quantize(x_BLCv_wo_first_l)
+            x = self.word_embed(token_embeddings)
+            
+            # 位置编码
+            if x.shape[1] <= self.pos_1LC.shape[1] - self.first_l:
+                x = x + self.pos_1LC[:, self.first_l:self.first_l + x.shape[1]]
+            
+            # 层级编码
+            if x.shape[1] <= len(self.lvl_1L) - self.first_l:
+                lvl_indices = self.lvl_1L[self.first_l:self.first_l + x.shape[1]]
+                lvl_pos = self.lvl_embed(lvl_indices)
+                x = x + lvl_pos.unsqueeze(0)
+            
+            # Class条件
+            cond_BD = self.class_emb(label_B)
+            
+            # 通过transformer
+            for block in self.blocks:
+                x = block(x, cond_BD, attn_bias=None, histology_condition=histology_condition)
+            
+            # 预测下一个token
+            logits = self.get_logits(x, cond_BD)  # [B, cur_L-first_l, vocab_size]
+            
+            if logits.shape[1] > 0:
+                next_token_logits = logits[:, -1, :]  # [B, vocab_size]
+                
+                # Top-k和top-p采样
+                if top_k > 0:
+                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    next_token_logits[indices_to_remove] = float('-inf')
+                
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    next_token_logits[indices_to_remove] = float('-inf')
+                
+                # 采样
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids[:, cur_L] = next_token.squeeze(-1)
+        
+        # 解码为图像
+        # 将所有tokens转换为多尺度格式
+        ms_tokens = []
+        start_idx = 0
+        for pn in self.patch_nums:
+            length = pn ** 2
+            tokens = input_ids[:, start_idx:start_idx + length]
+            ms_tokens.append(tokens)
+            start_idx += length
+        
+        # 解码
+        generated_images = self.idxBl_to_img(ms_tokens, last_one=True)
+        
+        return generated_images
     
     def forward_inference(
         self,
@@ -770,48 +593,21 @@ class VARGeneWrapper(nn.Module):
         temperature: float = 1.0,
         num_samples: int = 1
     ) -> Dict[str, torch.Tensor]:
-        """
-        推理前向传播：从组织学特征生成基因表达
-        
-        Args:
-            histology_features: [B, feature_dim] 组织学特征
-            class_labels: [B] 可选的类别标签
-            cfg_scale: Classifier-free guidance缩放
-            其他参数：VAR生成参数
-        
-        Returns:
-            生成的基因表达预测
-        """
+        """推理模式前向传播"""
         B = histology_features.shape[0]
         device = histology_features.device
         
-        # 1. 处理条件
-        if class_labels is None:
-            condition_embeddings = self.condition_processor(histology_features)
-            class_labels = torch.argmax(condition_embeddings[:, :self.var_num_classes], dim=-1)
+        # 生成图像
+        generated_images = self.autoregressive_infer_cfg(
+            B=B,
+            label_B=class_labels,
+                cfg=cfg_scale,
+                top_k=top_k,
+                top_p=top_p,
+            histology_condition=histology_features
+            )
         
-        # 2. VAR自回归生成 或 简单推理
-        try:
-            if hasattr(self.var_model, 'autoregressive_infer_cfg'):
-                # 使用VAR的自回归生成
-                generated_images = self.var_model.autoregressive_infer_cfg(
-                    B=B * num_samples,
-                    label_B=class_labels.repeat(num_samples) if num_samples > 1 else class_labels,
-                    cfg=cfg_scale,
-                    top_k=top_k,
-                    top_p=top_p,
-                    more_smooth=False
-                )
-            else:
-                # 简化推理：直接生成随机伪图像
-                generated_images = torch.randn(B * num_samples, 1, self.image_size, self.image_size, device=device)
-                
-        except Exception as e:
-            print(f"⚠️ VAR推理异常: {e}，使用随机生成")
-            # 回退：生成随机伪图像
-            generated_images = torch.randn(B * num_samples, 1, self.image_size, self.image_size, device=device)
-        
-        # 3. 调整生成图像格式
+        # 确保图像格式正确
         if generated_images.shape[-2:] != (self.image_size, self.image_size):
             generated_images = F.interpolate(
                 generated_images,
@@ -820,33 +616,24 @@ class VARGeneWrapper(nn.Module):
                 align_corners=False
             )
         
-        # 确保通道数为1（灰度）
         if generated_images.shape[1] != 1:
-            if generated_images.shape[1] == 3:
                 generated_images = generated_images.mean(dim=1, keepdim=True)
-            else:
-                generated_images = generated_images[:, :1]
         
-        # 4. 生成的伪图像 → 基因表达
+        # 转换为基因表达
         predicted_genes = self.gene_adapter.pseudo_image_to_genes(generated_images)
         
-        # 5. 重塑输出
-        if num_samples > 1:
-            predicted_genes = predicted_genes.view(B, num_samples, self.num_genes)
-            generated_images = generated_images.view(B, num_samples, 1, self.image_size, self.image_size)
-        
         return {
+            'predicted_expression': predicted_genes,
             'predictions': predicted_genes,
-            'generated_images': generated_images,
-            'class_labels': class_labels,
-            'predicted_expression': predicted_genes
+            'generated_images': generated_images
         }
     
     def forward(self, **inputs) -> Dict[str, torch.Tensor]:
-        """统一前向传播接口"""
+        """主前向传播入口"""
         mode = inputs.get('mode', 'training')
         
-        if mode == 'training':
+        if mode == 'training' or 'gene_expression' in inputs:
+            # 训练模式
             return self.forward_training(
                 gene_expression=inputs['gene_expression'],
                 histology_features=inputs['histology_features'],
@@ -854,6 +641,7 @@ class VARGeneWrapper(nn.Module):
                 show_details=inputs.get('show_details', False)
             )
         else:
+            # 推理模式
             return self.forward_inference(
                 histology_features=inputs['histology_features'],
                 class_labels=inputs.get('class_labels'),

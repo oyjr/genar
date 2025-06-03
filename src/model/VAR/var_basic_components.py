@@ -456,6 +456,8 @@ class AdaLNSelfAttn(nn.Module):
         self, block_idx, last_drop_p, embed_dim, cond_dim, shared_aln: bool, norm_layer,
         num_heads, mlp_ratio=4., drop=0., attn_drop=0., drop_path=0., attn_l2_norm=False,
         flash_if_available=False, fused_if_available=True,
+        enable_histology_injection=False,
+        histology_dim=512,
     ):
         super(AdaLNSelfAttn, self).__init__()
         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
@@ -472,9 +474,30 @@ class AdaLNSelfAttn(nn.Module):
             lin = nn.Linear(cond_dim, 6*embed_dim)
             self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin)
         
+        self.enable_histology_injection = enable_histology_injection
+        if self.enable_histology_injection:
+            self.histology_proj = nn.Linear(histology_dim, embed_dim)
+            self.histology_gate = nn.Sequential(
+                nn.Linear(embed_dim + histology_dim, embed_dim),
+                nn.Sigmoid()
+            )
+            print(f"   ✅ Block {block_idx}: 启用组织学条件注入 (histology_dim={histology_dim} → embed_dim={embed_dim})")
+        
         self.fused_add_norm_fn = None
     
-    def forward(self, x, cond_BD, attn_bias):
+    def forward(self, x, cond_BD, attn_bias, histology_condition=None):
+        if self.enable_histology_injection and histology_condition is not None:
+            B, L, embed_dim = x.shape
+            
+            histology_proj = self.histology_proj(histology_condition)
+            histology_expanded = histology_proj.unsqueeze(1).expand(-1, L, -1)
+            
+            histology_condition_expanded = histology_condition.unsqueeze(1).expand(-1, L, -1)
+            gate_input = torch.cat([x, histology_condition_expanded], dim=-1)
+            gate = self.histology_gate(gate_input)
+            
+            x = x + gate * histology_expanded
+        
         if self.shared_aln:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2)
         else:
@@ -484,7 +507,7 @@ class AdaLNSelfAttn(nn.Module):
         return x
     
     def extra_repr(self) -> str:
-        return f'shared_aln={self.shared_aln}'
+        return f'shared_aln={self.shared_aln}, histology_injection={self.enable_histology_injection}'
 
 
 class AdaLNBeforeHead(nn.Module):

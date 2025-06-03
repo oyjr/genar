@@ -3,11 +3,14 @@
 
 负责基因表达向量与VAR期望的图像格式之间的转换
 核心功能：
-1. 基因表达向量 [B, 196] -> 单通道伪图像 [B, 1, 16, 16] (padding到256)
-2. 单通道伪图像 [B, 1, 16, 16] -> 基因表达向量 [B, 196]
+1. 基因表达向量 [B, 196] -> 14×14 -> 插值上采样 -> [B, 1, 224, 224] (VQVAE标准输入)
+2. 伪图像 [B, 1, 224, 224] -> 下采样 -> 14×14 -> 基因表达向量 [B, 196]
 3. 数据验证和标准化
 
-🔧 解决方案：使用padding将196基因扩展到16×16=256，避免14×14太小的问题
+🔧 新解决方案：14×14→224×224插值上采样
+- 196基因完美匹配14×14（100%空间利用率）
+- 使用最近邻插值扩展到224×224（VQVAE标准输入）
+- 每个基因值复制到16×16区域，保持信息密度
 """
 
 import torch
@@ -20,64 +23,63 @@ import math
 
 class GenePseudoImageAdapter(nn.Module):
     """
-    基因伪图像适配器 - Padding版本
+    基因伪图像适配器 - 插值上采样版本
     
-    将196基因表达向量padding到16×16=256，转换为VAR期望的单通道伪图像格式
+    将196基因表达向量通过14×14中间表示插值上采样到224×224，满足VQVAE需求
     
     关键改进：
-    - 使用16×16而不是14×14，为VAR提供足够的空间进行多层卷积
-    - padding策略：196基因 + 60个零padding = 256位置
-    - 确保转换过程无损且可逆
+    - 196基因 → 14×14（完美匹配，100%空间利用率）
+    - 14×14 → 插值上采样 → 224×224（VQVAE标准输入）
+    - 每个基因值扩散到16×16区域，保持信息连续性
+    - 反向：224×224 → 下采样 → 14×14 → 196基因
     """
     
     def __init__(
         self,
         num_genes: int = 196,
-        target_image_size: int = 16,  # 🔧 改为16×16
+        intermediate_size: int = 14,  # 🔧 中间14×14表示
+        target_image_size: int = 64,  # 🔧 改回64×64输出
         normalize_method: str = 'layer_norm',
         eps: float = 1e-6
     ):
         """
-        初始化基因伪图像适配器 - Padding版本
+        初始化基因伪图像适配器 - 插值上采样版本
         
         Args:
             num_genes: 基因数量（固定196）
-            target_image_size: 目标图像大小（16×16=256）
+            intermediate_size: 中间表示大小（14×14=196）
+            target_image_size: 目标图像大小（64×64，VQVAE标准）
             normalize_method: 标准化方法 ('layer_norm', 'batch_norm', 'none')
             eps: 数值稳定性参数
         """
         super().__init__()
         
         self.num_genes = num_genes
+        self.intermediate_size = intermediate_size
         self.target_image_size = target_image_size
         self.normalize_method = normalize_method
         self.eps = eps
         
-        # 计算目标图像的总位置数
-        self.total_positions = target_image_size * target_image_size
-        
-        # 🔧 强制使用padding策略
-        if num_genes > self.total_positions:
+        # 验证196基因与14×14的完美匹配
+        intermediate_positions = intermediate_size * intermediate_size
+        if num_genes != intermediate_positions:
             raise ValueError(
-                f"基因数量 {num_genes} 不能大于目标图像位置数 {target_image_size}^2 = {self.total_positions}"
+                f"基因数量 {num_genes} 必须等于中间表示位置数 {intermediate_size}^2 = {intermediate_positions}"
             )
         
-        self.use_padding = True  # 总是使用padding
-        self.padding_size = self.total_positions - num_genes
+        # 计算上采样倍数
+        self.upsampling_factor = target_image_size // intermediate_size
         
-        print(f"🧬 初始化基因伪图像适配器 (Padding版本):")
+        print(f"🧬 初始化基因伪图像适配器 (插值上采样版本):")
         print(f"   - 基因数量: {num_genes}")
+        print(f"   - 中间表示: {intermediate_size}×{intermediate_size}")
         print(f"   - 目标图像尺寸: {target_image_size}×{target_image_size}")
-        print(f"   - 总位置数: {self.total_positions}")
-        print(f"   - Padding大小: {self.padding_size}")
-        print(f"   - 空间利用率: {num_genes/self.total_positions:.1%}")
+        print(f"   - 上采样倍数: {self.upsampling_factor}×")
+        print(f"   - 空间利用率: 100% (完美匹配)")
         print(f"   - 标准化方法: {normalize_method}")
-        
-        # 🔧 严格验证196基因配置
-        if num_genes == 196:
-            if target_image_size < 14:
-                raise ValueError(f"196基因至少需要14×14图像，但指定了{target_image_size}×{target_image_size}")
-            print(f"   - ✅ 196基因模式：使用{target_image_size}×{target_image_size}，padding {self.padding_size}个位置")
+        if normalize_method == 'none':
+            print(f"   - ⚠️ LayerNorm已禁用，保持log2转换基因表达的原始数值范围")
+        print(f"   - ✅ 196基因模式：14×14 → 插值上采样 → {target_image_size}×{target_image_size}")
         
         # 初始化标准化层（只对实际基因数量进行标准化）
         if normalize_method == 'layer_norm':
@@ -107,13 +109,15 @@ class GenePseudoImageAdapter(nn.Module):
     
     def genes_to_pseudo_image(self, gene_expression: torch.Tensor) -> torch.Tensor:
         """
-        将基因表达向量转换为伪图像 (Padding版本)
+        将基因表达向量转换为伪图像 (插值上采样版本)
+        
+        流程: [B, 196] → reshape → [B, 1, 14, 14] → 插值上采样 → [B, 1, 224, 224]
         
         Args:
             gene_expression: [B, num_genes] - 基因表达向量 (196个基因)
             
         Returns:
-            torch.Tensor: [B, 1, target_image_size, target_image_size] - 伪图像 (单通道，16×16)
+            torch.Tensor: [B, 1, target_image_size, target_image_size] - 伪图像 (单通道，224×224)
         """
         B, num_genes = gene_expression.shape
         
@@ -121,32 +125,35 @@ class GenePseudoImageAdapter(nn.Module):
         if num_genes != self.num_genes:
             raise ValueError(f"期望基因数量: {self.num_genes}, 得到: {num_genes}")
         
-        # 🔧 修复：在验证阶段跳过标准化以确保完美重建
-        if self.training:
-            # 训练时使用标准化
-            normalized_genes = self._apply_normalization(gene_expression)
-        else:
-            # 验证/推理时跳过标准化，确保可逆性
-            normalized_genes = gene_expression
+        # 🔧 修复：LayerNorm已禁用，保持log2基因表达的原始数值范围
+        # 不再区分训练/验证模式，始终保持数据的原始分布
+        normalized_genes = gene_expression
         
-        # 🆕 添加零padding：[B, 196] → [B, 256]
-        padding_tensor = torch.zeros(B, self.padding_size, 
-                                   device=normalized_genes.device, 
-                                   dtype=normalized_genes.dtype)
-        # 拼接：[B, num_genes] + [B, padding_size] = [B, total_positions]
-        padded_genes = torch.cat([normalized_genes, padding_tensor], dim=1)
+        # Step 1: 将196基因重塑为14×14中间表示
+        # [B, 196] → [B, 1, 14, 14]
+        intermediate_image = normalized_genes.view(
+            B, 1, self.intermediate_size, self.intermediate_size
+        ).contiguous()
         
-        # 重塑为单通道伪图像: [B, total_positions] → [B, 1, H, W]
-        pseudo_image_1ch = padded_genes.view(B, 1, self.target_image_size, self.target_image_size).contiguous()
+        # Step 2: 插值上采样到224×224
+        # [B, 1, 14, 14] → [B, 1, 224, 224]
+        upsampled_image = F.interpolate(
+            intermediate_image,
+            size=(self.target_image_size, self.target_image_size),
+            mode='nearest',  # 最近邻插值，每个基因值复制到16×16区域
+            align_corners=None
+        )
         
-        return pseudo_image_1ch
+        return upsampled_image
     
     def pseudo_image_to_genes(self, pseudo_image: torch.Tensor) -> torch.Tensor:
         """
-        将伪图像转换回基因表达向量 (Padding版本)
+        将伪图像转换回基因表达向量 (插值上采样版本)
+        
+        流程: [B, 1, 224, 224] → 下采样 → [B, 1, 14, 14] → reshape → [B, 196]
         
         Args:
-            pseudo_image: [B, 1, target_image_size, target_image_size] - 伪图像 (单通道，16×16)
+            pseudo_image: [B, 1, target_image_size, target_image_size] - 伪图像 (单通道，224×224)
             
         Returns:
             torch.Tensor: [B, num_genes] - 基因表达向量 (196个基因)
@@ -159,19 +166,22 @@ class GenePseudoImageAdapter(nn.Module):
         if H != self.target_image_size or W != self.target_image_size:
             raise ValueError(f"期望图像尺寸: {self.target_image_size}x{self.target_image_size}, 得到: {H}x{W}")
         
-        # 展平: [B, 1, H, W] → [B, total_positions]
-        flattened_data = pseudo_image.view(B, self.total_positions).contiguous()
+        # Step 1: 下采样到14×14中间表示
+        # [B, 1, 224, 224] → [B, 1, 14, 14]
+        downsampled_image = F.interpolate(
+            pseudo_image,
+            size=(self.intermediate_size, self.intermediate_size),
+            mode='bilinear',  # 双线性插值进行下采样，保持平滑性
+            align_corners=False
+        )
         
-        # 🆕 去除padding部分：[B, 256] → [B, 196]
-        gene_expression = flattened_data[:, :self.num_genes].contiguous()
+        # Step 2: 重塑为基因表达向量
+        # [B, 1, 14, 14] → [B, 196]
+        gene_expression = downsampled_image.view(B, self.num_genes).contiguous()
         
-        # 🔧 修复：在验证阶段跳过反标准化
-        if self.training:
-            # 训练时使用反标准化
-            denormalized_genes = self._apply_denormalization(gene_expression)
-        else:
-            # 验证/推理时跳过反标准化，确保可逆性
-            denormalized_genes = gene_expression
+        # 🔧 修复：LayerNorm已禁用，不需要反标准化
+        # 直接返回原始基因表达数值范围
+        denormalized_genes = gene_expression
         
         return denormalized_genes
     
@@ -230,8 +240,8 @@ class GenePseudoImageAdapter(nn.Module):
                     'reconstructed_genes_shape': reconstructed_genes.shape,
                     'num_genes': self.num_genes,
                     'target_image_size': self.target_image_size,
-                    'padding_size': self.padding_size,
-                    'space_utilization': self.num_genes / self.total_positions
+                    'upsampling_factor': self.upsampling_factor,
+                    'space_utilization': 1.0
                 }
         finally:
             # 恢复原始训练状态
@@ -242,11 +252,11 @@ class GenePseudoImageAdapter(nn.Module):
         return {
             'num_genes': self.num_genes,
             'target_image_size': self.target_image_size,
-            'total_positions': self.total_positions,
-            'padding_size': self.padding_size,
-            'space_utilization': self.num_genes / self.total_positions,
+            'intermediate_size': self.intermediate_size,
+            'upsampling_factor': self.upsampling_factor,
+            'space_utilization': 1.0,
             'normalize_method': self.normalize_method,
-            'use_padding': self.use_padding
+            'use_padding': False
         }
     
     def forward(self, x: torch.Tensor, direction: str = 'gene_to_image') -> torch.Tensor:
