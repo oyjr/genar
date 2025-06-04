@@ -178,9 +178,9 @@ def load_callbacks(cfg: Dict):
             raise ValueError(f"不支持的训练阶段: {training_stage}")
     else:
         # 其他模型保持原有设置
-        default_monitor = 'val_loss'
+        default_monitor = 'val_mse'
         default_mode = 'min'
-        checkpoint_filename = 'best-epoch={epoch:02d}-{val_mse:.4f}'
+        checkpoint_filename = 'best-epoch={epoch:02d}-val_mse={val_mse:.4f}'
         print(f"🔧 标准模型: 监控指标={default_monitor}, 模式={default_mode}")
     
     # 处理early stopping配置

@@ -297,6 +297,28 @@ def build_config_from_args(args):
         config.MODEL.stage1_ckpt_path = args.stage1_ckpt
         config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
         
+        # 🔧 关键修复：动态设置监控指标
+        if args.training_stage == 1:
+            # Stage 1: 监控 val_mse (基因重建质量)
+            config.TRAINING.monitor = 'val_mse'
+            config.TRAINING.mode = 'min'
+            config.CALLBACKS.early_stopping.monitor = 'val_mse'
+            config.CALLBACKS.early_stopping.mode = 'min'
+            config.CALLBACKS.model_checkpoint.monitor = 'val_mse'
+            config.CALLBACKS.model_checkpoint.mode = 'min'
+            config.CALLBACKS.model_checkpoint.filename = 'stage1-best-epoch={epoch:02d}-val_mse={val_mse:.4f}'
+            print(f"   - Stage 1 监控指标: val_mse (基因重建质量)")
+        elif args.training_stage == 2:
+            # Stage 2: 监控 val_accuracy (token预测准确率)
+            config.TRAINING.monitor = 'val_accuracy'
+            config.TRAINING.mode = 'max'
+            config.CALLBACKS.early_stopping.monitor = 'val_accuracy'
+            config.CALLBACKS.early_stopping.mode = 'max'
+            config.CALLBACKS.model_checkpoint.monitor = 'val_accuracy'
+            config.CALLBACKS.model_checkpoint.mode = 'max'
+            config.CALLBACKS.model_checkpoint.filename = 'stage2-best-epoch={epoch:02d}-val_acc={val_accuracy:.4f}'
+            print(f"   - Stage 2 监控指标: val_accuracy (token预测准确率)")
+        
         # 检查Stage 2训练的必需参数
         if args.training_stage == 2 and not args.stage1_ckpt:
             raise ValueError("Stage 2训练需要指定 --stage1_ckpt 参数")
@@ -304,6 +326,15 @@ def build_config_from_args(args):
         print(f"   - 两阶段训练: Stage {args.training_stage}")
         if args.stage1_ckpt:
             print(f"   - Stage 1 Checkpoint: {args.stage1_ckpt}")
+    else:
+        # 🔧 其他模型也使用 val_mse 而不是 val_loss
+        config.TRAINING.monitor = 'val_mse'
+        config.TRAINING.mode = 'min'
+        config.CALLBACKS.early_stopping.monitor = 'val_mse'
+        config.CALLBACKS.early_stopping.mode = 'min'
+        config.CALLBACKS.model_checkpoint.monitor = 'val_mse'
+        config.CALLBACKS.model_checkpoint.mode = 'min'
+        print(f"   - 标准模型监控指标: val_mse")
     
     # 更新训练参数
     if args.epochs:

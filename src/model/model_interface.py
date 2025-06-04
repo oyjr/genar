@@ -95,9 +95,10 @@ class ModelInterface(pl.LightningModule):
         self._update_metrics('train', logits, target_genes)
 
         # 记录训练损失和学习率
-        self.log('train_loss', loss, on_step=True, on_epoch=True, logger=True, sync_dist=True)
+        batch_size = logits.size(0) if logits is not None else len(batch)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
         current_lr = self.optimizers().param_groups[0]['lr']
-        self.log('learning_rate', current_lr, on_step=True, logger=True, sync_dist=True)
+        self.log('learning_rate', current_lr, on_step=True, logger=True, sync_dist=True, batch_size=batch_size)
         
         # 🔧 记录Two-Stage VAR-ST的Stage 2训练指标
         if (hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST' and 
@@ -105,13 +106,13 @@ class ModelInterface(pl.LightningModule):
             
             # 记录VAR Transformer的训练指标
             if 'accuracy' in results_dict:
-                self.log('train_accuracy', results_dict['accuracy'], on_step=True, on_epoch=True, logger=True, sync_dist=True)
+                self.log('train_accuracy', results_dict['accuracy'], on_step=True, on_epoch=True, logger=True, sync_dist=True, prog_bar=True, batch_size=batch_size)
             
             if 'perplexity' in results_dict:
-                self.log('train_perplexity', results_dict['perplexity'], on_step=True, on_epoch=True, logger=True, sync_dist=True)
+                self.log('train_perplexity', results_dict['perplexity'], on_step=True, on_epoch=True, logger=True, sync_dist=True, prog_bar=True, batch_size=batch_size)
             
             if 'top5_accuracy' in results_dict:
-                self.log('train_top5_accuracy', results_dict['top5_accuracy'], on_step=True, on_epoch=True, logger=True, sync_dist=True)
+                self.log('train_top5_accuracy', results_dict['top5_accuracy'], on_step=True, on_epoch=True, logger=True, sync_dist=True, prog_bar=False, batch_size=batch_size)
         
         return loss
 
@@ -180,7 +181,8 @@ class ModelInterface(pl.LightningModule):
         self._save_step_outputs('val', loss, logits, target_genes, batch_idx)
         
         # 记录损失
-        self.log('val_loss', loss, on_epoch=True, logger=True, sync_dist=True)
+        batch_size = logits.size(0) if logits is not None else len(original_batch)
+        self.log('val_loss', loss, on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
         
         # 🔧 记录Two-Stage VAR-ST的Stage 2特殊指标
         if (hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST' and 
@@ -205,6 +207,12 @@ class ModelInterface(pl.LightningModule):
                 else:
                     # Stage 2训练时设置MSE为0，避免混淆
                     self.log('val_mse', torch.tensor(0.0, device=loss.device), on_epoch=True, logger=True, sync_dist=True)
+        else:
+            # 🔧 调试信息：确认Stage 1不会执行Stage 2代码
+            if hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST':
+                current_stage = getattr(self.model, 'current_stage', 'undefined')
+                logger.debug(f"Stage {current_stage}: 跳过Stage 2特殊指标记录，val_mse已由_update_metrics正确记录")
+        # 🔧 Stage 1时，val_mse已经通过_update_metrics正确记录，不需要额外处理
         
         return loss
 
@@ -554,22 +562,27 @@ class ModelInterface(pl.LightningModule):
             metrics.update(predictions, targets)
 
             metric_dict = metrics.compute()
+            batch_size = predictions.size(0)
             for name, value in metric_dict.items():
                 if isinstance(value, torch.Tensor):
                     values = torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
                     mean_value = values.mean()
                     std_value = values.std()
                 
-                    self.log(f'{stage}_{name}', mean_value, prog_bar=True)
-                    self.log(f'{stage}_{name}_std', std_value, prog_bar=True)
+                    # 🔧 优化进度条显示：只显示最重要的指标
+                    show_in_prog_bar = name in ['mse', 'mae']  # 只在进度条显示MSE和MAE
+                    
+                    self.log(f'{stage}_{name}', mean_value, prog_bar=show_in_prog_bar, batch_size=batch_size)
+                    self.log(f'{stage}_{name}_std', std_value, prog_bar=False, batch_size=batch_size)  # 标准差不显示在进度条
 
                     if name == 'pearson':
                         top_k = max(1,int(len(values)*0.3))
                         high_values = torch.topk(values, top_k)[0]
                         high_mean = high_values.mean()
                         high_std = high_values.std()
-                        self.log(f'{stage}_pearson_high_mean', high_mean, prog_bar=True)
-                        self.log(f'{stage}_pearson_high_std', high_std, prog_bar=True)
+                        # Pearson相关性指标不显示在进度条，避免过于拥挤
+                        self.log(f'{stage}_pearson_high_mean', high_mean, prog_bar=False, batch_size=batch_size)
+                        self.log(f'{stage}_pearson_high_std', high_std, prog_bar=False, batch_size=batch_size)
 
         except Exception as e:
             logger.error(f"更新指标时发生错误: {e}")
