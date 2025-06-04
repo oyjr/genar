@@ -71,13 +71,13 @@ MODELS = {
         'num_genes': 200,
         'histology_feature_dim': 1024,  # 依赖编码器
         'spatial_coord_dim': 2,
-        # Stage 1 VQVAE 配置
+        # Stage 1 VQVAE 配置 - 🔧 方案A: 参数优化
         'vqvae_config': {
             'vocab_size': 4096,
             'embed_dim': 128,
-            'beta': 0.25,
-            'hierarchical_loss_weight': 0.1,
-            'vq_loss_weight': 0.25
+            'beta': 1.0,  # 🔧 从0.25增加到1.0，强化commitment loss
+            'hierarchical_loss_weight': 0.2,  # 🔧 从0.1增加到0.2，增强分层学习
+            'vq_loss_weight': 0.5  # 🔧 从0.25增加到0.5，强化VQ学习
         },
         # Stage 2 VAR Transformer 配置
         'var_config': {
@@ -110,14 +110,14 @@ DEFAULT_CONFIG = {
             'persistent_workers': True
         },
         'val_dataloader': {
-            'batch_size': 32,  # 🔧 进一步增加验证批次大小，显著加速验证
+            'batch_size': 64,  # 🔧 进一步增加验证批次大小到64，显著加速验证
             'num_workers': 4,
             'pin_memory': True,
             'shuffle': False,
             'persistent_workers': True
         },
         'test_dataloader': {
-            'batch_size': 32,  # 🔧 同步增加测试批次大小
+            'batch_size': 64,  # 🔧 同步增加测试批次大小到64
             'num_workers': 4,
             'pin_memory': True,
             'shuffle': False,

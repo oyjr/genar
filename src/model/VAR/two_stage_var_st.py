@@ -64,9 +64,9 @@ class TwoStageVARST(nn.Module):
         self.vqvae_config = vqvae_config or {
             'vocab_size': 4096,
             'embed_dim': 128,
-            'beta': 0.25,
-            'hierarchical_loss_weight': 0.1,
-            'vq_loss_weight': 0.25
+            'beta': 1.0,
+            'hierarchical_loss_weight': 0.2,
+            'vq_loss_weight': 0.5
         }
         
         self.var_config = var_config or {

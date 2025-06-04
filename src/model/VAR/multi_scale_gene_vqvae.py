@@ -51,9 +51,9 @@ class MultiScaleGeneVQVAE(nn.Module):
         self,
         vocab_size: int = 4096,
         embed_dim: int = 128,
-        beta: float = 0.25,
-        hierarchical_loss_weight: float = 0.1,
-        vq_loss_weight: float = 0.25
+        beta: float = 1.0,
+        hierarchical_loss_weight: float = 0.2,
+        vq_loss_weight: float = 0.5
     ):
         super().__init__()
         
@@ -182,6 +182,8 @@ class MultiScaleGeneVQVAE(nn.Module):
             quantized[scale] = self.shared_quantizer.decode(tokens[scale])
         
         # 2. 解码
+        # 🔧 重要：VQVAE在训练时学会重建log2尺度的数据
+        # 所以推理时应该直接输出log2尺度，不需要额外变换
         return self.decode(quantized)
     
     def forward(self, gene_expression: torch.Tensor) -> Dict[str, Any]:

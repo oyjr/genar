@@ -139,12 +139,12 @@ class DataInterface(pl.LightningDataModule):
         
         # Handle both dict and Namespace types
         if isinstance(val_config, dict):
-            batch_size = val_config.get('batch_size', 1)
+            batch_size = val_config.get('batch_size', 64)
             shuffle = val_config.get('shuffle', False)
             pin_memory = val_config.get('pin_memory', True)
             num_workers = val_config.get('num_workers', 4)
         else:
-            batch_size = getattr(val_config, 'batch_size', 1)
+            batch_size = getattr(val_config, 'batch_size', 64)
             shuffle = getattr(val_config, 'shuffle', False)
             pin_memory = getattr(val_config, 'pin_memory', True)
             num_workers = getattr(val_config, 'num_workers', 4)
@@ -167,12 +167,12 @@ class DataInterface(pl.LightningDataModule):
         
         # Handle both dict and Namespace types
         if isinstance(test_config, dict):
-            batch_size = test_config.get('batch_size', 1)
+            batch_size = test_config.get('batch_size', 64)
             shuffle = test_config.get('shuffle', False)
             pin_memory = test_config.get('pin_memory', True)
             num_workers = test_config.get('num_workers', 4)
         else:
-            batch_size = getattr(test_config, 'batch_size', 1)
+            batch_size = getattr(test_config, 'batch_size', 64)
             shuffle = getattr(test_config, 'shuffle', False)
             pin_memory = getattr(test_config, 'pin_memory', True)
             num_workers = getattr(test_config, 'num_workers', 4)
