@@ -98,7 +98,8 @@ def main():
     cmd = [
         'python', 'src/main.py',
         '--dataset', args.dataset,
-        '--model', 'VAR_ST',  # 使用VAR_ST模型
+        '--model', 'TWO_STAGE_VAR_ST',  # 使用Two-Stage VAR_ST模型
+        '--training_stage', '1',  # 第一阶段训练
         '--gpus', str(gpu_count),  # 使用计算出的GPU数量
         '--epochs', str(args.epochs),
         '--batch_size', str(args.batch_size),

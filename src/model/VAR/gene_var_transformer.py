@@ -447,16 +447,17 @@ class Stage2Trainer:
         num_batches = len(dataloader)
         
         for batch_idx, batch in enumerate(dataloader):
-            # 处理数据
+            # 严格验证数据格式
             if isinstance(batch, (list, tuple)):
+                if len(batch) < 3:
+                    raise ValueError(f"Batch must contain [gene_expressions, histology_features, spatial_coords], "
+                                   f"but got {len(batch)} elements")
                 gene_expressions = batch[0]
-                histology_features = batch[1] if len(batch) > 1 else torch.randn(gene_expressions.shape[0], 1024)
-                spatial_coords = batch[2] if len(batch) > 2 else torch.rand(gene_expressions.shape[0], 2)
+                histology_features = batch[1]
+                spatial_coords = batch[2]
             else:
-                gene_expressions = batch
-                B = gene_expressions.shape[0]
-                histology_features = torch.randn(B, 1024)
-                spatial_coords = torch.rand(B, 2)
+                raise ValueError("Batch must be a tuple/list containing [gene_expressions, histology_features, spatial_coords]. "
+                               "Single tensor batches are not supported for Stage 2 training.")
             
             # 移动到设备
             gene_expressions = gene_expressions.to(self.device)
@@ -535,16 +536,17 @@ class Stage2Trainer:
         num_batches = len(dataloader)
         
         for batch in dataloader:
-            # 处理数据 (与训练相同)
+            # 严格验证数据格式 (与训练相同)
             if isinstance(batch, (list, tuple)):
+                if len(batch) < 3:
+                    raise ValueError(f"Validation batch must contain [gene_expressions, histology_features, spatial_coords], "
+                                   f"but got {len(batch)} elements")
                 gene_expressions = batch[0]
-                histology_features = batch[1] if len(batch) > 1 else torch.randn(gene_expressions.shape[0], 1024)
-                spatial_coords = batch[2] if len(batch) > 2 else torch.rand(gene_expressions.shape[0], 2)
+                histology_features = batch[1]
+                spatial_coords = batch[2]
             else:
-                gene_expressions = batch
-                B = gene_expressions.shape[0]
-                histology_features = torch.randn(B, 1024)
-                spatial_coords = torch.rand(B, 2)
+                raise ValueError("Validation batch must be a tuple/list containing [gene_expressions, histology_features, spatial_coords]. "
+                               "Single tensor batches are not supported for Stage 2 validation.")
             
             gene_expressions = gene_expressions.to(self.device)
             histology_features = histology_features.to(self.device)
@@ -590,14 +592,22 @@ class Stage2Trainer:
         print(f"Stage 2 checkpoint保存至: {filepath}")
     
     def load_checkpoint(self, filepath: str) -> Dict:
-        """加载Stage 2 checkpoint"""
+        """加载Stage 2 checkpoint - 严格验证"""
         checkpoint = torch.load(filepath, map_location=self.device)
+        
+        # 严格验证checkpoint完整性
+        required_keys = ['var_transformer_state_dict', 'condition_processor_state_dict', 
+                        'optimizer_state_dict', 'epoch', 'epoch_losses', 'epoch_accuracies']
+        
+        for key in required_keys:
+            if key not in checkpoint:
+                raise KeyError(f"Missing required key in Stage 2 checkpoint: {key}")
         
         self.var_transformer.load_state_dict(checkpoint['var_transformer_state_dict'])
         self.condition_processor.load_state_dict(checkpoint['condition_processor_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.epoch_losses = checkpoint.get('epoch_losses', [])
-        self.epoch_accuracies = checkpoint.get('epoch_accuracies', [])
+        self.epoch_losses = checkpoint['epoch_losses']
+        self.epoch_accuracies = checkpoint['epoch_accuracies']
         
         print(f"Stage 2 checkpoint加载: {filepath}, epoch: {checkpoint['epoch']}")
         return checkpoint

@@ -92,12 +92,7 @@ class MultiScaleGeneVQVAE(nn.Module):
         # 5. 残差重建器
         self.reconstructor = ResidualReconstructor()
         
-        print(f"🧬 MultiScaleGeneVQVAE初始化:")
-        print(f"   词汇表大小: {vocab_size}")
-        print(f"   嵌入维度: {embed_dim}")
-        print(f"   β参数: {beta}")
-        print(f"   分层损失权重: {hierarchical_loss_weight}")
-        print(f"   VQ损失权重: {vq_loss_weight}")
+        # Initialization complete
     
     def encode(self, gene_expression: torch.Tensor) -> Dict[str, Any]:
         """
@@ -414,6 +409,13 @@ class Stage1Trainer:
         self.epoch_losses = []
         self.codebook_utilizations = []
     
+    def _extract_gene_expressions(self, batch):
+        """提取基因表达数据的公共方法"""
+        if isinstance(batch, (list, tuple)):
+            return batch[0]  # 取第一个元素作为基因表达数据
+        else:
+            return batch
+    
     def train_epoch(self, dataloader, epoch: int) -> Dict[str, float]:
         """
         训练一个epoch
@@ -438,11 +440,8 @@ class Stage1Trainer:
         num_batches = len(dataloader)
         
         for batch_idx, batch in enumerate(dataloader):
-            # 处理不同的数据格式
-            if isinstance(batch, (list, tuple)):
-                gene_expressions = batch[0]  # 取第一个元素作为基因表达数据
-            else:
-                gene_expressions = batch
+            # 处理数据格式
+            gene_expressions = self._extract_gene_expressions(batch)
             
             # 移动到设备
             gene_expressions = gene_expressions.to(self.device)  # [B, 200]
@@ -512,11 +511,8 @@ class Stage1Trainer:
         num_batches = len(dataloader)
         
         for batch in dataloader:
-            # 处理不同的数据格式
-            if isinstance(batch, (list, tuple)):
-                gene_expressions = batch[0]  # 取第一个元素作为基因表达数据
-            else:
-                gene_expressions = batch
+            # 处理数据格式
+            gene_expressions = self._extract_gene_expressions(batch)
             
             gene_expressions = gene_expressions.to(self.device)
             

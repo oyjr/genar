@@ -1,4 +1,3 @@
-Two-Stage VAR-ST 评估报告
 生成时间: 2025-06-04 02:33:41
 Stage 1 检查点: logs/PRAD/TWO_STAGE_VAR_ST/stage1-best-epoch=epoch=143-val_mse=val_mse=0.5353.ckpt
 Stage 2 检查点: logs/PRAD/TWO_STAGE_VAR_ST/stage2-best-epoch=epoch=03-val_acc=val_accuracy=0.8263.ckpt

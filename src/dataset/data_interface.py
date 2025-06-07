@@ -19,16 +19,9 @@ class DataInterface(pl.LightningDataModule):
         elif hasattr(config, 'model_name'):
             model_name = config.model_name
         
-        is_var_st = model_name.upper() == 'VAR_ST'
-        
-        # 强制VAR-ST模型使用196基因模式
-        if is_var_st:
-            use_var_st_genes = True
-            var_st_gene_count = 196
-            print(f"🧬 检测到VAR_ST模型，强制启用196基因模式")
-        else:
-            use_var_st_genes = getattr(config, 'use_var_st_genes', False)
-            var_st_gene_count = getattr(config, 'var_st_gene_count', 196)
+        # Two-stage VAR-ST 支持所有基因数量，不强制196基因模式
+        use_var_st_genes = getattr(config, 'use_var_st_genes', False)
+        var_st_gene_count = getattr(config, 'var_st_gene_count', 196)
         
         print(f"初始化DataInterface:")
         print(f"  - 数据集名称: STDataset")
@@ -37,7 +30,6 @@ class DataInterface(pl.LightningDataModule):
         print(f"  - 编码器: {config.encoder_name}")
         print(f"  - 使用增强: {config.use_augmented}")
         print(f"  - 🧬 检测到模型名称: {model_name}")
-        print(f"  - 🆕 VAR-ST基因模式: {use_var_st_genes}")
         
         if use_var_st_genes:
             print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count}")

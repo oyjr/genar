@@ -54,18 +54,6 @@ MODELS = {
         'num_genes': 200,
         'dropout_rate': 0.1
     },
-    'VAR_ST': {
-        'model_name': 'VAR_ST',
-        'num_genes': 196,  # 🆕 固定使用196个基因 (14x14)
-        # VAR-ST 特定参数来自配置文件
-        'spatial_size': 64,  # 🔧 修复：使用64×64 padding策略，解决VQVAE下采样问题
-        'vae_ch': 128,
-        'vae_embed_dim': 256,
-        'vae_num_embeddings': 1024,
-        'var_depth': 16,
-        'var_embed_dim': 1024,
-        'var_num_heads': 16,
-    },
     'TWO_STAGE_VAR_ST': {
         'model_name': 'TWO_STAGE_VAR_ST',
         'num_genes': 200,

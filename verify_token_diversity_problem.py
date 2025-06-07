@@ -27,7 +27,7 @@ def analyze_stage1_token_distribution():
     print("=" * 50)
     
     # 加载Stage 1模型
-    stage1_ckpt = "logs/PRAD/TWO_STAGE_VAR_ST/stage1-best-epoch=epoch=143-val_mse=val_mse=0.5353.ckpt"
+    stage1_ckpt = "logs/PRAD/TWO_STAGE_VAR_ST/stage1-best-epoch=epoch=50-val_mse=val_mse=0.5207.ckpt"
     checkpoint = torch.load(stage1_ckpt, map_location='cpu')
     
     vqvae = MultiScaleGeneVQVAE()

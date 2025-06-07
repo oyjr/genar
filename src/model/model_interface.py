@@ -81,10 +81,6 @@ class ModelInterface(pl.LightningModule):
 
         results_dict = self.model(**batch)
         
-        # 如果是VAR_ST模型，需要后处理输出
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            results_dict = self._postprocess_outputs_var_st(results_dict, original_batch)
-
         # 计算损失
         loss = self._compute_loss(results_dict, original_batch)
 
@@ -124,50 +120,8 @@ class ModelInterface(pl.LightningModule):
         # 预处理输入
         batch = self._preprocess_inputs(batch)
         
-        # 🔧 关键修复：VAR_ST模型在验证时使用推理模式
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            # 修改输入模式为推理
-            batch['mode'] = 'inference'
-            # 移除基因表达输入，强制模型进行纯生成
-            histology_features = batch['histology_features']
-            class_labels = batch.get('class_labels')
-            
-            # 使用推理模式：仅从组织学特征生成基因表达
-            results_dict = self.model.forward_inference(
-                histology_features=histology_features,
-                class_labels=class_labels,
-                cfg_scale=1.0,  # 验证时不使用guidance
-                top_k=50,
-                top_p=0.9,
-                temperature=1.0,
-                num_samples=1
-            )
-            
-            # 🔧 修复：为推理模式手动添加loss计算
-            if 'loss' not in results_dict:
-                # 获取预测和目标基因表达
-                predicted_genes = results_dict.get('predicted_expression', results_dict.get('predictions'))
-                target_genes = original_batch.get('target_genes', batch.get('gene_expression'))
-                
-                if predicted_genes is not None and target_genes is not None:
-                    # 确保在相同设备上
-                    if predicted_genes.device != target_genes.device:
-                        target_genes = target_genes.to(predicted_genes.device)
-                    
-                    # 计算预测损失
-                    validation_loss = self.criterion(predicted_genes, target_genes)
-                    results_dict['loss'] = validation_loss
-                else:
-                    # 如果无法计算，使用零损失
-                    results_dict['loss'] = torch.tensor(0.0, device=histology_features.device, requires_grad=True)
-        else:
-            # 其他模型使用正常前向传播
-            results_dict = self.model(**batch)
+        results_dict = self.model(**batch)
         
-        # 如果是VAR_ST模型，需要后处理输出
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            results_dict = self._postprocess_outputs_var_st(results_dict, original_batch)
-
         # 计算损失
         loss = self._compute_loss(results_dict, original_batch)
         
@@ -223,10 +177,6 @@ class ModelInterface(pl.LightningModule):
         batch = self._preprocess_inputs(batch)
 
         results_dict = self.model(**batch)
-        
-        # 如果是VAR_ST模型，需要后处理输出
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            results_dict = self._postprocess_outputs_var_st(results_dict, original_batch)
         
         # 获取预测和目标
         logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
@@ -328,14 +278,13 @@ class ModelInterface(pl.LightningModule):
     
 
     def _init_metrics(self):
-        # 检测是否为VAR_ST模型
+        # 检测模型类型
         model_name = getattr(self.config, 'model_name', '') or getattr(self.config.MODEL, 'model_name', '') if hasattr(self.config, 'MODEL') else ''
-        is_var_st = model_name.upper() == 'VAR_ST'
         
-        if is_var_st:
-            # VAR-ST模型使用196个基因
-            num_outputs = 196
-            logger.info(f"VAR_ST模型使用固定基因数量: {num_outputs}")
+        if model_name.upper() == 'TWO_STAGE_VAR_ST':
+            # Two-stage VAR_ST模型使用200个基因
+            num_outputs = 200
+            logger.info(f"Two-stage VAR_ST模型使用基因数量: {num_outputs}")
         else:
             # 其他模型从基因列表文件获取基因数量
             if hasattr(self.config, 'data_path'):
@@ -402,84 +351,22 @@ class ModelInterface(pl.LightningModule):
 
     def _preprocess_inputs(self, inputs):
         """
-        预处理输入数据，使其与模型期望的格式匹配
+        根据模型类型进行输入预处理
         
-        Args:
-            inputs: 原始输入数据批次
-            
-        Returns:
-            处理后的输入数据
+        支持的模型类型:
+        - MFBP: 使用默认预处理
+        - TWO_STAGE_VAR_ST: 使用两阶段VAR-ST预处理
         """
         
-        # 记录输入张量的形状用于调试
-        logger.debug("Original input shapes:")
-        for key, value in inputs.items():
-            if isinstance(value, torch.Tensor):
-                logger.debug(f"  {key}: {value.shape}")
+        # 根据模型名称选择预处理方法
+        if hasattr(self, 'model_name'):
+            if self.model_name == 'TWO_STAGE_VAR_ST':
+                return self._preprocess_inputs_two_stage_var_st(inputs)
         
-        # 如果是VAR_ST模型，需要特殊的输入格式
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            return self._preprocess_inputs_var_st(inputs)
-        # 如果是两阶段VAR_ST模型，需要特殊的输入格式
-        elif hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST':
-            return self._preprocess_inputs_two_stage_var_st(inputs)
-        else:
-            # 原有的MFBP输入格式
-            return inputs
+        # 默认预处理（MFBP及其他模型）
+        return inputs
 
-    def _preprocess_inputs_var_st(self, inputs):
-        """
-        VAR_ST模型的输入预处理（基因多尺度版本）
-        
-        关键变化：
-        - 196基因 → 14×14伪图像
-        - 基因多尺度 (1,2,3,4,5) → 55 tokens
-        
-        不需要positions参数，因为基因多尺度在基因维度而非空间维度
-        """
-        processed = {}
-        
-        # 基因表达数据处理 - 直接使用，不做维度转换
-        if 'target_genes' in inputs:
-            target_genes = inputs['target_genes']
-            processed['gene_expression'] = target_genes
-            # 🔇 简化输出：只在debug模式显示
-            # print(f"📊 基因表达数据: {target_genes.shape}")
-            
-            # 验证维度
-            if target_genes.dim() not in [2, 3]:
-                raise ValueError(f"不支持的target_genes维度: {target_genes.shape}")
-        
-        # 组织学特征处理 - 直接使用，不做维度转换
-        if 'img' in inputs:
-            img_features = inputs['img']
-            processed['histology_features'] = img_features
-            # 🔇 简化输出：只在debug模式显示
-            # print(f"🖼️  组织学特征: {img_features.shape}")
-            
-            # 验证维度
-            if img_features.dim() not in [2, 3]:
-                raise ValueError(f"不支持的img_features维度: {img_features.shape}")
-        else:
-            raise ValueError("Missing histology features ('img' key not found in inputs)")
-        
-        # 空间位置处理 - 基因多尺度模式下可选
-        if 'positions' in inputs:
-            processed['positions'] = inputs['positions']
-            # 🔇 简化输出：只在debug模式显示
-            # print(f"📍 空间位置: {inputs['positions'].shape} (基因模式下不使用)")
-        
-        # 设置模式
-        processed['mode'] = 'training' if 'target_genes' in inputs else 'inference'
-        
-        # 🔇 大幅简化预处理完成输出
-        # print(f"✅ VAR_ST预处理完成 (基因多尺度模式):")
-        # print(f"   - 模式: {processed['mode']}")
-        # for key, value in processed.items():
-        #     if isinstance(value, torch.Tensor):
-        #         print(f"   - {key}: {value.shape}")
-        
-        return processed
+
 
     def _preprocess_inputs_two_stage_var_st(self, inputs):
         """
@@ -520,8 +407,7 @@ class ModelInterface(pl.LightningModule):
             if spatial_coords.dim() not in [2, 3]:
                 raise ValueError(f"不支持的spatial_coords维度: {spatial_coords.shape}")
         
-        # 设置模式
-        processed['mode'] = 'train' if 'target_genes' in inputs else 'inference'
+        # 移除mode参数 - TwoStageVARST不再需要mode参数
         
         return processed
 
@@ -558,6 +444,10 @@ class ModelInterface(pl.LightningModule):
                 B, N, G = targets.shape
                 targets = targets.reshape(-1, G)  # [B*N, num_genes]
             
+            # 🔧 关键修复：训练阶段每次都重置指标，避免累积
+            if stage == 'train':
+                metrics.reset()
+            
             # 更新指标
             metrics.update(predictions, targets)
 
@@ -590,6 +480,13 @@ class ModelInterface(pl.LightningModule):
     
     
     def _save_step_outputs(self, phase, loss, preds, targets, batch_idx=None):
+        # 🔧 关键修复：训练阶段不累积数据，避免内存泄漏
+        if phase == 'train':
+            # 训练阶段不保存数据，避免内存无限累积
+            # 训练指标通过Lightning的内置机制记录即可
+            return
+        
+        # 只对验证和测试阶段累积数据用于最终评估
         output_dict = {
             'loss': loss.detach(),
             'preds': preds.detach().cpu(),
@@ -675,8 +572,10 @@ class ModelInterface(pl.LightningModule):
         # 这样可以避免产生大量中间可视化文件
 
     def on_train_epoch_end(self):
-        self._process_epoch_end('train')
-        
+        # 🔧 训练数据不再累积，无需清理
+        # self._process_epoch_end('train')  # 已移除，因为训练数据不再累积
+        pass
+    
     def on_validation_epoch_end(self):
         self._compute_and_log_evaluation_metrics('val')
         # 只有在非最后一个epoch时才清空数据，保留最后一个epoch的数据用于可视化
@@ -1017,10 +916,6 @@ class ModelInterface(pl.LightningModule):
                 logger.info("加载MFBP模型...")
                 Model = getattr(importlib.import_module(
                     f'model.MFBP.MFBP'), 'MFBP')
-            elif self.model_name == 'VAR_ST':
-                logger.info("加载VAR_ST模型...")
-                Model = getattr(importlib.import_module(
-                    f'model.VAR.var_gene_wrapper'), 'VARGeneWrapper')
             elif self.model_name == 'TWO_STAGE_VAR_ST':
                 logger.info("加载两阶段VAR-ST模型...")
                 Model = getattr(importlib.import_module(
@@ -1118,54 +1013,14 @@ class ModelInterface(pl.LightningModule):
             loss: 计算得到的损失值
         """
         
-        # 如果是VAR_ST模型，使用其特殊的损失计算
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            return self._compute_loss_var_st(outputs, batch)
         # 如果是两阶段VAR_ST模型，使用其损失计算
-        elif hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST':
+        if hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST':
             return self._compute_loss_two_stage_var_st(outputs, batch)
         else:
             # 原有的MFBP损失计算
             return self._compute_loss_mfbp(outputs, batch)
 
-    def _compute_loss_var_st(self, outputs, batch):
-        """
-        VAR_ST模型的损失计算
-        
-        VAR_ST返回的输出包含多个损失组件：
-        - loss: 总损失 (已经在模型内部计算好)
-        - vq_loss: VQ量化损失
-        - recon_loss: 重建损失  
-        - ar_loss: 自回归损失
-        - spot_recon_loss: spots重建损失
-        """
-        if 'loss' in outputs:
-            # 如果模型已经计算好总损失，直接使用
-            total_loss = outputs['loss']
-            
-            # 记录各个损失组件用于监控
-            if 'vq_loss' in outputs:
-                self.log('train_vq_loss', outputs['vq_loss'], on_epoch=True, logger=True, sync_dist=True)
-            if 'recon_loss' in outputs:
-                self.log('train_recon_loss', outputs['recon_loss'], on_epoch=True, logger=True, sync_dist=True)
-            if 'ar_loss' in outputs:
-                self.log('train_ar_loss', outputs['ar_loss'], on_epoch=True, logger=True, sync_dist=True)
-            if 'spot_recon_loss' in outputs:
-                self.log('train_spot_recon_loss', outputs['spot_recon_loss'], on_epoch=True, logger=True, sync_dist=True)
-            
-            logger.debug(f"VAR_ST总损失: {total_loss.item():.4f}")
-            
-            return total_loss
-        else:
-            # 如果模型没有返回损失，手动计算
-            if 'predicted_expression' in outputs and 'gene_expression' in batch:
-                logits = outputs['predicted_expression']
-                target_genes = batch['gene_expression']
-                loss = self.criterion(logits, target_genes)
-                logger.debug(f"VAR_ST预测损失: {loss.item():.4f}")
-                return loss
-            else:
-                raise ValueError("VAR_ST模型输出格式不正确，缺少损失信息")
+
 
     def _compute_loss_two_stage_var_st(self, outputs, batch):
         """
@@ -1483,23 +1338,7 @@ class ModelInterface(pl.LightningModule):
         Returns:
             tuple: (logits, target_genes)
         """
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            # VAR_ST模型输出格式
-            if 'predicted_expression' in results_dict:
-                logits = results_dict['predicted_expression']
-            elif 'logits' in results_dict:
-                logits = results_dict['logits']
-            else:
-                raise ValueError("VAR_ST模型输出中找不到predicted_expression或logits")
-            
-            # 目标数据
-            if 'gene_expression' in batch:
-                target_genes = batch['gene_expression']
-            elif 'target_genes' in batch:
-                target_genes = batch['target_genes']
-            else:
-                raise ValueError("批次数据中找不到gene_expression或target_genes")
-        elif hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST':
+        if hasattr(self, 'model_name') and self.model_name == 'TWO_STAGE_VAR_ST':
             # 🔧 关键修复：Two-stage VAR_ST模型的正确处理
             
             # 获取当前训练阶段
@@ -1561,52 +1400,7 @@ class ModelInterface(pl.LightningModule):
         
         return logits, target_genes
 
-    def _postprocess_outputs_var_st(self, outputs, original_inputs):
-        """
-        为VAR_ST模型后处理输出数据 - 基因维度多尺度模式
-        
-        支持单spot和多spot输出：
-        - 单spot: [B, num_genes] 
-        - 多spot: [B, N, num_genes]
-        """
-        processed = {}
-        
-        if 'target_genes' in original_inputs:
-            # 训练模式：直接使用模型输出
-            processed['loss'] = outputs['loss']
-            processed['var_loss'] = outputs.get('var_loss', outputs['loss'])
-            processed['vqvae_loss'] = outputs.get('vqvae_loss', torch.tensor(0.0, requires_grad=True))
-            processed['gene_recon_loss'] = outputs.get('gene_recon_loss', torch.tensor(0.0, requires_grad=True))
-            
-            # 预测和目标数据 - 确保所有必要字段都被传递
-            processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression'))
-            processed['predicted_expression'] = outputs.get('predicted_expression', outputs.get('predictions'))
-            processed['logits'] = outputs.get('logits', outputs.get('predicted_expression', outputs.get('predictions')))
-            processed['targets'] = outputs.get('targets', original_inputs['target_genes'])
-            
-            # 只在每100个step时显示详细信息，其余时候保持简洁
-            if not hasattr(self, '_step_count'):
-                self._step_count = 0
-            self._step_count += 1
-            
-            # 🔧 在分布式训练中，只在主进程输出，并大幅减少输出频率
-            import os
-            is_main_process = int(os.environ.get('LOCAL_RANK', 0)) == 0
-            
-            if processed['predictions'] is not None and is_main_process and self._step_count % 500 == 1:
-                pred_shape = processed['predictions'].shape
-                if len(pred_shape) == 2:
-                    print(f"🔄 单spot训练: {pred_shape} (Step {self._step_count})")
-                elif len(pred_shape) == 3:
-                    B, N, G = pred_shape
-                    print(f"🔄 多spot训练: Batch={B}, Spots={N}, Genes={G} (Step {self._step_count})")
-        else:
-            # 推理模式：处理预测输出
-            processed['predictions'] = outputs.get('predictions', outputs.get('predicted_expression', outputs.get('logits')))
-            processed['predicted_expression'] = processed['predictions']
-            processed['logits'] = processed['predictions']
-        
-        return processed
+
 
     def test_full_slide(self, slide_data: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
         """
@@ -1659,9 +1453,7 @@ class ModelInterface(pl.LightningModule):
                 # 模型预测
                 results_dict = self.model(**processed_batch)
                 
-                # 后处理输出（如果是VAR_ST）
-                if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-                    results_dict = self._postprocess_outputs_var_st(results_dict, single_spot_batch)
+
                 
                 # 提取预测和目标
                 prediction, target = self._extract_predictions_and_targets(results_dict, single_spot_batch)

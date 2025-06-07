@@ -60,25 +60,9 @@ class TwoStageVARST(nn.Module):
         self.current_stage = current_stage
         self.device = device
         
-        # Default configurations
-        self.vqvae_config = vqvae_config or {
-            'vocab_size': 4096,
-            'embed_dim': 128,
-            'beta': 1.0,
-            'hierarchical_loss_weight': 0.2,
-            'vq_loss_weight': 0.5
-        }
-        
-        self.var_config = var_config or {
-            'vocab_size': 4096,
-            'embed_dim': 640,
-            'num_heads': 8,
-            'num_layers': 12,
-            'feedforward_dim': 2560,
-            'dropout': 0.1,
-            'max_sequence_length': 1500,
-            'condition_embed_dim': 640
-        }
+        # Validate and set configurations
+        self.vqvae_config = self._validate_vqvae_config(vqvae_config)
+        self.var_config = self._validate_var_config(var_config)
         
         # Initialize Stage 1: Multi-scale Gene VQVAE
         logger.info("Initializing Stage 1: Multi-scale Gene VQVAE")
@@ -99,11 +83,78 @@ class TwoStageVARST(nn.Module):
         # Training stage management
         self.set_training_stage(current_stage, stage1_ckpt_path)
         
-        # Loss tracking
-        self.stage1_losses = {}
-        self.stage2_losses = {}
-        
         logger.info(f"Two-Stage VAR-ST initialized with stage={current_stage}")
+    
+    def _validate_vqvae_config(self, config: Optional[Dict]) -> Dict:
+        """Validate VQVAE configuration and provide defaults only if None"""
+        if config is None:
+            return {
+                'vocab_size': 4096,
+                'embed_dim': 128,
+                'beta': 1.0,
+                'hierarchical_loss_weight': 0.2,
+                'vq_loss_weight': 0.5
+            }
+        
+        required_keys = ['vocab_size', 'embed_dim', 'beta', 'hierarchical_loss_weight', 'vq_loss_weight']
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required VQVAE config key: {key}")
+        
+        return config
+    
+    def _validate_var_config(self, config: Optional[Dict]) -> Dict:
+        """Validate VAR configuration and provide defaults only if None"""
+        if config is None:
+            return {
+                'vocab_size': 4096,
+                'embed_dim': 640,
+                'num_heads': 8,
+                'num_layers': 12,
+                'feedforward_dim': 2560,
+                'dropout': 0.1,
+                'max_sequence_length': 1500,
+                'condition_embed_dim': 640
+            }
+        
+        required_keys = ['vocab_size', 'embed_dim', 'num_heads', 'num_layers', 
+                        'feedforward_dim', 'dropout', 'max_sequence_length', 'condition_embed_dim']
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required VAR config key: {key}")
+        
+        return config
+    
+    def _validate_stage2_inputs(self, gene_expression: torch.Tensor, 
+                               histology_features: torch.Tensor, 
+                               spatial_coords: torch.Tensor):
+        """验证Stage 2输入维度"""
+        batch_size = gene_expression.size(0)
+        
+        if gene_expression.shape != (batch_size, self.num_genes):
+            raise ValueError(f"Expected gene_expression shape: [{batch_size}, {self.num_genes}], "
+                           f"got: {gene_expression.shape}")
+        
+        if histology_features.shape != (batch_size, self.histology_feature_dim):
+            raise ValueError(f"Expected histology_features shape: [{batch_size}, {self.histology_feature_dim}], "
+                           f"got: {histology_features.shape}")
+        
+        if spatial_coords.shape != (batch_size, self.spatial_coord_dim):
+            raise ValueError(f"Expected spatial_coords shape: [{batch_size}, {self.spatial_coord_dim}], "
+                           f"got: {spatial_coords.shape}")
+    
+    def _validate_inference_inputs(self, histology_features: torch.Tensor, 
+                                  spatial_coords: torch.Tensor):
+        """验证推理输入维度"""
+        batch_size = histology_features.size(0)
+        
+        if histology_features.shape[1] != self.histology_feature_dim:
+            raise ValueError(f"Expected histology_features dim: {self.histology_feature_dim}, "
+                           f"got: {histology_features.shape[1]}")
+        
+        if spatial_coords.shape != (batch_size, self.spatial_coord_dim):
+            raise ValueError(f"Expected spatial_coords shape: [{batch_size}, {self.spatial_coord_dim}], "
+                           f"got: {spatial_coords.shape}")
     
     def set_training_stage(self, stage: int, stage1_ckpt_path: Optional[str] = None):
         """
@@ -168,31 +219,20 @@ class TwoStageVARST(nn.Module):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Stage 1 checkpoint not found: {ckpt_path}")
         
-        try:
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
-            
-            # Handle different checkpoint formats
-            if 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            elif 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
-            
-            # Load state dict to VQVAE
-            self.stage1_vqvae.load_state_dict(state_dict, strict=False)
-            logger.info(f"Successfully loaded Stage 1 VQVAE from {ckpt_path}")
-            
-        except Exception as e:
-            logger.error(f"Failed to load Stage 1 checkpoint: {e}")
-            raise
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        
+        # Expect standard format with 'model_state_dict' key
+        if 'model_state_dict' not in checkpoint:
+            raise KeyError("Stage 1 checkpoint must contain 'model_state_dict' key")
+        
+        self.stage1_vqvae.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        logger.info(f"Successfully loaded Stage 1 VQVAE from {ckpt_path}")
     
     def forward(
         self,
         gene_expression: torch.Tensor,
         histology_features: Optional[torch.Tensor] = None,
-        spatial_coords: Optional[torch.Tensor] = None,
-        mode: str = 'train'
+        spatial_coords: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass based on current training stage
@@ -201,22 +241,19 @@ class TwoStageVARST(nn.Module):
             gene_expression: [B, num_genes] gene expression data
             histology_features: [B, histology_dim] histology features (Stage 2 only)
             spatial_coords: [B, spatial_dim] spatial coordinates (Stage 2 only)
-            mode: 'train' or 'inference'
         
         Returns:
             Dictionary containing losses and predictions based on current stage
         """
         if self.current_stage == 1:
-            return self._forward_stage1(gene_expression, mode)
+            return self._forward_stage1(gene_expression)
         elif self.current_stage == 2:
-            return self._forward_stage2(gene_expression, histology_features, spatial_coords, mode)
+            return self._forward_stage2(gene_expression, histology_features, spatial_coords)
         else:
             raise ValueError(f"Invalid stage: {self.current_stage}")
     
-    def _forward_stage1(self, gene_expression: torch.Tensor, mode: str) -> Dict[str, torch.Tensor]:
+    def _forward_stage1(self, gene_expression: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Stage 1 forward: VQVAE training"""
-        batch_size = gene_expression.size(0)
-        
         # VQVAE forward pass
         vqvae_output = self.stage1_vqvae(gene_expression)
         
@@ -227,33 +264,30 @@ class TwoStageVARST(nn.Module):
         reconstruction_loss = vqvae_output['total_reconstruction_loss']
         total_loss = vqvae_output['total_loss']
         
-        # Store losses for monitoring
-        self.stage1_losses = {
-            'total_loss': total_loss,
-            'reconstruction_loss': reconstruction_loss,
-            'hierarchical_loss': hierarchical_loss,
-            'vq_loss': vq_loss
-        }
-        
         return {
             'loss': total_loss,
             'reconstructed': reconstructed,
             'tokens': vqvae_output['tokens'],
-            'stage1_losses': self.stage1_losses
+            'stage1_losses': {
+                'total_loss': total_loss,
+                'reconstruction_loss': reconstruction_loss,
+                'hierarchical_loss': hierarchical_loss,
+                'vq_loss': vq_loss
+            }
         }
     
     def _forward_stage2(
         self,
         gene_expression: torch.Tensor,
         histology_features: torch.Tensor,
-        spatial_coords: torch.Tensor,
-        mode: str
+        spatial_coords: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """Stage 2 forward: VAR Transformer training"""
         if histology_features is None or spatial_coords is None:
             raise ValueError("histology_features and spatial_coords are required for Stage 2")
         
-        batch_size = gene_expression.size(0)
+        # 验证输入维度
+        self._validate_stage2_inputs(gene_expression, histology_features, spatial_coords)
         
         # Get target tokens from frozen VQVAE
         with torch.no_grad():
@@ -267,6 +301,7 @@ class TwoStageVARST(nn.Module):
                 token_sequence.append(scale_tokens)
             
             target_tokens = torch.cat(token_sequence, dim=1)  # [B, total_seq_len]
+            target_tokens = target_tokens.detach()
         
         # Process condition information
         condition_embed = self.condition_processor(histology_features, spatial_coords)
@@ -278,28 +313,22 @@ class TwoStageVARST(nn.Module):
             target_tokens=target_tokens
         )
         
-        # Extract VAR loss - 🔧 Stage 2只使用交叉熵损失
+        # Extract VAR loss - Stage 2只使用交叉熵损失
         var_loss = var_output['loss']
         
-        # Store losses for monitoring
-        self.stage2_losses = {
-            'var_loss': var_loss,
-            'total_loss': var_loss  # Stage 2总损失就是VAR损失
-        }
-        
         output = {
-            'loss': var_loss,  # 🔧 只返回交叉熵损失，不添加任何正则化
+            'loss': var_loss,
             'logits': var_output['logits'],
-            'stage2_losses': self.stage2_losses
+            'stage2_losses': {
+                'var_loss': var_loss,
+                'total_loss': var_loss
+            }
         }
         
-        # 🔧 添加VAR Transformer的所有指标
-        if 'accuracy' in var_output:
-            output['accuracy'] = var_output['accuracy']
-        if 'perplexity' in var_output:
-            output['perplexity'] = var_output['perplexity']
-        if 'top5_accuracy' in var_output:
-            output['top5_accuracy'] = var_output['top5_accuracy']
+        # 添加VAR Transformer的所有指标
+        for metric in ['accuracy', 'perplexity', 'top5_accuracy']:
+            if metric in var_output:
+                output[metric] = var_output[metric]
         
         return output
     
@@ -325,8 +354,11 @@ class TwoStageVARST(nn.Module):
             Dictionary containing predicted gene expression and intermediate results
         """
         if self.current_stage != 2:
-            logger.warning("Inference requires Stage 2 setup. Setting to Stage 2 mode.")
-            # Note: This assumes Stage 1 is already loaded
+            raise ValueError(f"Inference requires Stage 2 setup, but current stage is {self.current_stage}. "
+                           "Please set training stage to 2 with proper Stage 1 checkpoint before inference.")
+        
+        # 验证推理输入维度
+        self._validate_inference_inputs(histology_features, spatial_coords)
         
         self.eval()
         
@@ -343,9 +375,8 @@ class TwoStageVARST(nn.Module):
                 top_p=top_p
             )  # [B, seq_len]
             
-            # Need to reconstruct multi-scale tokens from flat sequence
-            # Assuming the sequence order: global(1) + pathway(8) + module(32) + individual(200) = 241
-            batch_size = generated_tokens.shape[0]
+            # Reconstruct multi-scale tokens from flat sequence
+            # Sequence order: global(1) + pathway(8) + module(32) + individual(200) = 241
             tokens = {
                 'global': generated_tokens[:, 0:1],         # [B, 1]
                 'pathway': generated_tokens[:, 1:9],        # [B, 8]
@@ -436,12 +467,19 @@ class TwoStageVARST(nn.Module):
         """
         checkpoint = torch.load(ckpt_path, map_location=device)
         
-        # Extract configs and model parameters
+        # Extract configs and model parameters - strict validation
+        required_keys = ['vqvae_config', 'var_config', 'stage1_state_dict', 'stage2_state_dict',
+                        'num_genes', 'histology_feature_dim', 'spatial_coord_dim']
+        
+        for key in required_keys:
+            if key not in checkpoint:
+                raise KeyError(f"Missing required key in checkpoint: {key}")
+        
         vqvae_config = checkpoint['vqvae_config']
         var_config = checkpoint['var_config']
-        num_genes = checkpoint.get('num_genes', 200)
-        histology_feature_dim = checkpoint.get('histology_feature_dim', 1024)
-        spatial_coord_dim = checkpoint.get('spatial_coord_dim', 2)
+        num_genes = checkpoint['num_genes']
+        histology_feature_dim = checkpoint['histology_feature_dim']
+        spatial_coord_dim = checkpoint['spatial_coord_dim']
         
         # Create model instance
         model = cls(
