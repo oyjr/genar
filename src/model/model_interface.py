@@ -472,7 +472,7 @@ class ModelInterface(pl.LightningModule):
         
         logger.info(f"📊 开始计算{phase}阶段的详细评估指标...")
         
-        # 收集所有预测和目标 (这些已经是log2标准化的值)
+        # 收集本GPU的所有预测和目标 (这些已经是log2标准化的值)
         all_predictions = []
         all_targets = []
         
@@ -485,7 +485,7 @@ class ModelInterface(pl.LightningModule):
             logger.warning(f"⚠️ {phase}阶段没有有效的预测数据")
             return
         
-        # 整合数据
+        # 整合本GPU的数据
         predictions_log2 = np.vstack(all_predictions)  # Log2标准化的预测值
         targets_log2 = np.vstack(all_targets)  # Log2标准化的目标值
         
@@ -494,46 +494,111 @@ class ModelInterface(pl.LightningModule):
             logger.warning(f"⚠️ {phase}阶段数据为空，跳过评估指标计算")
             return
         
-        logger.info(f"数据形状检查 - predictions: {predictions_log2.shape}, targets: {targets_log2.shape}")
+        logger.info(f"本GPU数据形状 - predictions: {predictions_log2.shape}, targets: {targets_log2.shape}")
         
-        # 计算log2标准化空间的指标
-        metrics_log2 = self.calculate_evaluation_metrics(targets_log2, predictions_log2)
-        
-        # 🆕 计算原始计数空间的指标用于对比
-        predictions_raw = np.power(2, predictions_log2) - 1  # 反向转换
-        targets_raw = np.power(2, targets_log2) - 1
-        predictions_raw = np.clip(predictions_raw, 0, None)  # 确保非负
-        targets_raw = np.clip(targets_raw, 0, None)
-        
-        metrics_raw = self.calculate_evaluation_metrics(targets_raw, predictions_raw)
-        
-        # 打印对比报告
-        self.print_dual_evaluation_results(metrics_log2, metrics_raw, phase)
-        
-        # 记录到wandb和日志 - 🔧 修复：移除numpy数组，修正指标名称，添加batch_size
-        batch_size = predictions_log2.shape[0]  # 获取batch大小
-        for key, value in metrics_log2.items():
-            if key != 'correlations':  # 跳过numpy数组
-                # 确保值是标量
-                if isinstance(value, (np.ndarray, list)):
-                    if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
-                        value = float(value)
-                    else:
-                        continue  # 跳过非标量值
-                self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
-        
-        # 记录原始计数值指标（用于对比）
-        for key, value in metrics_raw.items():
-            if key != 'correlations':  # 跳过numpy数组
-                # 确保值是标量
-                if isinstance(value, (np.ndarray, list)):
-                    if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
-                        value = float(value)
-                    else:
-                        continue  # 跳过非标量值
-                self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
-        
-        logger.info(f"✅ {phase}阶段评估指标计算完成")
+        # 🆕 在多GPU环境下，收集所有GPU的数据进行统一评估
+        if self.trainer.world_size > 1:
+            # 将数据转换为tensor以便all_gather
+            predictions_tensor = torch.from_numpy(predictions_log2).to(self.device)
+            targets_tensor = torch.from_numpy(targets_log2).to(self.device)
+            
+            # 收集所有GPU的数据
+            all_predictions_gathered = self.all_gather(predictions_tensor)
+            all_targets_gathered = self.all_gather(targets_tensor)
+            
+            # 只在主进程进行最终评估和打印
+            if self.trainer.is_global_zero:
+                # 将收集的数据重新整合
+                if all_predictions_gathered.dim() == 3:  # [num_gpus, batch_size, num_genes]
+                    all_predictions_gathered = all_predictions_gathered.view(-1, all_predictions_gathered.size(-1))
+                    all_targets_gathered = all_targets_gathered.view(-1, all_targets_gathered.size(-1))
+                
+                predictions_log2_all = all_predictions_gathered.cpu().numpy()
+                targets_log2_all = all_targets_gathered.cpu().numpy()
+                
+                logger.info(f"所有GPU数据形状 - predictions: {predictions_log2_all.shape}, targets: {targets_log2_all.shape}")
+                
+                # 计算log2标准化空间的指标
+                metrics_log2 = self.calculate_evaluation_metrics(targets_log2_all, predictions_log2_all)
+                
+                # 计算原始计数空间的指标用于对比
+                predictions_raw = np.power(2, predictions_log2_all) - 1  # 反向转换
+                targets_raw = np.power(2, targets_log2_all) - 1
+                predictions_raw = np.clip(predictions_raw, 0, None)  # 确保非负
+                targets_raw = np.clip(targets_raw, 0, None)
+                
+                metrics_raw = self.calculate_evaluation_metrics(targets_raw, predictions_raw)
+                
+                # 只在主进程打印对比报告
+                self.print_dual_evaluation_results(metrics_log2, metrics_raw, phase)
+                
+                # 记录到wandb和日志
+                batch_size = predictions_log2_all.shape[0]  # 所有GPU的总batch大小
+                for key, value in metrics_log2.items():
+                    if key != 'correlations':  # 跳过numpy数组
+                        # 确保值是标量
+                        if isinstance(value, (np.ndarray, list)):
+                            if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
+                                value = float(value)
+                            else:
+                                continue  # 跳过非标量值
+                        self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
+                
+                # 记录原始计数值指标（用于对比）
+                for key, value in metrics_raw.items():
+                    if key != 'correlations':  # 跳过numpy数组
+                        # 确保值是标量
+                        if isinstance(value, (np.ndarray, list)):
+                            if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
+                                value = float(value)
+                            else:
+                                continue  # 跳过非标量值
+                        self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
+                
+                logger.info(f"✅ {phase}阶段评估指标计算完成（使用所有{self.trainer.world_size}个GPU的数据）")
+            else:
+                # 非主进程只记录日志
+                logger.info(f"GPU {self.trainer.global_rank}: 数据已发送给主进程进行统一评估")
+        else:
+            # 单GPU模式，直接计算
+            # 计算log2标准化空间的指标
+            metrics_log2 = self.calculate_evaluation_metrics(targets_log2, predictions_log2)
+            
+            # 计算原始计数空间的指标用于对比
+            predictions_raw = np.power(2, predictions_log2) - 1  # 反向转换
+            targets_raw = np.power(2, targets_log2) - 1
+            predictions_raw = np.clip(predictions_raw, 0, None)  # 确保非负
+            targets_raw = np.clip(targets_raw, 0, None)
+            
+            metrics_raw = self.calculate_evaluation_metrics(targets_raw, predictions_raw)
+            
+            # 打印对比报告
+            self.print_dual_evaluation_results(metrics_log2, metrics_raw, phase)
+            
+            # 记录到wandb和日志
+            batch_size = predictions_log2.shape[0]  # 获取batch大小
+            for key, value in metrics_log2.items():
+                if key != 'correlations':  # 跳过numpy数组
+                    # 确保值是标量
+                    if isinstance(value, (np.ndarray, list)):
+                        if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
+                            value = float(value)
+                        else:
+                            continue  # 跳过非标量值
+                    self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
+            
+            # 记录原始计数值指标（用于对比）
+            for key, value in metrics_raw.items():
+                if key != 'correlations':  # 跳过numpy数组
+                    # 确保值是标量
+                    if isinstance(value, (np.ndarray, list)):
+                        if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
+                            value = float(value)
+                        else:
+                            continue  # 跳过非标量值
+                    self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
+            
+            logger.info(f"✅ {phase}阶段评估指标计算完成")
 
     def print_dual_evaluation_results(self, metrics_log2: dict, metrics_raw: dict, phase: str = ""):
         """
