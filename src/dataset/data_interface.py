@@ -12,14 +12,7 @@ class DataInterface(pl.LightningDataModule):
         super().__init__()
         self.config = config
         
-        # 🆕 检测VAR-ST模式 - 修复配置访问方式
-        model_name = ''
-        if hasattr(config, 'MODEL') and hasattr(config.MODEL, 'model_name'):
-            model_name = config.MODEL.model_name
-        elif hasattr(config, 'model_name'):
-            model_name = config.model_name
-        
-        # Two-stage VAR-ST 支持所有基因数量，不强制196基因模式
+        # VAR-ST模型配置
         use_var_st_genes = getattr(config, 'use_var_st_genes', False)
         var_st_gene_count = getattr(config, 'var_st_gene_count', 196)
         
@@ -29,7 +22,7 @@ class DataInterface(pl.LightningDataModule):
         print(f"  - 数据路径: {config.data_path}")
         print(f"  - 编码器: {config.encoder_name}")
         print(f"  - 使用增强: {config.use_augmented}")
-        print(f"  - 🧬 检测到模型名称: {model_name}")
+        print(f"  - 🧬 模型: VAR_ST")
         
         if use_var_st_genes:
             print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count}")

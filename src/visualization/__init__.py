@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualization module for MFBP.
+Visualization module for VAR_ST.
 Provides comprehensive gene expression visualization capabilities.
 """
 

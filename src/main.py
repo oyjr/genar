@@ -47,24 +47,22 @@ DATASETS = {
     }
 }
 
-# 模型配置 - 只保留VAR_ST
-MODELS = {
-    'VAR_ST': {
-        'model_name': 'VAR_ST',
-        'num_genes': 200,
-        'histology_feature_dim': 1024,  # 依赖编码器
-        'spatial_coord_dim': 2,
-        # VAR Transformer 配置
-        'var_config': {
-            'vocab_size': 4096,
-            'embed_dim': 640,
-            'num_heads': 8,
-            'num_layers': 12,
-            'feedforward_dim': 2560,
-            'dropout': 0.1,
-            'max_sequence_length': 1500,
-            'condition_embed_dim': 640
-        }
+# VAR_ST 模型配置
+VAR_ST_CONFIG = {
+    'model_name': 'VAR_ST',
+    'num_genes': 200,
+    'histology_feature_dim': 1024,  # 依赖编码器
+    'spatial_coord_dim': 2,
+    # VAR Transformer 配置
+    'var_config': {
+        'vocab_size': 4096,
+        'embed_dim': 640,
+        'num_heads': 8,
+        'num_layers': 12,
+        'feedforward_dim': 2560,
+        'dropout': 0.1,
+        'max_sequence_length': 1500,
+        'condition_embed_dim': 640
     }
 }
 
@@ -137,7 +135,7 @@ DEFAULT_CONFIG = {
 
 def get_parse():
     """
-    Parse command line arguments for simplified MFBP training.
+    Parse command line arguments for VAR_ST training.
     
     Returns:
         argparse.ArgumentParser: Configured argument parser with simplified parameters
@@ -150,8 +148,8 @@ Examples:
   # Basic usage
   python src/main.py --dataset PRAD --gpus 4
   
-  # With custom parameters
-  python src/main.py --dataset PRAD --model MFBP --encoder uni \\
+  # With custom parameters  
+  python src/main.py --dataset PRAD --encoder uni \\
       --gpus 4 --epochs 200 --batch_size 256 --lr 1e-4
   
   # Single GPU training
@@ -165,8 +163,6 @@ Examples:
     # === 核心参数 ===
     parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
                         help='数据集名称 (PRAD, her2st)')
-    parser.add_argument('--model', type=str, default='VAR_ST', choices=['VAR_ST'],
-                        help='模型名称 (固定: VAR_ST)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
                         help='编码器类型 (uni, conch)，默认使用数据集推荐编码器')
     
@@ -238,13 +234,13 @@ def build_config_from_args(args):
     if args.dataset not in DATASETS:
         raise ValueError(f"不支持的数据集: {args.dataset}，支持的数据集: {list(DATASETS.keys())}")
     
-    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型={args.model}")
+    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型=VAR_ST")
     
     # 获取数据集信息
     dataset_info = DATASETS[args.dataset]
     
     # 获取模型信息
-    model_info = MODELS[args.model]
+    model_info = VAR_ST_CONFIG
     
     # 确定编码器
     encoder_name = args.encoder or dataset_info['recommended_encoder']

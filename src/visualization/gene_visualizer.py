@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Gene Expression Visualization Module for MFBP.
-Based on STEm's visualization approach but adapted for MFBP architecture.
+Gene Expression Visualization Module for VAR_ST.
+Based on STEm's visualization approach but adapted for VAR_ST architecture.
 """
 
 import os
@@ -342,7 +342,7 @@ class GeneVisualizer:
             save_name: Name for saved report file
         """
         fig, axs = plt.subplots(2, 3, figsize=(20, 12))
-        fig.suptitle('MFBP Model Performance Summary Report', fontsize=20, fontweight='bold')
+        fig.suptitle('VAR_ST Model Performance Summary Report', fontsize=20, fontweight='bold')
         
         # 1. Key Metrics Bar Chart
         metric_names = ['PCC-10', 'PCC-50', 'PCC-200', 'MSE', 'MAE', 'RVD']
@@ -393,7 +393,7 @@ class GeneVisualizer:
         axs[1, 0].set_title('Gene Performance Categories', fontsize=14, fontweight='bold')
         
         # 5. Model Comparison (placeholder for future use)
-        models = ['MFBP']
+        models = ['VAR_ST']
         pcc_10_values = [metrics.get('PCC-10', 0)]
         
         axs[1, 1].bar(models, pcc_10_values, color='blue', alpha=0.7)

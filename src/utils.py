@@ -159,18 +159,11 @@ def load_callbacks(cfg: Dict):
     # 设置默认监控指标
     model_name = getattr(cfg.MODEL, 'model_name', '')
     
-    # 根据模型类型设置监控策略
-    if model_name == 'VAR_ST':
-        default_monitor = 'val_loss'
-        default_mode = 'min'
-        checkpoint_filename = 'best-epoch={epoch:02d}-val_loss={val_loss:.4f}'
-        print(f"🔧 VAR-ST: 监控指标={default_monitor}, 模式={default_mode}")
-    else:
-        # 其他模型保持原有设置
-        default_monitor = 'val_mse'
-        default_mode = 'min'
-        checkpoint_filename = 'best-epoch={epoch:02d}-val_mse={val_mse:.4f}'
-        print(f"🔧 标准模型: 监控指标={default_monitor}, 模式={default_mode}")
+    # VAR_ST模型监控策略
+    default_monitor = 'val_loss'
+    default_mode = 'min'
+    checkpoint_filename = 'best-epoch={epoch:02d}-val_loss={val_loss:.4f}'
+    print(f"🔧 VAR-ST: 监控指标={default_monitor}, 模式={default_mode}")
     
     # 处理early stopping配置
     if 'early_stopping' in cfg.CALLBACKS:

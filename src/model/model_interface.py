@@ -47,13 +47,12 @@ class ModelInterface(pl.LightningModule):
 
         self.save_hyperparameters()
 
-        self.model_name = config.MODEL.model_name if hasattr(config.MODEL, 'model_name') else None
         self.model_config = config.MODEL
 
-        logger.debug(f"Model config: {self.model_config}")
+        logger.debug(f"VAR_ST model config: {self.model_config}")
         self.model = self.load_model()
 
-        logger.debug(f"Model: {self.model}")
+        logger.debug(f"VAR_ST model loaded: {self.model}")
 
         self.criterion = torch.nn.MSELoss()
 
@@ -113,10 +112,10 @@ class ModelInterface(pl.LightningModule):
         # 记录损失
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         
-        # 🔧 记录VAR-ST的训练指标
-        if hasattr(results_dict, 'accuracy'):
+        # 记录VAR-ST的训练指标
+        if 'accuracy' in results_dict:
             self.log('train_accuracy_step', results_dict['accuracy'], on_step=True)
-        if hasattr(results_dict, 'perplexity'):
+        if 'perplexity' in results_dict:
             self.log('train_perplexity_step', results_dict['perplexity'], on_step=True)
         
         return loss
@@ -163,17 +162,15 @@ class ModelInterface(pl.LightningModule):
             logger.info(f"   原始计数值 - 预测均值: {pred_raw_mean:.2f}, 目标均值: {target_raw_mean:.2f}")
             logger.info(f"   Log2标准化 - 预测均值: {pred_log2_mean:.3f}, 目标均值: {target_log2_mean:.3f}")
         
-        # 🔧 记录VAR-ST的验证指标
-        if hasattr(self, 'model_name') and self.model_name == 'VAR_ST':
-            # 记录VAR Transformer的专用指标
-            if 'accuracy' in results_dict:
-                self.log('val_accuracy', results_dict['accuracy'], on_epoch=True, logger=True, sync_dist=True, prog_bar=True)
-            
-            if 'perplexity' in results_dict:
-                self.log('val_perplexity', results_dict['perplexity'], on_epoch=True, logger=True, sync_dist=True, prog_bar=True)
-            
-            if 'top5_accuracy' in results_dict:
-                self.log('val_top5_accuracy', results_dict['top5_accuracy'], on_epoch=True, logger=True, sync_dist=True)
+        # 记录VAR-ST的验证指标
+        if 'accuracy' in results_dict:
+            self.log('val_accuracy', results_dict['accuracy'], on_epoch=True, logger=True, sync_dist=True, prog_bar=True)
+        
+        if 'perplexity' in results_dict:
+            self.log('val_perplexity', results_dict['perplexity'], on_epoch=True, logger=True, sync_dist=True, prog_bar=True)
+        
+        if 'top5_accuracy' in results_dict:
+            self.log('val_top5_accuracy', results_dict['top5_accuracy'], on_epoch=True, logger=True, sync_dist=True)
         
         return loss
 
@@ -285,55 +282,18 @@ class ModelInterface(pl.LightningModule):
     
 
     def _init_metrics(self):
-        # 检测模型类型
-        model_name = getattr(self.config, 'model_name', '') or getattr(self.config.MODEL, 'model_name', '') if hasattr(self.config, 'MODEL') else ''
+        # VAR_ST模型使用200个基因
+        num_genes = getattr(self.config.MODEL, 'num_genes', 200)
+        logger.info(f"VAR_ST模型使用基因数量: {num_genes}")
         
-        if model_name.upper() == 'TWO_STAGE_VAR_ST':
-            # Two-stage VAR_ST模型使用200个基因
-            num_outputs = 200
-            logger.info(f"Two-stage VAR_ST模型使用基因数量: {num_outputs}")
-        else:
-            # 其他模型从基因列表文件获取基因数量
-            if hasattr(self.config, 'data_path'):
-                gene_file = f"{self.config.data_path}processed_data/selected_gene_list.txt"
-                try:
-                    with open(gene_file, 'r') as f:
-                        genes = [line.strip() for line in f.readlines() if line.strip()]
-                    num_outputs = len(genes)
-                    logger.info(f"从基因列表文件获取基因数量: {num_outputs}")
-                except FileNotFoundError:
-                    num_outputs = 200  # 默认值
-                    logger.warning(f"无法读取基因列表文件，使用默认基因数量: {num_outputs}")
-                except Exception as e:
-                    num_outputs = 200  # 默认值
-                    logger.error(f"读取基因列表文件时出错: {e}，使用默认基因数量: {num_outputs}")
-            else:
-                num_outputs = 200  # 默认值
-                logger.warning(f"配置中无数据路径，使用默认基因数量: {num_outputs}")
-
-        # 🔧 VAR模型特殊处理：修复concordance指标的维度匹配
-        if self.config.MODEL.name == 'VARSTModel':
-            # VAR-ST输出基因表达预测，需要与基因数量匹配
-            num_genes = getattr(self.config.MODEL, 'num_genes', 196)
-            print(f"🔧 VAR模型配置concordance指标，基因数量: {num_genes}")
-            
-            # 为VAR模型创建正确的指标
-            metrics = {
-                'mse': MeanSquaredError(),
-                'mae': MeanAbsoluteError(),
-                'pearson': PearsonCorrCoef(num_outputs=num_genes),
-                'concordance': ConcordanceCorrCoef(num_outputs=num_genes),
-                'r2': R2Score(multioutput='uniform_average')
-            }
-        else:
-            # 其他模型保持原有逻辑
-            metrics = {
-                'mse': MeanSquaredError(),
-                'mae': MeanAbsoluteError(),
-                'pearson': PearsonCorrCoef(num_outputs=num_outputs),
-                'concordance': ConcordanceCorrCoef(num_outputs=num_outputs),
-                'r2': R2Score(multioutput='uniform_average')
-            }
+        # 创建VAR_ST模型的评估指标
+        metrics = {
+            'mse': MeanSquaredError(),
+            'mae': MeanAbsoluteError(),
+            'pearson': PearsonCorrCoef(num_outputs=num_genes),
+            'concordance': ConcordanceCorrCoef(num_outputs=num_genes),
+            'r2': R2Score(multioutput='uniform_average')
+        }
 
         self.train_metrics = torchmetrics.MetricCollection(metrics.copy())
         self.val_metrics = torchmetrics.MetricCollection(metrics.copy())
@@ -358,26 +318,7 @@ class ModelInterface(pl.LightningModule):
 
     def _preprocess_inputs(self, inputs):
         """
-        根据模型类型进行输入预处理
-        
-        支持的模型类型:
-        - MFBP: 使用默认预处理
-        - VAR_ST: 使用VAR-ST预处理
-        """
-        
-        # 根据模型名称选择预处理方法
-        if hasattr(self, 'model_name'):
-            if self.model_name == 'VAR_ST':
-                return self._preprocess_inputs_var_st(inputs)
-        
-        # 默认预处理（MFBP及其他模型）
-        return inputs
-
-
-
-    def _preprocess_inputs_var_st(self, inputs):
-        """
-        VAR_ST模型的输入预处理
+        VAR_ST模型输入预处理
         
         VAR-ST模型期望的参数：
         - histology_features: 组织学特征 
@@ -414,6 +355,10 @@ class ModelInterface(pl.LightningModule):
                 raise ValueError(f"不支持的target_genes维度: {target_genes.shape}")
         
         return processed
+
+
+
+
 
 
     def _log_tensor_shapes(self, tensors_dict, prefix=""):
@@ -961,39 +906,24 @@ class ModelInterface(pl.LightningModule):
         self.log('grad_norm', grad_norm)
 
     def load_model(self):
-        """加载模型类"""
+        """加载VAR_ST模型"""
         try:
-            if '_' in self.model_name:
-                camel_name = ''.join([i.capitalize() for i in self.model_name.split('_')])
-            else:
-                camel_name = self.model_name
-                
-            logger.debug(f"加载模型类：{self.model_name}")
-            logger.debug(f"转换后的名称：{camel_name}")
-            
-            # 加载VAR-ST模型
             logger.info("加载VAR-ST模型...")
             Model = getattr(importlib.import_module(
                 f'model.VAR.two_stage_var_st'), 'VARST')
                 
-            logger.debug("模型类加载成功")
+            logger.debug("VAR_ST模型类加载成功")
                 
             # 实例化模型
             model = self.instancialize(Model)
             
-            logger.debug("模型实例化成功")
+            logger.debug("VAR_ST模型实例化成功")
                 
             return model
             
         except Exception as e:
-            logger.error(f"加载模型时出错：{str(e)}")
-            # 🔧 修复：保留原始错误信息，特别是两阶段VAR-ST的配置错误
-            if "stage1_ckpt_path is required" in str(e):
-                raise ValueError(f"Two-stage VAR-ST配置错误: {str(e)}")
-            elif "training_stage" in str(e):
-                raise ValueError(f"Two-stage VAR-ST参数错误: {str(e)}")
-            else:
-                raise ValueError(f'模型加载失败: {str(e)}')
+            logger.error(f"加载VAR_ST模型时出错：{str(e)}")
+            raise ValueError(f'VAR_ST模型加载失败: {str(e)}')
 
     def instancialize(self, Model, **other_args):
         try:
@@ -1023,19 +953,9 @@ class ModelInterface(pl.LightningModule):
                 elif arg == 'config':  # 如果需要config参数，传入完整配置
                     args1[arg] = self.config
                 elif arg == 'histology_feature_dim' and 'feature_dim' in inkeys:
-                    # 🔧 为VAR_ST模型映射feature_dim到histology_feature_dim
+                    # 为VAR_ST模型映射feature_dim到histology_feature_dim
                     args1[arg] = model_config_dict['feature_dim']
                     logger.debug(f"映射参数: feature_dim ({model_config_dict['feature_dim']}) -> histology_feature_dim")
-                elif arg == 'current_stage' and 'training_stage' in inkeys:
-                    # 🔧 修复：为TWO_STAGE_VAR_ST模型映射training_stage到current_stage
-                    args1[arg] = model_config_dict['training_stage']
-                    logger.debug(f"映射参数: training_stage ({model_config_dict['training_stage']}) -> current_stage")
-                elif arg == 'current_stage' and self.model_name == 'TWO_STAGE_VAR_ST':
-                    # 🚨 关键修复：如果是两阶段模型但没有training_stage配置，必须报错
-                    raise ValueError(
-                        f"TWO_STAGE_VAR_ST模型需要training_stage参数，但配置中未找到。"
-                        f"请确保正确指定 --training_stage 1 或 --training_stage 2"
-                    )
                     
             # 添加其他参数
             args1.update(other_args)
@@ -1055,7 +975,7 @@ class ModelInterface(pl.LightningModule):
 
     def _compute_loss(self, outputs, batch):
         """
-        计算损失 - VAR_ST模型专用
+        计算VAR_ST模型损失
         
         Args:
             outputs: 模型输出
@@ -1064,44 +984,19 @@ class ModelInterface(pl.LightningModule):
         Returns:
             loss: 计算得到的损失值
         """
-        return self._compute_loss_var_st(outputs, batch)
-
-
-
-    def _compute_loss_var_st(self, outputs, batch):
-        """
-        VAR_ST模型的损失计算
-        
-        VAR_ST返回的输出包含：
-        - loss: 总损失 (已经在模型内部计算好)
-        - predictions: 预测的基因表达
-        """
         if 'loss' in outputs:
-            # 如果模型已经计算好总损失，直接使用
+            # VAR_ST模型已经在内部计算好总损失，直接使用
             total_loss = outputs['loss']
             logger.debug(f"VAR_ST总损失: {total_loss.item():.4f}")
             return total_loss
         else:
             raise ValueError("VAR_ST模型输出格式不正确，缺少损失信息")
 
-    def _compute_loss_mfbp(self, outputs, batch):
-        """原有的MFBP损失计算"""
-        logits = outputs['logits']
-        target_genes = batch['target_genes']
-        
-        # 确保维度匹配
-        if logits.dim() != target_genes.dim():
-            if logits.dim() == 3 and target_genes.dim() == 2:
-                logits = logits.squeeze(1)
-            elif logits.dim() == 2 and target_genes.dim() == 3:
-                target_genes = target_genes.squeeze(1)
-        
-        # 计算MSE损失
-        loss = self.criterion(logits, target_genes)
-        
-        logger.debug(f"MFBP基因表达预测损失: {loss.item():.4f}")
-        
-        return loss
+
+
+
+
+
 
     def calculate_gene_correlations(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
         """
@@ -1217,7 +1112,7 @@ class ModelInterface(pl.LightningModule):
         print(f"RVD: {metrics['RVD']:.4f}")
 
     def save_evaluation_results(self, metrics: dict, save_path: str, 
-                               slide_id: str = "", model_name: str = "MFBP") -> None:
+                               slide_id: str = "", model_name: str = "VAR_ST") -> None:
         """
         Save evaluation metrics to file.
         
