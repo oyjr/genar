@@ -408,8 +408,8 @@ class ModelInterface(pl.LightningModule):
                     # 🔧 优化进度条显示：只显示最重要的指标
                     show_in_prog_bar = name in ['mse', 'mae']  # 只在进度条显示MSE和MAE
                     
-                    self.log(f'{stage}_{name}', mean_value, prog_bar=show_in_prog_bar, batch_size=batch_size)
-                    self.log(f'{stage}_{name}_std', std_value, prog_bar=False, batch_size=batch_size)  # 标准差不显示在进度条
+                    self.log(f'{stage}_{name}', mean_value, prog_bar=show_in_prog_bar, batch_size=batch_size, sync_dist=True)
+                    self.log(f'{stage}_{name}_std', std_value, prog_bar=False, batch_size=batch_size, sync_dist=True)  # 标准差不显示在进度条
 
                     if name == 'pearson':
                         top_k = max(1,int(len(values)*0.3))
@@ -423,8 +423,8 @@ class ModelInterface(pl.LightningModule):
                             high_std = torch.tensor(0.0)
                         
                         # Pearson相关性指标不显示在进度条，避免过于拥挤
-                        self.log(f'{stage}_pearson_high_mean', high_mean, prog_bar=False, batch_size=batch_size)
-                        self.log(f'{stage}_pearson_high_std', high_std, prog_bar=False, batch_size=batch_size)
+                        self.log(f'{stage}_pearson_high_mean', high_mean, prog_bar=False, batch_size=batch_size, sync_dist=True)
+                        self.log(f'{stage}_pearson_high_std', high_std, prog_bar=False, batch_size=batch_size, sync_dist=True)
 
         except Exception as e:
             logger.error(f"更新指标时发生错误: {e}")
@@ -496,34 +496,16 @@ class ModelInterface(pl.LightningModule):
         
         logger.info(f"本GPU数据形状 - predictions: {predictions_log2.shape}, targets: {targets_log2.shape}")
         
-        # 🆕 在多GPU环境下，收集所有GPU的数据进行统一评估
+        # 🆕 在多GPU环境下，只在主进程进行评估和打印
         if self.trainer.world_size > 1:
-            # 将数据转换为tensor以便all_gather
-            predictions_tensor = torch.from_numpy(predictions_log2).to(self.device)
-            targets_tensor = torch.from_numpy(targets_log2).to(self.device)
-            
-            # 收集所有GPU的数据
-            all_predictions_gathered = self.all_gather(predictions_tensor)
-            all_targets_gathered = self.all_gather(targets_tensor)
-            
-            # 只在主进程进行最终评估和打印
+            # 只在主进程进行评估和打印，避免all_gather同步问题
             if self.trainer.is_global_zero:
-                # 将收集的数据重新整合
-                if all_predictions_gathered.dim() == 3:  # [num_gpus, batch_size, num_genes]
-                    all_predictions_gathered = all_predictions_gathered.view(-1, all_predictions_gathered.size(-1))
-                    all_targets_gathered = all_targets_gathered.view(-1, all_targets_gathered.size(-1))
-                
-                predictions_log2_all = all_predictions_gathered.cpu().numpy()
-                targets_log2_all = all_targets_gathered.cpu().numpy()
-                
-                logger.info(f"所有GPU数据形状 - predictions: {predictions_log2_all.shape}, targets: {targets_log2_all.shape}")
-                
-                # 计算log2标准化空间的指标
-                metrics_log2 = self.calculate_evaluation_metrics(targets_log2_all, predictions_log2_all)
+                # 计算log2标准化空间的指标（只使用主进程的数据）
+                metrics_log2 = self.calculate_evaluation_metrics(targets_log2, predictions_log2)
                 
                 # 计算原始计数空间的指标用于对比
-                predictions_raw = np.power(2, predictions_log2_all) - 1  # 反向转换
-                targets_raw = np.power(2, targets_log2_all) - 1
+                predictions_raw = np.power(2, predictions_log2) - 1  # 反向转换
+                targets_raw = np.power(2, targets_log2) - 1
                 predictions_raw = np.clip(predictions_raw, 0, None)  # 确保非负
                 targets_raw = np.clip(targets_raw, 0, None)
                 
@@ -533,7 +515,7 @@ class ModelInterface(pl.LightningModule):
                 self.print_dual_evaluation_results(metrics_log2, metrics_raw, phase)
                 
                 # 记录到wandb和日志
-                batch_size = predictions_log2_all.shape[0]  # 所有GPU的总batch大小
+                batch_size = predictions_log2.shape[0]  # 获取batch大小
                 for key, value in metrics_log2.items():
                     if key != 'correlations':  # 跳过numpy数组
                         # 确保值是标量
@@ -542,7 +524,7 @@ class ModelInterface(pl.LightningModule):
                                 value = float(value)
                             else:
                                 continue  # 跳过非标量值
-                        self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
+                        self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=False, batch_size=batch_size)
                 
                 # 记录原始计数值指标（用于对比）
                 for key, value in metrics_raw.items():
@@ -553,12 +535,13 @@ class ModelInterface(pl.LightningModule):
                                 value = float(value)
                             else:
                                 continue  # 跳过非标量值
-                        self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
+                        self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=False, batch_size=batch_size)
                 
-                logger.info(f"✅ {phase}阶段评估指标计算完成（使用所有{self.trainer.world_size}个GPU的数据）")
+                logger.info(f"✅ {phase}阶段评估指标计算完成（主进程数据）")
             else:
-                # 非主进程只记录日志
-                logger.info(f"GPU {self.trainer.global_rank}: 数据已发送给主进程进行统一评估")
+                # 非主进程跳过评估
+                logger.info(f"GPU {self.trainer.global_rank}: 跳过评估（只在主进程进行）")
+                return
         else:
             # 单GPU模式，直接计算
             # 计算log2标准化空间的指标
