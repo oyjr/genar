@@ -49,7 +49,7 @@ class DataInterface(pl.LightningDataModule):
         # 统一使用STDataset
         dataset_class = getattr(dataset, 'STDataset')
         
-        # 基础参数配置 - 🆕 添加VAR-ST基因支持
+        # 基础参数配置 - 🆕 添加VAR-ST基因支持和离散token模式
         base_params = {
             'data_path': self.config.data_path,
             'expr_name': self.config.expr_name,
@@ -60,6 +60,8 @@ class DataInterface(pl.LightningDataModule):
             'normalize': self.config.DATA.normalize,
             'use_var_st_genes': self.use_var_st_genes,  # 🆕 VAR-ST基因模式
             'var_st_gene_count': self.var_st_gene_count,  # 🆕 VAR-ST基因数量
+            'gene_count_mode': getattr(self.config, 'gene_count_mode', 'continuous'),  # 🆕 基因计数模式
+            'max_gene_count': getattr(self.config, 'max_gene_count', 4095),  # 🆕 最大基因计数
         }
         
         print(f"基础参数配置: {base_params}")

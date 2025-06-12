@@ -156,26 +156,15 @@ def load_callbacks(cfg: Dict):
     
     Mycallbacks = []
     
-    # 🔧 根据模型类型和训练阶段设置不同的监控策略
+    # 设置默认监控指标
     model_name = getattr(cfg.MODEL, 'model_name', '')
-    training_stage = getattr(cfg.MODEL, 'training_stage', 1)
     
-    # 动态设置监控指标和checkpoint命名
-    if model_name == 'TWO_STAGE_VAR_ST':
-        if training_stage == 1:
-            # Stage 1: VQVAE训练 - 监控基因重建质量
-            default_monitor = 'val_mse'
-            default_mode = 'min'
-            checkpoint_filename = 'stage1-best-epoch={epoch:02d}-val_mse={val_mse:.4f}'
-            print(f"🔧 Stage 1 (VQVAE): 监控指标={default_monitor}, 模式={default_mode}")
-        elif training_stage == 2:
-            # Stage 2: VAR训练 - 监控token预测准确率
-            default_monitor = 'val_accuracy'
-            default_mode = 'max'
-            checkpoint_filename = 'stage2-best-epoch={epoch:02d}-val_acc={val_accuracy:.4f}'
-            print(f"🔧 Stage 2 (VAR): 监控指标={default_monitor}, 模式={default_mode}")
-        else:
-            raise ValueError(f"不支持的训练阶段: {training_stage}")
+    # 根据模型类型设置监控策略
+    if model_name == 'VAR_ST':
+        default_monitor = 'val_loss'
+        default_mode = 'min'
+        checkpoint_filename = 'best-epoch={epoch:02d}-val_loss={val_loss:.4f}'
+        print(f"🔧 VAR-ST: 监控指标={default_monitor}, 模式={default_mode}")
     else:
         # 其他模型保持原有设置
         default_monitor = 'val_mse'

@@ -47,27 +47,14 @@ DATASETS = {
     }
 }
 
-# 模型配置
+# 模型配置 - 只保留VAR_ST
 MODELS = {
-    'MFBP': {
-        'model_name': 'MFBP',
-        'num_genes': 200,
-        'dropout_rate': 0.1
-    },
-    'TWO_STAGE_VAR_ST': {
-        'model_name': 'TWO_STAGE_VAR_ST',
+    'VAR_ST': {
+        'model_name': 'VAR_ST',
         'num_genes': 200,
         'histology_feature_dim': 1024,  # 依赖编码器
         'spatial_coord_dim': 2,
-        # Stage 1 VQVAE 配置 - 🔧 方案A: 参数优化
-        'vqvae_config': {
-            'vocab_size': 4096,
-            'embed_dim': 128,
-            'beta': 1.0,  # 🔧 从0.25增加到1.0，强化commitment loss
-            'hierarchical_loss_weight': 0.2,  # 🔧 从0.1增加到0.2，增强分层学习
-            'vq_loss_weight': 0.5  # 🔧 从0.25增加到0.5，强化VQ学习
-        },
-        # Stage 2 VAR Transformer 配置
+        # VAR Transformer 配置
         'var_config': {
             'vocab_size': 4096,
             'embed_dim': 640,
@@ -178,8 +165,8 @@ Examples:
     # === 核心参数 ===
     parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
                         help='数据集名称 (PRAD, her2st)')
-    parser.add_argument('--model', type=str, default='MFBP', choices=list(MODELS.keys()),
-                        help='模型名称 (默认: MFBP)')
+    parser.add_argument('--model', type=str, default='VAR_ST', choices=['VAR_ST'],
+                        help='模型名称 (固定: VAR_ST)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
                         help='编码器类型 (uni, conch)，默认使用数据集推荐编码器')
     
@@ -210,17 +197,15 @@ Examples:
     parser.add_argument('--expand-augmented', action='store_true', default=True,
                         help='展开增强数据为7倍样本 (默认: True)')
     
+    # === 🆕 基因计数参数 ===
+    parser.add_argument('--max-gene-count', type=int, default=4095,
+                        help='最大基因计数值 (默认: 4095)')
+    
     # === 其他参数 ===
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
                         help='运行模式 (默认: train)')
     parser.add_argument('--seed', type=int,
                         help='随机种子 (默认: 2021)')
-    
-    # === 两阶段VAR-ST参数 ===
-    parser.add_argument('--training_stage', type=int, choices=[1, 2], default=1,
-                        help='VAR-ST训练阶段 (1: VQVAE, 2: VAR Transformer)')
-    parser.add_argument('--stage1_ckpt', type=str,
-                        help='Stage 1 VQVAE checkpoint路径 (Stage 2训练时必需)')
     
     # === 向后兼容参数 (保留最少必要的) ===
     parser.add_argument('--config', type=str,
@@ -279,51 +264,6 @@ def build_config_from_args(args):
     config.MODEL = Dict(model_info)
     config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     
-    # 特殊处理两阶段VAR-ST模型
-    if args.model == 'TWO_STAGE_VAR_ST':
-        config.MODEL.training_stage = args.training_stage
-        config.MODEL.stage1_ckpt_path = args.stage1_ckpt
-        config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
-        
-        # 🔧 关键修复：动态设置监控指标
-        if args.training_stage == 1:
-            # Stage 1: 监控 val_mse (基因重建质量)
-            config.TRAINING.monitor = 'val_mse'
-            config.TRAINING.mode = 'min'
-            config.CALLBACKS.early_stopping.monitor = 'val_mse'
-            config.CALLBACKS.early_stopping.mode = 'min'
-            config.CALLBACKS.model_checkpoint.monitor = 'val_mse'
-            config.CALLBACKS.model_checkpoint.mode = 'min'
-            config.CALLBACKS.model_checkpoint.filename = 'stage1-best-epoch={epoch:02d}-val_mse={val_mse:.4f}'
-            print(f"   - Stage 1 监控指标: val_mse (基因重建质量)")
-        elif args.training_stage == 2:
-            # Stage 2: 监控 val_accuracy (token预测准确率)
-            config.TRAINING.monitor = 'val_accuracy'
-            config.TRAINING.mode = 'max'
-            config.CALLBACKS.early_stopping.monitor = 'val_accuracy'
-            config.CALLBACKS.early_stopping.mode = 'max'
-            config.CALLBACKS.model_checkpoint.monitor = 'val_accuracy'
-            config.CALLBACKS.model_checkpoint.mode = 'max'
-            config.CALLBACKS.model_checkpoint.filename = 'stage2-best-epoch={epoch:02d}-val_acc={val_accuracy:.4f}'
-            print(f"   - Stage 2 监控指标: val_accuracy (token预测准确率)")
-        
-        # 检查Stage 2训练的必需参数
-        if args.training_stage == 2 and not args.stage1_ckpt:
-            raise ValueError("Stage 2训练需要指定 --stage1_ckpt 参数")
-        
-        print(f"   - 两阶段训练: Stage {args.training_stage}")
-        if args.stage1_ckpt:
-            print(f"   - Stage 1 Checkpoint: {args.stage1_ckpt}")
-    else:
-        # 🔧 其他模型也使用 val_mse 而不是 val_loss
-        config.TRAINING.monitor = 'val_mse'
-        config.TRAINING.mode = 'min'
-        config.CALLBACKS.early_stopping.monitor = 'val_mse'
-        config.CALLBACKS.early_stopping.mode = 'min'
-        config.CALLBACKS.model_checkpoint.monitor = 'val_mse'
-        config.CALLBACKS.model_checkpoint.mode = 'min'
-        print(f"   - 标准模型监控指标: val_mse")
-    
     # 更新训练参数
     if args.epochs:
         config.TRAINING.num_epochs = args.epochs
@@ -359,6 +299,8 @@ def build_config_from_args(args):
     config.encoder_name = encoder_name
     config.use_augmented = getattr(args, 'use_augmented', True)
     config.expand_augmented = getattr(args, 'expand_augmented', True)
+    config.gene_count_mode = 'discrete_tokens'  # 固定为离散token模式
+    config.max_gene_count = getattr(args, 'max_gene_count', 4095)
     
     # 设置多GPU参数
     config.devices = devices
@@ -373,6 +315,22 @@ def build_config_from_args(args):
     lr_patience = config.TRAINING.lr_scheduler.patience
     early_patience = config.CALLBACKS.early_stopping.patience
     patience_status = "禁用" if lr_patience == 0 else f"启用 (LR调度器: {lr_patience}, 早停: {early_patience})"
+    
+    # VAR-ST模型配置
+    config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
+    config.MODEL.gene_count_mode = config.gene_count_mode
+    config.MODEL.max_gene_count = config.max_gene_count
+    # VAR-ST使用val_loss作为监控指标
+    config.TRAINING.monitor = 'val_loss'
+    config.TRAINING.mode = 'min'
+    config.CALLBACKS.early_stopping.monitor = 'val_loss'
+    config.CALLBACKS.early_stopping.mode = 'min'
+    config.CALLBACKS.model_checkpoint.monitor = 'val_loss'
+    config.CALLBACKS.model_checkpoint.mode = 'min'
+    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-val_loss={val_loss:.4f}'
+    print(f"   - VAR-ST监控指标: val_loss")
+    print(f"   - 基因计数模式: discrete_tokens")
+    print(f"   - 最大基因计数: {config.max_gene_count}")
     
     print(f"✅ 配置构建完成:")
     print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")

@@ -1,19 +1,17 @@
 """
-基因VAR Transformer模块 - Stage 2训练
+基因VAR Transformer模块
 
 实现基于VAR架构的条件基因表达生成模型。
 
 核心特性：
 1. 条件处理器：处理组织学特征和空间坐标
 2. VAR Transformer：自回归生成基因tokens
-3. 两阶段训练：Stage 2冻结VQVAE，只训练Transformer
-4. Next Token Prediction：标准的自回归语言模型训练
+3. Next Token Prediction：标准的自回归语言模型训练
 
 架构流程：
 1. 条件信息：组织学特征[1024] + 空间坐标[2] → 条件嵌入[640]
-2. Token序列：基因tokens[B, 1446] (来自冻结的VQVAE编码)
-3. VAR生成：条件嵌入 + 历史tokens → 下一个token预测
-4. 损失计算：交叉熵损失 (next token prediction)
+2. VAR生成：条件嵌入 + 历史tokens → 下一个token预测
+3. 损失计算：交叉熵损失 (next token prediction)
 """
 
 import torch
@@ -23,9 +21,6 @@ from typing import Dict, Tuple, Optional, Any, List
 import math
 import os
 from tqdm import tqdm
-
-from .shared_components import SharedVectorQuantizer
-from .multi_scale_gene_vqvae import MultiScaleGeneVQVAE
 
 
 class ConditionProcessor(nn.Module):
@@ -160,7 +155,7 @@ class PositionalEncoding(nn.Module):
 
 class GeneVARTransformer(nn.Module):
     """
-    基因VAR Transformer - Stage 2的核心模型
+    基因VAR Transformer
     
     架构：
     1. Token嵌入：将基因tokens转换为嵌入向量
@@ -201,38 +196,37 @@ class GeneVARTransformer(nn.Module):
         else:
             self.condition_projection = nn.Identity()
         
-        # Transformer解码器层
-        decoder_layer = nn.TransformerDecoderLayer(
+        # Transformer编码器
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=feedforward_dim,
             dropout=dropout,
-            activation='relu',
-            batch_first=False  # 使用(seq_len, batch, embed_dim)格式
+            activation='gelu',
+            batch_first=True
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         
         # 输出投影层
         self.output_projection = nn.Linear(embed_dim, vocab_size)
         
-        # 初始化参数
+        # 初始化权重
         self._init_weights()
     
     def _init_weights(self):
-        """初始化权重"""
+        """初始化模型权重"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.normal_(module.weight, std=0.02)
                 if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                nn.init.normal_(module.weight, std=0.02)
     
     def create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """创建因果注意力掩码"""
+        """创建因果注意力遮罩"""
         mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
-        mask = mask.masked_fill(mask == 1, float('-inf'))
-        return mask
+        return mask.bool()
     
     def forward(
         self,
@@ -240,374 +234,138 @@ class GeneVARTransformer(nn.Module):
         condition_embed: torch.Tensor,   # [B, condition_embed_dim]
         target_tokens: Optional[torch.Tensor] = None  # [B, seq_len] for training
     ) -> Dict[str, torch.Tensor]:
-        """
-        前向传播
         
-        Args:
-            input_tokens: 输入token序列 [B, seq_len]
-            condition_embed: 条件嵌入 [B, condition_embed_dim] 
-            target_tokens: 目标token序列 [B, seq_len] (训练时使用)
-            
-        Returns:
-            包含logits和loss的字典
-        """
-        B, seq_len = input_tokens.shape
+        batch_size, seq_len = input_tokens.shape
         device = input_tokens.device
         
         # Token嵌入
         token_embeds = self.token_embedding(input_tokens)  # [B, seq_len, embed_dim]
-        token_embeds = token_embeds.transpose(0, 1)        # [seq_len, B, embed_dim]
         
-        # 位置编码
-        token_embeds = self.positional_encoding(token_embeds)  # [seq_len, B, embed_dim]
+        # 位置编码 (转换为batch_first格式)
+        token_embeds = token_embeds.transpose(0, 1)  # [seq_len, B, embed_dim]
+        token_embeds = self.positional_encoding(token_embeds)
+        token_embeds = token_embeds.transpose(0, 1)  # [B, seq_len, embed_dim]
         
-        # 处理条件信息
-        condition_proj = self.condition_projection(condition_embed)  # [B, embed_dim]
-        # 扩展条件为记忆序列，用作Transformer的memory
-        memory = condition_proj.unsqueeze(0)  # [1, B, embed_dim]
+        # 条件投影和融合
+        condition_embed = self.condition_projection(condition_embed)  # [B, embed_dim]
+        condition_broadcast = condition_embed.unsqueeze(1).expand(-1, seq_len, -1)  # [B, seq_len, embed_dim]
         
-        # 创建因果掩码
-        tgt_mask = self.create_causal_mask(seq_len, device)  # [seq_len, seq_len]
+        # 融合token嵌入和条件信息
+        fused_embeds = token_embeds + condition_broadcast  # [B, seq_len, embed_dim]
         
-        # Transformer解码
-        transformer_output = self.transformer_decoder(
-            tgt=token_embeds,           # [seq_len, B, embed_dim]
-            memory=memory,              # [1, B, embed_dim]
-            tgt_mask=tgt_mask          # [seq_len, seq_len]
-        )  # [seq_len, B, embed_dim]
+        # 创建因果遮罩
+        causal_mask = self.create_causal_mask(seq_len, device)
+        
+        # Transformer处理
+        transformer_output = self.transformer(
+            fused_embeds, 
+            mask=causal_mask
+        )  # [B, seq_len, embed_dim]
         
         # 输出投影
-        logits = self.output_projection(transformer_output)  # [seq_len, B, vocab_size]
-        logits = logits.transpose(0, 1)  # [B, seq_len, vocab_size]
+        logits = self.output_projection(transformer_output)  # [B, seq_len, vocab_size]
         
-        result = {'logits': logits}
+        results = {
+            'logits': logits,
+            'token_embeds': token_embeds,
+            'condition_embed': condition_embed
+        }
         
         # 如果提供了目标tokens，计算损失和指标
         if target_tokens is not None:
-            # 计算交叉熵损失 (next token prediction)
-            # 输入: input_tokens[:-1], 目标: target_tokens[1:]
-            shift_logits = logits[:, :-1, :].contiguous()  # [B, seq_len-1, vocab_size]
-            shift_labels = target_tokens[:, 1:].contiguous()  # [B, seq_len-1]
-            
-            # 🔧 Stage 2只使用交叉熵损失，移除其他损失组件
+            # 计算交叉熵损失
             loss = F.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-1,  # 忽略padding tokens
-                reduction='mean'
+                logits.view(-1, self.vocab_size), 
+                target_tokens.view(-1),
+                ignore_index=-1
             )
             
-            result['loss'] = loss
+            # 计算准确率
+            predictions = logits.argmax(dim=-1)
+            accuracy = (predictions == target_tokens).float().mean()
             
-            # 计算准确率和困惑度
-            with torch.no_grad():
-                # Token预测准确率
-                predictions = torch.argmax(shift_logits, dim=-1)
-                valid_mask = (shift_labels != -1)  # 忽略padding
-                accuracy = (predictions == shift_labels)[valid_mask].float().mean()
-                result['accuracy'] = accuracy
-                
-                # 🔧 困惑度计算：perplexity = exp(loss)
-                # 困惑度衡量模型预测的不确定性，越低越好
-                perplexity = torch.exp(loss)
-                result['perplexity'] = perplexity
-                
-                # 🔧 额外指标：top-5准确率
-                top5_predictions = torch.topk(shift_logits, k=5, dim=-1)[1]  # [B, seq_len-1, 5]
-                shift_labels_expanded = shift_labels.unsqueeze(-1).expand_as(top5_predictions)
-                top5_accuracy = (top5_predictions == shift_labels_expanded).any(dim=-1)[valid_mask].float().mean()
-                result['top5_accuracy'] = top5_accuracy
+            # 计算困惑度
+            perplexity = torch.exp(loss)
+            
+            # 计算top-5准确率
+            top5_predictions = logits.topk(5, dim=-1)[1]  # [B, seq_len, 5]
+            top5_accuracy = (top5_predictions == target_tokens.unsqueeze(-1)).any(dim=-1).float().mean()
+            
+            results.update({
+                'loss': loss,
+                'accuracy': accuracy,
+                'perplexity': perplexity,
+                'top5_accuracy': top5_accuracy,
+                'predictions': predictions,
+                'target_tokens': target_tokens
+            })
         
-        return result
+        return results
     
     @torch.no_grad()
     def generate(
         self,
         condition_embed: torch.Tensor,   # [B, condition_embed_dim]
-        max_length: int = 1446,
+        max_length: int = 200,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None
     ) -> torch.Tensor:                   # [B, max_length]
         """
-        自回归生成基因tokens
+        自回归生成token序列
         
         Args:
             condition_embed: 条件嵌入 [B, condition_embed_dim]
-            max_length: 最大生成长度
+            max_length: 生成的最大长度
             temperature: 采样温度
-            top_k: top-k采样
-            top_p: nucleus采样
+            top_k: Top-k采样
+            top_p: Top-p采样
             
         Returns:
             生成的token序列 [B, max_length]
         """
-        B = condition_embed.shape[0]
+        batch_size = condition_embed.size(0)
         device = condition_embed.device
         
-        # 初始化序列 (使用特殊的开始token，这里用0)
-        generated = torch.zeros(B, 1, dtype=torch.long, device=device)
+        # 初始化序列 (使用0作为起始token)
+        generated = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         
-        for step in range(max_length - 1):
+        for _ in range(max_length - 1):
             # 前向传播
             outputs = self.forward(generated, condition_embed)
-            logits = outputs['logits']  # [B, current_length, vocab_size]
+            logits = outputs['logits']  # [B, current_len, vocab_size]
             
             # 获取最后一个位置的logits
             next_token_logits = logits[:, -1, :] / temperature  # [B, vocab_size]
             
-            # 应用top-k采样
+            # Top-k filtering
             if top_k is not None:
-                values, indices = torch.topk(next_token_logits, top_k)
-                next_token_logits = torch.full_like(next_token_logits, float('-inf'))
-                next_token_logits.scatter_(1, indices, values)
+                top_k = min(top_k, logits.size(-1))
+                top_k_logits, _ = torch.topk(next_token_logits, top_k)
+                min_top_k = top_k_logits[:, -1:].expand_as(next_token_logits)
+                next_token_logits = torch.where(
+                    next_token_logits < min_top_k,
+                    torch.full_like(next_token_logits, float('-inf')),
+                    next_token_logits
+                )
             
-            # 应用nucleus (top-p)采样
+            # Top-p filtering
             if top_p is not None:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 
-                # 移除累积概率超过top_p的tokens
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
                 
-                for i in range(B):
-                    indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
-                    next_token_logits[i][indices_to_remove] = float('-inf')
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_token_logits = next_token_logits.masked_fill(indices_to_remove, float('-inf'))
             
             # 采样下一个token
             probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, 1)  # [B, 1]
+            next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
             
-            # 添加到序列中
+            # 拼接到生成序列
             generated = torch.cat([generated, next_token], dim=1)
         
         return generated
-
-
-class Stage2Trainer:
-    """
-    Stage 2训练器 - 训练基因VAR Transformer
-    
-    功能：
-    1. 冻结Stage 1的VQVAE模型
-    2. 训练VAR Transformer进行条件生成
-    3. 管理训练循环和验证
-    4. 保存和加载checkpoint
-    """
-    
-    def __init__(
-        self,
-        vqvae_model: MultiScaleGeneVQVAE,
-        var_transformer: GeneVARTransformer,
-        condition_processor: ConditionProcessor,
-        device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        learning_rate: float = 1e-4,
-        weight_decay: float = 1e-4,
-        print_freq: int = 100
-    ):
-        self.device = device
-        self.print_freq = print_freq
-        
-        # 模型组件
-        self.vqvae_model = vqvae_model.to(device)
-        self.var_transformer = var_transformer.to(device)
-        self.condition_processor = condition_processor.to(device)
-        
-        # 冻结VQVAE参数
-        for param in self.vqvae_model.parameters():
-            param.requires_grad = False
-        self.vqvae_model.eval()
-        
-        # 优化器 (只优化VAR Transformer和条件处理器)
-        trainable_params = list(self.var_transformer.parameters()) + list(self.condition_processor.parameters())
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
-        
-        # 训练统计
-        self.epoch_losses = []
-        self.epoch_accuracies = []
-    
-    def train_epoch(self, dataloader, epoch: int) -> Dict[str, float]:
-        """
-        训练一个epoch
-        
-        Args:
-            dataloader: 数据加载器 (包含基因表达、组织学特征、空间坐标)
-            epoch: 当前epoch
-            
-        Returns:
-            平均损失和准确率
-        """
-        self.var_transformer.train()
-        self.condition_processor.train()
-        
-        epoch_loss = 0.0
-        epoch_accuracy = 0.0
-        num_batches = len(dataloader)
-        
-        for batch_idx, batch in enumerate(dataloader):
-            # 严格验证数据格式
-            if isinstance(batch, (list, tuple)):
-                if len(batch) < 3:
-                    raise ValueError(f"Batch must contain [gene_expressions, histology_features, spatial_coords], "
-                                   f"but got {len(batch)} elements")
-                gene_expressions = batch[0]
-                histology_features = batch[1]
-                spatial_coords = batch[2]
-            else:
-                raise ValueError("Batch must be a tuple/list containing [gene_expressions, histology_features, spatial_coords]. "
-                               "Single tensor batches are not supported for Stage 2 training.")
-            
-            # 移动到设备
-            gene_expressions = gene_expressions.to(self.device)
-            histology_features = histology_features.to(self.device)
-            spatial_coords = spatial_coords.to(self.device)
-            
-            # 使用冻结的VQVAE编码基因表达为tokens
-            with torch.no_grad():
-                vqvae_result = self.vqvae_model(gene_expressions)
-                tokens = vqvae_result['tokens']  # Dict of tokens for each scale
-                
-                # 将多尺度tokens展平为序列
-                token_sequence = []
-                for scale in ['global', 'pathway', 'module', 'individual']:
-                    scale_tokens = tokens[scale].view(tokens[scale].shape[0], -1)  # [B, num_tokens]
-                    token_sequence.append(scale_tokens)
-                
-                full_token_sequence = torch.cat(token_sequence, dim=1)  # [B, total_seq_len]
-            
-            # 处理条件信息
-            condition_embed = self.condition_processor(histology_features, spatial_coords)
-            
-            # 准备输入和目标 (teacher forcing)
-            input_tokens = full_token_sequence  # [B, seq_len]
-            target_tokens = full_token_sequence  # [B, seq_len] (same for autoregressive training)
-            
-            # 前向传播
-            self.optimizer.zero_grad()
-            outputs = self.var_transformer(input_tokens, condition_embed, target_tokens)
-            
-            loss = outputs['loss']
-            accuracy = outputs['accuracy']
-            
-            # 反向传播
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.var_transformer.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(self.condition_processor.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            # 累积统计
-            epoch_loss += loss.item()
-            epoch_accuracy += accuracy.item()
-            
-            # 打印进度
-            if batch_idx % self.print_freq == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}/{num_batches}: "
-                      f"Loss={loss.item():.4f}, Accuracy={accuracy.item():.4f}")
-        
-        # 计算平均值
-        avg_loss = epoch_loss / num_batches
-        avg_accuracy = epoch_accuracy / num_batches
-        
-        # 保存统计
-        self.epoch_losses.append(avg_loss)
-        self.epoch_accuracies.append(avg_accuracy)
-        
-        return {'loss': avg_loss, 'accuracy': avg_accuracy}
-    
-    @torch.no_grad()
-    def validate_epoch(self, dataloader, epoch: int) -> Dict[str, float]:
-        """
-        验证一个epoch
-        
-        Args:
-            dataloader: 验证数据加载器
-            epoch: 当前epoch
-            
-        Returns:
-            验证损失和准确率
-        """
-        self.var_transformer.eval()
-        self.condition_processor.eval()
-        
-        val_loss = 0.0
-        val_accuracy = 0.0
-        num_batches = len(dataloader)
-        
-        for batch in dataloader:
-            # 严格验证数据格式 (与训练相同)
-            if isinstance(batch, (list, tuple)):
-                if len(batch) < 3:
-                    raise ValueError(f"Validation batch must contain [gene_expressions, histology_features, spatial_coords], "
-                                   f"but got {len(batch)} elements")
-                gene_expressions = batch[0]
-                histology_features = batch[1]
-                spatial_coords = batch[2]
-            else:
-                raise ValueError("Validation batch must be a tuple/list containing [gene_expressions, histology_features, spatial_coords]. "
-                               "Single tensor batches are not supported for Stage 2 validation.")
-            
-            gene_expressions = gene_expressions.to(self.device)
-            histology_features = histology_features.to(self.device)
-            spatial_coords = spatial_coords.to(self.device)
-            
-            # 编码基因tokens
-            vqvae_result = self.vqvae_model(gene_expressions)
-            tokens = vqvae_result['tokens']
-            
-            token_sequence = []
-            for scale in ['global', 'pathway', 'module', 'individual']:
-                scale_tokens = tokens[scale].view(tokens[scale].shape[0], -1)
-                token_sequence.append(scale_tokens)
-            
-            full_token_sequence = torch.cat(token_sequence, dim=1)
-            
-            # 处理条件
-            condition_embed = self.condition_processor(histology_features, spatial_coords)
-            
-            # 前向传播
-            outputs = self.var_transformer(full_token_sequence, condition_embed, full_token_sequence)
-            
-            val_loss += outputs['loss'].item()
-            val_accuracy += outputs['accuracy'].item()
-        
-        avg_val_loss = val_loss / num_batches
-        avg_val_accuracy = val_accuracy / num_batches
-        
-        return {'loss': avg_val_loss, 'accuracy': avg_val_accuracy}
-    
-    def save_checkpoint(self, filepath: str, epoch: int, metadata: Optional[Dict] = None):
-        """保存Stage 2 checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'var_transformer_state_dict': self.var_transformer.state_dict(),
-            'condition_processor_state_dict': self.condition_processor.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epoch_losses': self.epoch_losses,
-            'epoch_accuracies': self.epoch_accuracies,
-            'metadata': metadata or {}
-        }
-        torch.save(checkpoint, filepath)
-        print(f"Stage 2 checkpoint保存至: {filepath}")
-    
-    def load_checkpoint(self, filepath: str) -> Dict:
-        """加载Stage 2 checkpoint - 严格验证"""
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
-        # 严格验证checkpoint完整性
-        required_keys = ['var_transformer_state_dict', 'condition_processor_state_dict', 
-                        'optimizer_state_dict', 'epoch', 'epoch_losses', 'epoch_accuracies']
-        
-        for key in required_keys:
-            if key not in checkpoint:
-                raise KeyError(f"Missing required key in Stage 2 checkpoint: {key}")
-        
-        self.var_transformer.load_state_dict(checkpoint['var_transformer_state_dict'])
-        self.condition_processor.load_state_dict(checkpoint['condition_processor_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.epoch_losses = checkpoint['epoch_losses']
-        self.epoch_accuracies = checkpoint['epoch_accuracies']
-        
-        print(f"Stage 2 checkpoint加载: {filepath}, epoch: {checkpoint['epoch']}")
-        return checkpoint

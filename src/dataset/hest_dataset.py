@@ -23,7 +23,9 @@ class STDataset(Dataset):
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
                  normalize: bool = True,       # 数据归一化 (STEm方式: log2(+1))
                  use_var_st_genes: bool = False,  # 🆕 是否使用VAR-ST的196基因模式
-                 var_st_gene_count: int = 196):   # 🆕 VAR-ST模式的基因数量
+                 var_st_gene_count: int = 196,   # 🆕 VAR-ST模式的基因数量
+                 gene_count_mode: str = 'discrete_tokens',  # 🆕 基因计数模式（固定为离散）
+                 max_gene_count: int = 4095):   # 🆕 最大基因计数值
         """
         空间转录组学数据集
         
@@ -43,6 +45,8 @@ class STDataset(Dataset):
                 - True: 使用前196个基因 (适合VAR模型的14x14空间排列)
                 - False: 使用数据集原生的基因列表 (如PRAD的200基因)
             var_st_gene_count: 🆕 VAR-ST模式使用的基因数量 (默认196 = 14x14)
+            gene_count_mode: 🆕 基因计数处理模式（固定为discrete_tokens）
+            max_gene_count: 🆕 最大基因计数值（用于截断）
         """
         super(STDataset, self).__init__()
         
@@ -52,6 +56,9 @@ class STDataset(Dataset):
         
         if encoder_name not in ['uni', 'conch']:
             raise ValueError(f"encoder_name must be one of ['uni', 'conch'], but got {encoder_name}")
+        
+        # 固定使用离散token模式
+        gene_count_mode = 'discrete_tokens'
         
         # expand_augmented只在use_augmented=True且mode='train'时有效
         if expand_augmented and not use_augmented:
@@ -70,7 +77,12 @@ class STDataset(Dataset):
         self.expand_augmented = expand_augmented
         self.use_var_st_genes = use_var_st_genes  # 🆕 VAR-ST基因模式
         self.var_st_gene_count = var_st_gene_count  # 🆕 VAR-ST基因数量
-        self.norm_param = {'normalize': normalize}
+        self.gene_count_mode = gene_count_mode  # 🆕 基因计数模式（固定为离散）
+        self.max_gene_count = max_gene_count  # 🆕 最大基因计数
+        
+        # 离散模式不归一化
+        self.norm_param = {'normalize': False}
+        print(f"🔢 使用离散token模式: 基因计数范围 [0, {max_gene_count}]")
         
         # 构建路径
         self.st_dir = f"{data_path}st"
@@ -88,6 +100,7 @@ class STDataset(Dataset):
         print(f"  - 编码器: {encoder_name}")
         print(f"  - 使用增强: {use_augmented}")
         print(f"  - 🆕 VAR-ST基因模式: {use_var_st_genes}")
+        print(f"  - 🔢 基因计数模式: {gene_count_mode}")
         
         if self.use_var_st_genes:
             print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count} (前{var_st_gene_count}个基因)")
@@ -509,7 +522,7 @@ class STDataset(Dataset):
             
             return {
                 'img': torch.FloatTensor(features),  # [feature_dim]
-                'target_genes': torch.FloatTensor(expression),  # [num_genes]
+                'target_genes': self._process_gene_expression(expression),  # [num_genes]
                 'positions': torch.FloatTensor(positions),  # [2]
                 'slide_id': slide_id,
                 'spot_idx': sample_idx,
@@ -534,7 +547,7 @@ class STDataset(Dataset):
             
             return {
                 'img': features,  # [feature_dim]
-                'target_genes': torch.FloatTensor(expression),  # [num_genes]
+                'target_genes': self._process_gene_expression(expression),  # [num_genes]
                 'positions': torch.FloatTensor(positions),  # [2]
                 'slide_id': slide_id,
                 'spot_idx': sample_idx
@@ -579,7 +592,7 @@ class STDataset(Dataset):
         
         return {
             'img': torch.FloatTensor(features),  # [feature_dim] - 单个spot
-            'target_genes': torch.FloatTensor(expression),  # [num_genes] - 单个spot
+            'target_genes': self._process_gene_expression(expression),  # [num_genes] - 单个spot
             'positions': torch.FloatTensor(positions),  # [2] - 单个spot
             'slide_id': slide_id,
             'spot_idx': sample_idx
@@ -605,7 +618,7 @@ class STDataset(Dataset):
         
         return {
             'img': features,  # [num_spots, feature_dim]
-            'target_genes': torch.FloatTensor(expression),  # [num_spots, num_genes]
+            'target_genes': self._process_gene_expression(expression),  # [num_spots, num_genes]
             'positions': torch.FloatTensor(positions),  # [num_spots, 2]
             'slide_id': slide_id,
             'num_spots': adata.n_obs
@@ -644,7 +657,7 @@ class STDataset(Dataset):
         
         return {
             'img': torch.FloatTensor(features),  # [num_spots, feature_dim]
-            'target_genes': torch.FloatTensor(expression),  # [num_spots, num_genes]
+            'target_genes': self._process_gene_expression(expression),  # [num_spots, num_genes]
             'positions': torch.FloatTensor(positions),  # [num_spots, 2]
             'slide_id': slide_id,
             'num_spots': adata.n_obs,
@@ -653,13 +666,25 @@ class STDataset(Dataset):
 
     def get_test_slide_ids(self) -> List[str]:
         """
-        获取测试模式的所有slide ID列表
-        
-        Returns:
-            测试slide的ID列表
+        获取测试集的slide ID列表
         """
         if self.mode == 'test':
             return self.ids
         else:
-            return []
+            return self.slide_splits['test']
+
+    def _process_gene_expression(self, gene_expr: np.ndarray) -> torch.Tensor:
+        """
+        处理基因表达数据为离散token
+        
+        Args:
+            gene_expr: 原始基因表达数组 [num_genes]
+            
+        Returns:
+            处理后的基因表达tensor (long)
+        """
+        # 离散token模式：将基因计数值转换为long tensor并截断
+        gene_expr = np.round(gene_expr).astype(np.int64)  # 确保是整数
+        gene_tokens = torch.clamp(torch.from_numpy(gene_expr).long(), 0, self.max_gene_count)
+        return gene_tokens
 
