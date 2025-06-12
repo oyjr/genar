@@ -254,7 +254,7 @@ def build_config_from_args(args):
     config = Dict(DEFAULT_CONFIG)
     
     # 更新日志路径为数据集名称和模型名称
-    config.GENERAL.log_path = f'./logs/{args.dataset}/{args.model}'
+    config.GENERAL.log_path = f'./logs/{args.dataset}/VAR_ST'
     
     # 更新模型配置
     config.MODEL = Dict(model_info)
@@ -330,7 +330,7 @@ def build_config_from_args(args):
     
     print(f"✅ 配置构建完成:")
     print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
-    print(f"   - 模型: {args.model}")
+    print(f"   - 模型: VAR_ST")
     print(f"   - 编码器: {encoder_name} (特征维度: {ENCODER_FEATURE_DIMS[encoder_name]})")
     print(f"   - GPU: {devices}个 (策略: {strategy})")
     print(f"   - 训练轮数: {config.TRAINING.num_epochs}")
