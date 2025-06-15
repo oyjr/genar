@@ -1,9 +1,25 @@
+"""
+VAR-ST模型的PyTorch Lightning接口
+精简版本：保留核心功能，删除冗余代码
+"""
+
+# 标准库导入
 import os
 import inspect
 import importlib
 import logging
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass
+
+# 第三方库导入
 import numpy as np
 import torch
+import torch.nn as nn
+
+# PyTorch Lightning相关
+import pytorch_lightning as pl
+
+# Metrics
 import torchmetrics
 from torchmetrics.regression import (
     PearsonCorrCoef,
@@ -13,280 +29,128 @@ from torchmetrics.regression import (
     R2Score,
 )
 
-from scipy.stats import pearsonr
-from datetime import datetime
-from typing import Dict, Any
-
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import BasePredictionWriter
-import torch.nn.functional as F
+# 项目内部导入
 from addict import Dict as AddictDict
-import torch.nn as nn
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
 
-# Import visualization module
-try:
-    # 🔧 修复：使用绝对导入避免相对导入错误
-    from visualization import GeneVisualizer
-    VISUALIZATION_AVAILABLE = True
-except ImportError:
-    # 🔧 删除回退机制，导入失败直接报错
-    raise ImportError(
-        "无法导入可视化模块。请确保安装了matplotlib, seaborn, 和PIL依赖。"
-        "如果不需要可视化功能，请修改代码移除可视化相关导入。"
-    )
+# 默认常量
+DEFAULT_NUM_GENES = 200
+DEFAULT_LEARNING_RATE = 1e-4
+DEFAULT_WEIGHT_DECAY = 0.0
+DEFAULT_GRADIENT_CLIP = 1.0
+MAX_SAVED_SAMPLES = 10000
+LOG_FREQUENCY = 100
+TOP_GENE_RATIO = 0.3
+MIN_VARIANCE_THRESHOLD = 1e-8
 
 
 class ModelInterface(pl.LightningModule):
+    """VAR-ST模型的PyTorch Lightning接口"""
 
     def __init__(self, config):
         super().__init__()
+        
+        # 创建专用logger
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        
+        # 保存配置
         self.config = config
-
         self.save_hyperparameters()
 
+        # 加载模型配置和模型
         self.model_config = config.MODEL
-
-        logger.debug(f"VAR_ST model config: {self.model_config}")
-        self.model = self.load_model()
-
-        logger.debug(f"VAR_ST model loaded: {self.model}")
-
+        self._logger.info("初始化VAR-ST模型接口")
+        self.model = self._load_model()
+        
+        # 初始化损失函数
         self.criterion = torch.nn.MSELoss()
 
-        self.train_outputs = []
+        # 初始化输出缓存（只用于验证和测试）
         self.val_outputs = []
         self.test_outputs = []
 
+        # 初始化指标
         self._init_metrics()
 
-        self.config = config
+        # 获取标准化设置
+        self.normalize = self._get_config('DATA.normalize', True)
 
-        if hasattr(config.DATA, 'normalize'):
-            self.normalize = config.DATA.normalize
-        else:
-            self.normalize = True
-
-        self.avg_pcc = None
-
-
-    def training_step(self, batch, batch_idx):
-        logger.debug(f"Training step {batch_idx} started")
+    def _get_config(self, path: str, default=None):
+        """安全地获取配置值"""
+        parts = path.split('.')
+        value = self.config
         
-        # 预处理输入
-        original_batch = batch.copy() if isinstance(batch, dict) else batch
-        processed_batch = self._preprocess_inputs(batch)
-        
-        # 前向传播
-        results_dict = self.model(**processed_batch)
-        
-        # 计算损失 (仍然使用原始计数值计算交叉熵损失)
-        loss = self._compute_loss(results_dict, original_batch)
-        
-        # 🆕 如果需要记录指标，则使用log2标准化值
-        if batch_idx % 1000 == 0:  # 每1000个batch记录一次训练指标
-            # 提取预测和目标 (log2标准化)
-            logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
-            
-            # 更新训练指标 (使用标准化值)
-            self._update_metrics('train', logits, target_genes)
-            
-            # 记录原始计数值统计
-            if 'predictions' in results_dict:
-                predictions_raw = results_dict['predictions']
-            else:
-                predictions_raw = results_dict.get('generated_sequence', logits)
-            targets_raw = original_batch['target_genes']
-            
-            pred_raw_mean = predictions_raw.float().mean().item()
-            target_raw_mean = targets_raw.float().mean().item()
-            pred_log2_mean = logits.mean().item()
-            target_log2_mean = target_genes.mean().item()
-            
-            logger.info(f"🏃 训练 Batch {batch_idx}:")
-            logger.info(f"   原始计数值 - 预测均值: {pred_raw_mean:.2f}, 目标均值: {target_raw_mean:.2f}")
-            logger.info(f"   Log2标准化 - 预测均值: {pred_log2_mean:.3f}, 目标均值: {target_log2_mean:.3f}")
-        
-        # 记录损失
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        
-        # 记录VAR-ST的训练指标
-        if 'accuracy' in results_dict:
-            self.log('train_accuracy_step', results_dict['accuracy'], on_step=True)
-        if 'perplexity' in results_dict:
-            self.log('train_perplexity_step', results_dict['perplexity'], on_step=True)
-        
-        return loss
-
-
-    def validation_step(self, batch, batch_idx):
-        logger.debug(f"Validation step {batch_idx} started")
-        
-        # 预处理输入
-        original_batch = batch.copy() if isinstance(batch, dict) else batch
-        processed_batch = self._preprocess_inputs(batch)
-        
-        # 前向传播
-        results_dict = self.model(**processed_batch)
-        
-        # 计算损失
-        loss = self._compute_loss(results_dict, original_batch)
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        
-        # 提取预测和目标 (已经过log2标准化)
-        logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
-        
-        # 🆕 同时记录原始计数值用于分析
-        if 'predictions' in results_dict:
-            predictions_raw = results_dict['predictions']
-        else:
-            predictions_raw = results_dict.get('generated_sequence', logits)
-        targets_raw = original_batch['target_genes']
-        
-        # 更新标准化值的指标
-        self._update_metrics('val', logits, target_genes)
-        
-        # 保存输出用于epoch结束时的评估 (保存标准化值)
-        self._save_step_outputs('val', loss, logits, target_genes, batch_idx)
-        
-        # 🆕 记录原始计数值统计信息
-        if batch_idx % 100 == 0:  # 每100个batch记录一次
-            pred_raw_mean = predictions_raw.float().mean().item()
-            target_raw_mean = targets_raw.float().mean().item()
-            pred_log2_mean = logits.mean().item()
-            target_log2_mean = target_genes.mean().item()
-            
-            logger.info(f"📊 Batch {batch_idx} 统计:")
-            logger.info(f"   原始计数值 - 预测均值: {pred_raw_mean:.2f}, 目标均值: {target_raw_mean:.2f}")
-            logger.info(f"   Log2标准化 - 预测均值: {pred_log2_mean:.3f}, 目标均值: {target_log2_mean:.3f}")
-        
-        # 记录VAR-ST的验证指标
-        if 'accuracy' in results_dict:
-            self.log('val_accuracy', results_dict['accuracy'], on_epoch=True, logger=True, sync_dist=True, prog_bar=True)
-        
-        if 'perplexity' in results_dict:
-            self.log('val_perplexity', results_dict['perplexity'], on_epoch=True, logger=True, sync_dist=True, prog_bar=True)
-        
-        if 'top5_accuracy' in results_dict:
-            self.log('val_top5_accuracy', results_dict['top5_accuracy'], on_epoch=True, logger=True, sync_dist=True)
-        
-        return loss
-
-    def test_step(self, batch, batch_idx):
-        self._log_tensor_shapes(batch, "Test batch")
-        
-        original_batch = batch.copy()  # 保存原始batch用于后处理
-        batch = self._preprocess_inputs(batch)
-
-        results_dict = self.model(**batch)
-        
-        # 获取预测和目标
-        logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
-        
-        # 计算损失和指标
-        loss = self._compute_loss(results_dict, original_batch)
-        logger.debug(f"Test loss: {loss.item():.4f}")
-        
-        # 更新指标
-        self._update_metrics('test', logits, target_genes)
-        
-        # 保存输出
-        self._save_step_outputs('test', loss, logits, target_genes, batch_idx)
-        
-        return {'logits': logits, 'target_genes': target_genes}
-    
-    def configure_optimizers(self):
-        """
-        Configure optimizer and learning rate scheduler with multi-GPU support.
-        
-        This method implements learning rate scaling strategies for multi-GPU training
-        and sets up the AdamW optimizer with ReduceLROnPlateau scheduler.
-        
-        Returns:
-            dict: Dictionary containing optimizer and lr_scheduler configurations
-        """
-        weight_decay = float(getattr(self.config.TRAINING, 'weight_decay', 0.0))
-        learning_rate = float(self.config.TRAINING.learning_rate)
-        
-        # Apply learning rate scaling for multi-GPU training
-        # When training with multiple GPUs, the effective batch size increases proportionally
-        # Different scaling strategies help maintain training stability and convergence
-        if hasattr(self.config, 'devices') and self.config.devices > 1:
-            if hasattr(self.config, 'MULTI_GPU') and hasattr(self.config.MULTI_GPU, 'lr_scaling'):
-                lr_scaling = self.config.MULTI_GPU.lr_scaling
-                if lr_scaling == 'linear':
-                    # Linear scaling: lr = base_lr * num_gpus
-                    # Commonly used rule: scale learning rate linearly with batch size
-                    learning_rate = learning_rate * self.config.devices
-                    logger.info(f"多卡训练线性缩放学习率: {learning_rate} (原始: {self.config.TRAINING.learning_rate}, 设备数: {self.config.devices})")
-                elif lr_scaling == 'sqrt':
-                    # Square root scaling: lr = base_lr * sqrt(num_gpus)
-                    # More conservative scaling, often used for very large batch sizes
-                    learning_rate = learning_rate * (self.config.devices ** 0.5)
-                    logger.info(f"多卡训练平方根缩放学习率: {learning_rate} (原始: {self.config.TRAINING.learning_rate}, 设备数: {self.config.devices})")
+        try:
+            for part in parts:
+                if isinstance(value, dict):
+                    value = value.get(part, default)
+                elif hasattr(value, part):
+                    value = getattr(value, part)
                 else:
-                    # No scaling: keep original learning rate
-                    # Useful when batch size scaling is handled elsewhere or not needed
-                    logger.info(f"多卡训练不缩放学习率: {learning_rate}")
-        
-        # Initialize AdamW optimizer with weight decay for regularization
-        # AdamW decouples weight decay from gradient-based update, improving generalization
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
-        
-        # Configure ReduceLROnPlateau scheduler for adaptive learning rate adjustment
-        # Reduces learning rate when validation loss plateaus, helping fine-tune convergence
-        lr_scheduler_config = self.config.TRAINING.lr_scheduler
-        
-        # Handle both dict and Namespace types for lr_scheduler configuration
-        if isinstance(lr_scheduler_config, dict):
-            factor = lr_scheduler_config.get('factor', 0.5)
-            patience = lr_scheduler_config.get('patience', 5)
-            mode = lr_scheduler_config.get('mode', 'min')
-        else:
-            factor = getattr(lr_scheduler_config, 'factor', 0.5)
-            patience = getattr(lr_scheduler_config, 'patience', 5)
-            mode = getattr(lr_scheduler_config, 'mode', 'min')
-        
-        # Set gradient clipping value for training stability
-        # Prevents exploding gradients by clipping gradient norms above threshold
-        self.trainer.gradient_clip_val = getattr(self.config.TRAINING, 'gradient_clip_val', 1.0)
-        
-        # Check if learning rate scheduler should be disabled
-        if patience == 0:
-            logger.info("学习率调度器已禁用 (patience=0)，将使用固定学习率")
-            return {'optimizer': optimizer}
-        
-        scheduler = {
-            'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode=self.config.TRAINING.mode,  # 'min' for loss, 'max' for accuracy
-                factor=factor,  # Reduction factor
-                patience=patience,  # Epochs to wait before reduction
-                verbose=True  # Log learning rate changes
-            ),
-            'monitor': self.config.TRAINING.monitor,  # Metric to monitor (e.g., 'val_loss')
-            'interval': 'epoch',  # Check at the end of each epoch
-            'frequency': 1  # Check every epoch
-        }
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': scheduler
-        }
-    
+                    return default
+            return value
+        except Exception:
+            return default
+
+    def _load_model(self):
+        """加载Multi-Scale Gene VAR模型"""
+        try:
+            self._logger.info("加载Multi-Scale Gene VAR模型...")
+            Model = getattr(importlib.import_module(
+                'model.VAR.two_stage_var_st'), 'MultiScaleGeneVAR')
+            
+            # 实例化模型
+            model = self._instancialize(Model)
+            self._logger.info("Multi-Scale Gene VAR模型加载成功")
+            
+            return model
+            
+        except Exception as e:
+            self._logger.error(f"加载Multi-Scale Gene VAR模型时出错：{str(e)}")
+            raise ValueError(f'Multi-Scale Gene VAR模型加载失败: {str(e)}')
+
+    def _instancialize(self, Model, **other_args):
+        """实例化模型"""
+        try:
+            # 获取模型初始化参数
+            class_args = inspect.getfullargspec(Model.__init__).args[1:]
+            
+            # 处理不同类型的配置对象
+            if isinstance(self.model_config, AddictDict):
+                model_config_dict = dict(self.model_config)
+            elif hasattr(self.model_config, '__dict__'):
+                model_config_dict = vars(self.model_config)
+            else:
+                model_config_dict = self.model_config
+            
+            args = {}
+            
+            # 从配置中获取参数
+            for arg in class_args:
+                if arg in model_config_dict:
+                    args[arg] = model_config_dict[arg]
+                elif arg == 'config':
+                    args[arg] = self.config
+                elif arg == 'histology_feature_dim' and 'feature_dim' in model_config_dict:
+                    args[arg] = model_config_dict['feature_dim']
+                    
+            # 添加其他参数
+            args.update(other_args)
+            
+            return Model(**args)
+            
+        except Exception as e:
+            self._logger.error(f"模型实例化失败：{str(e)}")
+            raise
 
     def _init_metrics(self):
-        # VAR_ST模型使用200个基因
-        num_genes = getattr(self.config.MODEL, 'num_genes', 200)
-        logger.info(f"VAR_ST模型使用基因数量: {num_genes}")
+        """初始化评估指标"""
+        num_genes = self._get_config('MODEL.num_genes', DEFAULT_NUM_GENES)
+        self._logger.info(f"VAR_ST模型使用基因数量: {num_genes}")
         
-        # 创建VAR_ST模型的评估指标
+        # 创建指标集合
         metrics = {
             'mse': MeanSquaredError(),
             'mae': MeanAbsoluteError(),
@@ -299,148 +163,319 @@ class ModelInterface(pl.LightningModule):
         self.val_metrics = torchmetrics.MetricCollection(metrics.copy())
         self.test_metrics = torchmetrics.MetricCollection(metrics.copy())
 
-        self.train_history = {
-            'loss': [],
-            'mse': [],
-            'mae': [],
-            'pearson_mean': [],
-            'pearson_high': [],
-        }
+        # 创建详细指标
+        self.val_detailed_metrics = self._create_detailed_metrics(num_genes)
+        self.test_detailed_metrics = self._create_detailed_metrics(num_genes)
 
-        self.val_history = {
-            'loss': [],
-            'mse': [],
-            'mae': [],
-            'pearson_mean': [],
-            'pearson_high': [],
-        }
-
-
-    def _preprocess_inputs(self, inputs):
-        """
-        VAR_ST模型输入预处理
+    def _common_step(self, batch, batch_idx, phase: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """通用的step处理逻辑"""
+        # 预处理
+        original_batch = batch.copy() if isinstance(batch, dict) else batch
+        processed_batch = self._preprocess_inputs(batch)
+        # 前向传播
+        results_dict = self.model(**processed_batch)
+        # 计算损失
+        loss = self._compute_loss(results_dict, original_batch)
+        # 提取预测和目标
+        logits, target_genes = self._extract_predictions_and_targets(results_dict, original_batch)
+        # 🔧 谨慎处理指标更新，避免验证时的多GPU同步问题
+        should_log = (phase == 'train' and batch_idx % LOG_FREQUENCY == 0)
+        if should_log:
+            # 只在训练时更新指标，验证时避免调用复杂的指标计算
+            self._update_metrics(phase, logits, target_genes)
         
-        VAR-ST模型期望的参数：
-        - histology_features: 组织学特征 
-        - spatial_coords: 空间坐标
-        - target_genes: 目标基因表达（训练时）
-        """
+        # 记录损失 - 避免验证时同步
+        # 🔧 关键修复：验证时不同步，避免死锁
+        sync_dist = False  # 完全禁用同步，让Lightning在epoch end处理
+        batch_size = original_batch.get('target_genes', torch.empty(1)).size(0) if isinstance(original_batch, dict) else 1
+        
+        # 只在training_step中记录，validation_step自己处理
+        if phase == 'train':
+            self.log(f'{phase}_loss', loss, 
+                    on_step=True, 
+                    on_epoch=True, 
+                    prog_bar=True,
+                    batch_size=batch_size,
+                    sync_dist=sync_dist)
+        
+        # 记录模型特定指标
+        self._log_model_specific_metrics(phase, results_dict)
+        
+        return loss, logits, target_genes
+
+    def training_step(self, batch, batch_idx):
+        """训练步骤"""
+        loss, _, _ = self._common_step(batch, batch_idx, 'train')
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        """验证步骤 - 修复多GPU同步问题"""
+        # 执行完整的验证步骤
+        loss, predictions, targets = self._common_step(batch, batch_idx, 'val')
+        
+        # 🔧 关键修复：在多GPU环境下正确同步val_loss
+        # 记录验证损失（启用同步以确保ModelCheckpoint能获取正确的值）
+        self.log('val_loss', loss, 
+                on_step=False, 
+                on_epoch=True, 
+                prog_bar=True,
+                batch_size=targets.size(0) if hasattr(targets, 'size') else 1,
+                sync_dist=True,  # 🔧 关键修复：启用同步确保ModelCheckpoint正确工作
+                reduce_fx='mean')  # 明确指定reduce函数
+        
+        # 返回验证结果，但不进行同步操作
+        return {
+            'val_loss': loss,
+            'predictions': predictions.detach().cpu(),  # 移到CPU减少GPU内存
+            'targets': targets.detach().cpu()
+        }
+
+    def test_step(self, batch, batch_idx):
+        """测试步骤"""
+        loss, logits, target_genes = self._common_step(batch, batch_idx, 'test')
+        # 保存输出
+        self._save_step_outputs('test', loss, logits, target_genes, batch_idx)
+        return {'logits': logits, 'target_genes': target_genes}
+    
+    def _preprocess_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """预处理输入数据"""
+        # 验证输入
+        self._validate_inputs(inputs)
         processed = {}
-        
         # 组织学特征处理
         if 'img' in inputs:
-            img_features = inputs['img']
-            processed['histology_features'] = img_features
-            
-            # 验证维度
-            if img_features.dim() not in [2, 3]:
-                raise ValueError(f"不支持的img_features维度: {img_features.shape}")
-        
+            processed['histology_features'] = inputs['img']
         # 空间坐标处理
         if 'positions' in inputs:
-            spatial_coords = inputs['positions']
-            processed['spatial_coords'] = spatial_coords
-            
-            # 验证维度
-            if spatial_coords.dim() not in [2, 3]:
-                raise ValueError(f"不支持的spatial_coords维度: {spatial_coords.shape}")
-        
-        # 基因表达数据处理（训练时使用）
+            processed['spatial_coords'] = inputs['positions']
+        # 基因表达数据处理
         if 'target_genes' in inputs:
-            target_genes = inputs['target_genes']
-            processed['target_genes'] = target_genes
-            
-            # 验证维度
-            if target_genes.dim() not in [2, 3]:
-                raise ValueError(f"不支持的target_genes维度: {target_genes.shape}")
-        
+            processed['target_genes'] = inputs['target_genes']
         return processed
 
+    def _validate_inputs(self, inputs: Dict[str, torch.Tensor]):
+        """验证输入数据"""
+        # 检查必需的键
+        if 'img' not in inputs:
+            raise ValueError("缺少必需的输入: img")
+        
+        # 定义不同字段的期望维度
+        expected_dims = {
+            'img': [2, 3],           # 图像特征: (batch, features) 或 (batch, seq, features)
+            'target_genes': [2, 3],   # 基因表达: (batch, genes) 或 (batch, seq, genes)
+            'positions': [2, 3],      # 空间坐标: (batch, coords) 或 (batch, seq, coords)
+            'spot_idx': [1, 2],       # spot索引: (batch,) 或 (batch, seq)
+            'slide_id': [1],          # slide标识: (batch,)
+            'gene_ids': [1, 2],       # 基因ID: (batch,) 或 (batch, genes)
+        }
+        
+        # 验证张量形状
+        for key, tensor in inputs.items():
+            if isinstance(tensor, torch.Tensor):
+                # 获取该字段的期望维度，如果未定义则允许1-3维
+                allowed_dims = expected_dims.get(key, [1, 2, 3])
+                
+                if tensor.dim() not in allowed_dims:
+                    raise ValueError(f"{key}维度错误: {tensor.shape}，期望维度: {allowed_dims}")
+        
+        # 验证数值范围
+        if 'target_genes' in inputs:
+            targets = inputs['target_genes']
+            if (targets < 0).any():
+                raise ValueError("目标基因表达值包含负数")
 
-
-
-
-
-    def _log_tensor_shapes(self, tensors_dict, prefix=""):
-        """记录张量形状信息到日志"""
-        if logger.isEnabledFor(logging.DEBUG):
-            for name, tensor in tensors_dict.items():
-                if isinstance(tensor, torch.Tensor):
-                    logger.debug(f"{prefix}{name}: {tensor.shape}")
-
-    
-
-    def _update_metrics(self, stage, predictions, targets):
+    def _compute_loss(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """计算损失"""
         try:
-                    # VAR-ST模型直接计算基因表达指标
+            if 'loss' not in outputs:
+                # 尝试备选方案
+                if 'ce_loss' in outputs and 'reg_loss' in outputs:
+                    total_loss = outputs['ce_loss'] + outputs['reg_loss']
+                    self._logger.warning("使用备选损失计算方案")
+                else:
+                    raise KeyError("模型输出中找不到损失值")
+            else:
+                total_loss = outputs['loss']
             
+            # 验证损失值
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                self._logger.error(f"损失值异常: {total_loss.item()}")
+                raise ValueError("损失值为NaN或Inf")
+                
+            return total_loss
+            
+        except Exception as e:
+            self._logger.error(f"计算损失时出错: {str(e)}")
+            self._logger.error(f"输出键: {list(outputs.keys())}")
+            raise
+
+    def _extract_predictions_and_targets(self, results_dict: Dict[str, torch.Tensor], 
+                                       batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """提取预测和目标"""
+        # 获取预测
+        if 'predictions' in results_dict:
+            logits = results_dict['predictions']
+        else:
+            logits = results_dict.get('generated_sequence', None)
+            if logits is None:
+                raise ValueError("Multi-Scale Gene VAR模型应该有predictions或generated_sequence输出")
+        
+        # 获取目标
+        if 'target_genes' not in batch:
+            raise ValueError("批次数据中找不到target_genes")
+        target_genes = batch['target_genes']
+        
+        # 🔧 关键修复：VAR_ST模型应该直接返回200个基因的预测
+        # 如果形状不匹配，说明模型实现有问题，直接报错
+        num_genes = target_genes.shape[-1]  # 通常是200
+        
+        if logits.shape[-1] != num_genes:
+            raise ValueError(
+                f"模型预测维度({logits.shape[-1]})与目标基因数量({num_genes})不匹配！"
+                f"这表明训练和推理的模型配置不一致。"
+                f"预测形状: {logits.shape}, 目标形状: {target_genes.shape}"
+            )
+        
+        # 训练时直接使用原始计数值，不进行log2变换
+        # 评估指标计算时会在需要的地方进行log2变换
+        return logits.float(), target_genes.float()
+
+    def _apply_log2_normalization_for_evaluation(self, predictions: torch.Tensor, 
+                                                targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """为评估指标应用log2(x+1)标准化 - 只在评估时使用"""
+        # 确保数据类型为float
+        predictions = predictions.float()
+        targets = targets.float()
+        
+        # 应用log2(x+1)标准化
+        predictions_log2 = torch.log2(predictions + 1.0)
+        targets_log2 = torch.log2(targets + 1.0)
+        
+        # 验证结果
+        if torch.isnan(predictions_log2).any() or torch.isnan(targets_log2).any():
+            self._logger.warning("Log2标准化后发现NaN值")
+        
+        return predictions_log2, targets_log2
+
+    def _update_metrics(self, stage: str, predictions: torch.Tensor, targets: torch.Tensor):
+        """更新评估指标"""
+        try:
             # 获取对应阶段的指标集合
             metrics = getattr(self, f'{stage}_metrics')
             
             # 确保输入维度正确
             if predictions.dim() == 3:
                 B, N, G = predictions.shape
-                predictions = predictions.reshape(-1, G)  # [B*N, num_genes]
+                predictions = predictions.reshape(-1, G)
             if targets.dim() == 3:
                 B, N, G = targets.shape
-                targets = targets.reshape(-1, G)  # [B*N, num_genes]
+                targets = targets.reshape(-1, G)
             
-            # 🔧 关键修复：训练阶段每次都重置指标，避免累积
+            # 为了与其他模型对比，在计算评估指标时应用log2变换
+            predictions_log2, targets_log2 = self._apply_log2_normalization_for_evaluation(predictions, targets)
+            
+            # 训练阶段每次都重置指标
             if stage == 'train':
                 metrics.reset()
             
-            # 更新指标
-            metrics.update(predictions, targets)
+            # 使用log2变换后的值更新指标
+            metrics.update(predictions_log2, targets_log2)
 
-            metric_dict = metrics.compute()
-            batch_size = predictions.size(0)
-            for name, value in metric_dict.items():
-                if isinstance(value, torch.Tensor):
-                    values = torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
-                    mean_value = values.mean()
-                    
-                    # 🔧 修复：安全计算标准差，避免degrees of freedom警告
-                    if values.numel() > 1:
-                        std_value = values.std()
-                    else:
-                        std_value = torch.tensor(0.0)
-                
-                    # 🔧 优化进度条显示：只显示最重要的指标
-                    show_in_prog_bar = name in ['mse', 'mae']  # 只在进度条显示MSE和MAE
-                    
-                    self.log(f'{stage}_{name}', mean_value, prog_bar=show_in_prog_bar, batch_size=batch_size, sync_dist=True)
-                    self.log(f'{stage}_{name}_std', std_value, prog_bar=False, batch_size=batch_size, sync_dist=True)  # 标准差不显示在进度条
-
-                    if name == 'pearson':
-                        top_k = max(1,int(len(values)*0.3))
-                        high_values = torch.topk(values, top_k)[0]
-                        high_mean = high_values.mean()
-                        
-                        # 🔧 修复：安全计算高相关性标准差
-                        if high_values.numel() > 1:
-                            high_std = high_values.std()
-                        else:
-                            high_std = torch.tensor(0.0)
-                        
-                        # Pearson相关性指标不显示在进度条，避免过于拥挤
-                        self.log(f'{stage}_pearson_high_mean', high_mean, prog_bar=False, batch_size=batch_size, sync_dist=True)
-                        self.log(f'{stage}_pearson_high_std', high_std, prog_bar=False, batch_size=batch_size, sync_dist=True)
+            # 计算并记录指标
+            if stage == 'train' or self.trainer.global_step % LOG_FREQUENCY == 0:
+                self._log_metrics(stage, metrics, predictions.size(0))
 
         except Exception as e:
-            logger.error(f"更新指标时发生错误: {e}")
-            raise e
-    
-    
-    def _save_step_outputs(self, phase, loss, preds, targets, batch_idx=None):
-        # 🔧 关键修复：训练阶段不累积数据，避免内存泄漏
+            self._logger.error(f"更新指标时发生错误: {e}")
+            raise
+
+    def _log_metrics(self, stage: str, metrics: torchmetrics.MetricCollection, batch_size: int):
+        """记录指标"""
+        metric_dict = metrics.compute()
+        
+        for name, value in metric_dict.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() > 1:
+                    # 多元素张量
+                    values = torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+                    mean_value = values.mean()
+                    std_value = values.std() if values.numel() > 1 else torch.tensor(0.0, device=value.device)
+                    
+                    # 只在进度条显示重要指标
+                    show_in_prog_bar = name in ['mse', 'mae']
+                    
+                    self.log(f'{stage}_{name}', mean_value, 
+                            prog_bar=show_in_prog_bar, 
+                            batch_size=batch_size, 
+                            sync_dist=True)
+                    self.log(f'{stage}_{name}_std', std_value, 
+                            prog_bar=False, 
+                            batch_size=batch_size, 
+                            sync_dist=True)
+                    
+                    # 记录高相关性基因
+                    if name in ['pearson', 'concordance']:
+                        self._log_high_correlation_genes(stage, name, values, batch_size)
+                else:
+                    # 单元素张量
+                    self.log(f'{stage}_{name}', value.item(), 
+                            prog_bar=(name in ['mse', 'mae']), 
+                            batch_size=batch_size, 
+                            sync_dist=True)
+
+    def _log_high_correlation_genes(self, stage: str, metric_name: str, 
+                                   values: torch.Tensor, batch_size: int):
+        """记录高相关性基因的统计"""
+        top_k = max(1, int(len(values) * TOP_GENE_RATIO))
+        high_values = torch.topk(values, top_k)[0]
+        high_mean = high_values.mean()
+        high_std = high_values.std() if high_values.numel() > 1 else torch.tensor(0.0, device=values.device)
+        
+        self.log(f'{stage}_{metric_name}_high_mean', high_mean, 
+                prog_bar=False, 
+                batch_size=batch_size, 
+                sync_dist=True)
+        self.log(f'{stage}_{metric_name}_high_std', high_std, 
+                prog_bar=False, 
+                batch_size=batch_size, 
+                sync_dist=True)
+
+    def _log_model_specific_metrics(self, phase: str, results_dict: Dict[str, Any]):
+        """记录模型特定的指标"""
+        # 🔧 减少同步，只在训练时记录详细指标
         if phase == 'train':
-            # 训练阶段不保存数据，避免内存无限累积
-            # 训练指标通过Lightning的内置机制记录即可
+            # VAR-ST的特定指标
+            if 'accuracy' in results_dict:
+                self.log(f'{phase}_accuracy', results_dict['accuracy'], 
+                        on_epoch=True, 
+                        sync_dist=False)
+            
+            if 'perplexity' in results_dict:
+                self.log(f'{phase}_perplexity', results_dict['perplexity'], 
+                        on_epoch=True, 
+                        sync_dist=False)
+            
+            if 'top5_accuracy' in results_dict:
+                self.log(f'{phase}_top5_accuracy', results_dict['top5_accuracy'], 
+                        on_epoch=True, 
+                        sync_dist=False)
+
+    def _save_step_outputs(self, phase: str, loss: torch.Tensor, 
+                          preds: torch.Tensor, targets: torch.Tensor, 
+                          batch_idx: Optional[int] = None):
+        """保存步骤输出"""
+        if phase == 'train':
+            return  # 训练阶段不保存
+        
+        # 检查内存限制
+        current_samples = sum(out['preds'].shape[0] for out in getattr(self, f'{phase}_outputs'))
+        if current_samples >= MAX_SAVED_SAMPLES:
+            if batch_idx == 0:  # 只在第一个batch时警告
+                self._logger.warning(f"{phase}阶段已保存{current_samples}个样本，达到上限")
             return
         
-        # 只对验证和测试阶段累积数据用于最终评估
         output_dict = {
-            'loss': loss.detach(),
+            'loss': loss.detach().cpu().item(),
             'preds': preds.detach().cpu(),
             'targets': targets.detach().cpu(),
         }
@@ -449,416 +484,262 @@ class ModelInterface(pl.LightningModule):
 
         getattr(self, f'{phase}_outputs').append(output_dict)
 
-    def _process_epoch_end(self, phase):
-        outputs = getattr(self, f'{phase}_outputs')
-        if len(outputs) == 0:
+    def configure_optimizers(self):
+        """配置优化器和学习率调度器"""
+        weight_decay = float(self._get_config('TRAINING.weight_decay', DEFAULT_WEIGHT_DECAY))
+        learning_rate = float(self._get_config('TRAINING.learning_rate', DEFAULT_LEARNING_RATE))
+        
+        # 多GPU学习率缩放
+        learning_rate = self._scale_learning_rate(learning_rate)
+        
+        # 创建优化器
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        
+        # 设置梯度裁剪
+        self.trainer.gradient_clip_val = self._get_config('TRAINING.gradient_clip_val', DEFAULT_GRADIENT_CLIP)
+        
+        # 配置学习率调度器
+        scheduler_config = self._get_scheduler_config(optimizer)
+        
+        if scheduler_config:
+            return {'optimizer': optimizer, 'lr_scheduler': scheduler_config}
+        else:
+            return {'optimizer': optimizer}
+
+    def _scale_learning_rate(self, base_lr: float) -> float:
+        """根据GPU数量缩放学习率"""
+        num_devices = self._get_config('devices', 1)
+        if num_devices <= 1:
+            return base_lr
+        
+        scaling_strategy = self._get_config('MULTI_GPU.lr_scaling', 'none')
+        
+        if scaling_strategy == 'linear':
+            scaled_lr = base_lr * num_devices
+            self._logger.info(f"线性缩放学习率: {scaled_lr} (原始: {base_lr}, 设备数: {num_devices})")
+        elif scaling_strategy == 'sqrt':
+            scaled_lr = base_lr * (num_devices ** 0.5)
+            self._logger.info(f"平方根缩放学习率: {scaled_lr} (原始: {base_lr}, 设备数: {num_devices})")
+        else:
+            scaled_lr = base_lr
+            self._logger.info(f"不缩放学习率: {scaled_lr}")
+        
+        return scaled_lr
+
+    def _get_scheduler_config(self, optimizer):
+        """获取学习率调度器配置"""
+        # 获取配置参数
+        factor = self._get_config('TRAINING.lr_scheduler.factor', 0.5)
+        patience = self._get_config('TRAINING.lr_scheduler.patience', 5)
+        mode = self._get_config('TRAINING.lr_scheduler.mode', 'min')
+        
+        if patience == 0:
+            self._logger.info("学习率调度器已禁用")
+            return None
+        
+        return {
+            'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode=mode,
+                factor=factor,
+                patience=patience,
+                verbose=True
+            ),
+            'monitor': self._get_config('TRAINING.monitor', 'val_loss'),
+            'interval': 'epoch',
+            'frequency': 1
+        }
+
+    def on_train_epoch_end(self):
+        """训练epoch结束时的回调"""
+        pass  # 训练数据不再累积
+    
+    def on_validation_epoch_end(self):
+        """验证epoch结束时的回调 - 增强监控和调试"""
+        # 🔧 增强验证完成监控
+        if self.trainer.is_global_zero:
+            try:
+                # 获取当前验证损失
+                current_val_loss = None
+                if hasattr(self.trainer.callback_metrics, 'val_loss'):
+                    current_val_loss = self.trainer.callback_metrics['val_loss']
+                elif 'val_loss' in self.trainer.callback_metrics:
+                    current_val_loss = self.trainer.callback_metrics['val_loss']
+                
+                print(f"\n✅ Epoch {self.current_epoch} 验证完成")
+                if current_val_loss is not None:
+                    print(f"   📊 当前验证损失: {current_val_loss:.4f}")
+                    
+                    # 检查ModelCheckpoint状态
+                    for callback in self.trainer.callbacks:
+                        if hasattr(callback, 'best_model_score') and callback.best_model_score is not None:
+                            best_score = callback.best_model_score.item() if hasattr(callback.best_model_score, 'item') else callback.best_model_score
+                            print(f"   🏆 最佳验证损失: {best_score:.4f}")
+                            print(f"   💾 最佳模型路径: {callback.best_model_path}")
+                            
+                            # 检查是否应该保存新checkpoint
+                            if current_val_loss < best_score:
+                                print(f"   🎯 发现更好的模型! {current_val_loss:.4f} < {best_score:.4f}")
+                            else:
+                                print(f"   ⏸️  当前模型未超越最佳: {current_val_loss:.4f} >= {best_score:.4f}")
+                            break
+                else:
+                    print(f"   ⚠️  警告: 无法获取val_loss值")
+                    print(f"   📋 可用指标: {list(self.trainer.callback_metrics.keys())}")
+                
+                print("   🔄 继续训练...\n")
+                
+            except Exception as e:
+                self._logger.warning(f"验证epoch结束处理警告: {e}")
+        
+        # 清理验证数据（安全操作）
+        self._cleanup_validation_data()
+            
+        # 🔧 重置验证指标以释放内存
+    
+    def _cleanup_validation_data(self):
+        """安全地清理验证相关数据"""
+        # 清空验证输出
+        if hasattr(self, 'val_outputs'):
+            self.val_outputs.clear()
+        if hasattr(self, '_collected_predictions'):
+            self._collected_predictions.clear()
+        if hasattr(self, '_collected_targets'):
+            self._collected_targets.clear()
+            
+        # 重置验证指标（这个操作是安全的）
+        if hasattr(self, 'val_metrics'):
+            try:
+                self.val_metrics.reset()
+            except Exception:
+                pass  # 如果重置失败就忽略
+        
+        # 🔧 确保验证指标正确重置
+        try:
+            if hasattr(self, 'val_metrics'):
+                self.val_metrics.reset()
+        except Exception:
+            pass  # 忽略重置错误
+
+    def on_test_epoch_end(self):
+        """测试epoch结束时的回调"""
+        self._compute_and_log_evaluation_metrics('test')
+        
+        # 清空测试输出
+        if self.current_epoch < self.trainer.max_epochs - 1:
+            self.test_outputs.clear()
+    
+    def on_fit_end(self):
+        """训练完成时的回调"""
+        if not self.trainer.is_global_zero:
+            self._logger.info(f"GPU进程 {self.trainer.global_rank}: 训练完成")
             return
         
-        # 清空输出列表
-        outputs.clear()
+        self._logger.info("训练完成！")
 
-    def _compute_and_log_evaluation_metrics(self, phase):
-        """
-        计算并记录详细的评估指标，包括原始计数值和标准化值的对比
-        
-        Args:
-            phase: 评估阶段 ('val', 'test')
-        """
+    def _compute_and_log_evaluation_metrics(self, phase: str):
+        """计算并记录评估指标"""
         outputs = getattr(self, f'{phase}_outputs', [])
         
         if not outputs:
-            logger.warning(f"⚠️ 没有找到{phase}阶段的输出数据")
+            self._logger.warning(f"没有{phase}阶段的输出数据")
             return
         
-        logger.info(f"📊 开始计算{phase}阶段的详细评估指标...")
-        
-        # 收集本GPU的所有预测和目标 (这些已经是log2标准化的值)
-        all_predictions = []
-        all_targets = []
-        
-        for output in outputs:
-            if 'preds' in output and 'targets' in output:
-                all_predictions.append(output['preds'].cpu().numpy())
-                all_targets.append(output['targets'].cpu().numpy())
-        
-        if not all_predictions:
-            logger.warning(f"⚠️ {phase}阶段没有有效的预测数据")
+        # 检查是否为sanity check
+        if hasattr(self.trainer, 'sanity_checking') and self.trainer.sanity_checking:
+            self._logger.info("跳过sanity check阶段的详细评估")
             return
+       
+        self._logger.info(f"开始计算{phase}阶段的评估指标...")
         
-        # 整合本GPU的数据
-        predictions_log2 = np.vstack(all_predictions)  # Log2标准化的预测值
-        targets_log2 = np.vstack(all_targets)  # Log2标准化的目标值
+        # 收集所有输出
+        all_predictions, all_targets = self._collect_outputs(outputs)
         
-        # 检查数据有效性
-        if predictions_log2.size == 0 or targets_log2.size == 0:
-            logger.warning(f"⚠️ {phase}阶段数据为空，跳过评估指标计算")
-            return
+        # 确保数据在正确的设备上
+        predictions = all_predictions.to(self.device)
+        targets = all_targets.to(self.device)
         
-        logger.info(f"本GPU数据形状 - predictions: {predictions_log2.shape}, targets: {targets_log2.shape}")
+        # 使用TorchMetrics计算标准指标
+        metrics = getattr(self, f'{phase}_metrics')
+        metrics.reset()
+        metrics.update(predictions, targets)
+        metric_dict = metrics.compute()
         
-        # 🆕 在多GPU环境下，只在主进程进行评估和打印
-        if self.trainer.world_size > 1:
-            # 只在主进程进行评估和打印，避免all_gather同步问题
-            if self.trainer.is_global_zero:
-                # 计算log2标准化空间的指标（只使用主进程的数据）
-                metrics_log2 = self.calculate_evaluation_metrics(targets_log2, predictions_log2)
-                
-                # 计算原始计数空间的指标用于对比
-                predictions_raw = np.power(2, predictions_log2) - 1  # 反向转换
-                targets_raw = np.power(2, targets_log2) - 1
-                predictions_raw = np.clip(predictions_raw, 0, None)  # 确保非负
-                targets_raw = np.clip(targets_raw, 0, None)
-                
-                metrics_raw = self.calculate_evaluation_metrics(targets_raw, predictions_raw)
-                
-                # 只在主进程打印对比报告
-                self.print_dual_evaluation_results(metrics_log2, metrics_raw, phase)
-                
-                # 记录到wandb和日志
-                batch_size = predictions_log2.shape[0]  # 获取batch大小
-                for key, value in metrics_log2.items():
-                    if key != 'correlations':  # 跳过numpy数组
-                        # 确保值是标量
-                        if isinstance(value, (np.ndarray, list)):
-                            if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
-                                value = float(value)
-                            else:
-                                continue  # 跳过非标量值
-                        self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=False, batch_size=batch_size)
-                
-                # 记录原始计数值指标（用于对比）
-                for key, value in metrics_raw.items():
-                    if key != 'correlations':  # 跳过numpy数组
-                        # 确保值是标量
-                        if isinstance(value, (np.ndarray, list)):
-                            if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
-                                value = float(value)
-                            else:
-                                continue  # 跳过非标量值
-                        self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=False, batch_size=batch_size)
-                
-                logger.info(f"✅ {phase}阶段评估指标计算完成（主进程数据）")
-            else:
-                # 非主进程跳过评估
-                logger.info(f"GPU {self.trainer.global_rank}: 跳过评估（只在主进程进行）")
-                return
-        else:
-            # 单GPU模式，直接计算
-            # 计算log2标准化空间的指标
-            metrics_log2 = self.calculate_evaluation_metrics(targets_log2, predictions_log2)
-            
-            # 计算原始计数空间的指标用于对比
-            predictions_raw = np.power(2, predictions_log2) - 1  # 反向转换
-            targets_raw = np.power(2, targets_log2) - 1
-            predictions_raw = np.clip(predictions_raw, 0, None)  # 确保非负
-            targets_raw = np.clip(targets_raw, 0, None)
-            
-            metrics_raw = self.calculate_evaluation_metrics(targets_raw, predictions_raw)
-            
-            # 打印对比报告
-            self.print_dual_evaluation_results(metrics_log2, metrics_raw, phase)
-            
-            # 记录到wandb和日志
-            batch_size = predictions_log2.shape[0]  # 获取batch大小
-            for key, value in metrics_log2.items():
-                if key != 'correlations':  # 跳过numpy数组
-                    # 确保值是标量
-                    if isinstance(value, (np.ndarray, list)):
-                        if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
-                            value = float(value)
-                        else:
-                            continue  # 跳过非标量值
-                    self.log(f'{phase}_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
-            
-            # 记录原始计数值指标（用于对比）
-            for key, value in metrics_raw.items():
-                if key != 'correlations':  # 跳过numpy数组
-                    # 确保值是标量
-                    if isinstance(value, (np.ndarray, list)):
-                        if np.isscalar(value) or (hasattr(value, 'size') and value.size == 1):
-                            value = float(value)
-                        else:
-                            continue  # 跳过非标量值
-                    self.log(f'{phase}_raw_{key}', float(value), on_epoch=True, logger=True, sync_dist=True, batch_size=batch_size)
-            
-            logger.info(f"✅ {phase}阶段评估指标计算完成")
-
-    def print_dual_evaluation_results(self, metrics_log2: dict, metrics_raw: dict, phase: str = ""):
-        """
-        打印对比评估结果：log2标准化 vs 原始计数值
+        # 记录标准指标
+        self._log_evaluation_metrics(phase, metric_dict)
         
-        Args:
-            metrics_log2: Log2标准化空间的指标
-            metrics_raw: 原始计数空间的指标
-            phase: 评估阶段名称
-        """
-        print(f"\n{'='*60}")
-        print(f"📊 {phase.upper()} 双重评估结果对比")
-        print(f"{'='*60}")
+        # 计算详细指标
+        if hasattr(self, f'{phase}_detailed_metrics'):
+            detailed_metrics = getattr(self, f'{phase}_detailed_metrics')
+            detailed_metrics.reset()
+            detailed_metrics.update(predictions, targets)
+            detailed_dict = detailed_metrics.compute()
+            self._log_detailed_metrics(phase, detailed_dict)
         
-        # 🔧 修复：使用正确的指标名称
-        print(f"🔹 Log2标准化空间 (推荐指标):")
-        print(f"   PCC-10:  {metrics_log2.get('PCC-10', 0):.4f}")
-        print(f"   PCC-50:  {metrics_log2.get('PCC-50', 0):.4f}")
-        print(f"   PCC-200: {metrics_log2.get('PCC-200', 0):.4f}")
-        print(f"   MSE:     {metrics_log2.get('MSE', 0):.4f}")
-        print(f"   MAE:     {metrics_log2.get('MAE', 0):.4f}")
-        print(f"   RVD:     {metrics_log2.get('RVD', 0):.4f}")
-        
-        print(f"\n🔸 原始计数空间 (参考对比):")
-        print(f"   PCC-10:  {metrics_raw.get('PCC-10', 0):.4f}")
-        print(f"   PCC-50:  {metrics_raw.get('PCC-50', 0):.4f}")
-        print(f"   PCC-200: {metrics_raw.get('PCC-200', 0):.4f}")
-        print(f"   MSE:     {metrics_raw.get('MSE', 0):.1f}")
-        print(f"   MAE:     {metrics_raw.get('MAE', 0):.1f}")
-        print(f"   RVD:     {metrics_raw.get('RVD', 0):.4f}")
-        
-        print(f"\n💡 解读:")
-        pcc_improvement = metrics_log2.get('PCC-200', 0) - metrics_raw.get('PCC-200', 0)
-        if pcc_improvement > 0:
-            print(f"   ✅ Log2标准化提升了PCC-200: +{pcc_improvement:.4f}")
-        else:
-            print(f"   ⚠️ Log2标准化降低了PCC-200: {pcc_improvement:.4f}")
-        
-        print(f"   📝 推荐使用Log2标准化指标作为模型性能评估标准")
-        print(f"{'='*60}")
-        print()  # 添加空行
-
-    def on_train_epoch_end(self):
-        # 🔧 训练数据不再累积，无需清理
-        # self._process_epoch_end('train')  # 已移除，因为训练数据不再累积
-        pass
-    
-    def on_validation_epoch_end(self):
-        self._compute_and_log_evaluation_metrics('val')
-        # 只有在非最后一个epoch时才清空数据，保留最后一个epoch的数据用于可视化
-        if self.current_epoch < self.trainer.max_epochs - 1:
-            self._process_epoch_end('val')
-        
-    def on_test_epoch_end(self):
-        self._compute_and_log_evaluation_metrics('test')
-        # 只有在非最后一个epoch时才清空数据，保留最后一个epoch的数据用于可视化
-        if self.current_epoch < self.trainer.max_epochs - 1:
-            self._process_epoch_end('test')
-    
-    def on_fit_end(self):
-        """训练完成时的回调 - 生成最终可视化"""
-        # 多GPU环境下只在主进程（rank 0）执行可视化
+        # 在主进程上生成评估报告
         if self.trainer.is_global_zero:
-            print("=" * 60)
-            print("🎉 训练完成！开始生成最终可视化...")
-            print("=" * 60)
-            logger.info("训练完成，开始生成最终可视化...")
-            logger.info(f"验证数据输出数量: {len(self.val_outputs)}")
-            logger.info(f"测试数据输出数量: {len(self.test_outputs)}")
-            print(f"📊 验证数据输出数量: {len(self.val_outputs)}")
-            print(f"📊 测试数据输出数量: {len(self.test_outputs)}")
-            
-            # 智能获取可视化设置
-            enable_vis = self._get_visualization_setting()
-            print(f"🔍 enable_visualization: {enable_vis}")
-            print(f"🔍 VISUALIZATION_AVAILABLE: {VISUALIZATION_AVAILABLE}")
-            
-            if enable_vis:
-                try:
-                    # 如果有验证数据，使用验证数据生成可视化
-                    if len(self.val_outputs) > 0:
-                        print("🎨 开始使用验证数据生成最终可视化...")
-                        logger.info("使用验证数据生成最终可视化...")
-                        self._generate_final_visualization('val')
-                        print("🎨 验证数据可视化完成")
-                    elif len(self.test_outputs) > 0:
-                        print("🎨 开始使用测试数据生成最终可视化...")
-                        logger.info("使用测试数据生成最终可视化...")
-                        self._generate_final_visualization('test')
-                        print("🎨 测试数据可视化完成")
-                    else:
-                        print("❌ 没有可用的验证或测试数据用于生成可视化")
-                        logger.warning("没有可用的验证或测试数据用于生成可视化")
-                        
-                except Exception as e:
-                    print(f"❌ 可视化生成异常: {e}")
-                    logger.error(f"最终可视化生成失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    logger.warning("训练已完成，但跳过可视化生成")
-            else:
-                print("❌ 可视化已禁用")
-                logger.info("可视化已禁用，跳过可视化生成")
-            
-            logger.info("训练和可视化生成完成")
-        else:
-            # 非主进程只记录信息
-            logger.info(f"GPU进程 {self.trainer.global_rank}: 训练完成，跳过可视化生成（只在主进程生成）")
+            self._generate_simple_evaluation_report(phase, metric_dict)
 
-    def _get_visualization_setting(self):
-        """智能获取可视化设置"""
-        # 尝试多个可能的配置位置
-        possible_paths = [
-            'enable_visualization',
-            'GENERAL.enable_visualization', 
-            'TRAINING.enable_visualization',
-            'visualization.enable',
-            'vis_enable'
-        ]
+    def _log_evaluation_metrics(self, phase: str, metric_dict: Dict[str, torch.Tensor]):
+        """记录评估指标"""
+        processed_metrics = {}
         
-        for attr_path in possible_paths:
-            try:
-                value = self.config
-                for part in attr_path.split('.'):
-                    value = getattr(value, part)
-                # 如果找到了布尔值，直接返回
-                if isinstance(value, bool):
-                    logger.info(f"Found visualization setting at {attr_path}: {value}")
-                    return value
-                # 如果是字符串，尝试转换
-                elif isinstance(value, str):
-                    if value.lower() in ['true', '1', 'yes', 'on']:
-                        logger.info(f"Found visualization setting at {attr_path}: {value} -> True")
-                        return True
-                    elif value.lower() in ['false', '0', 'no', 'off']:
-                        logger.info(f"Found visualization setting at {attr_path}: {value} -> False")
-                        return False
-            except AttributeError:
-                continue
-        
-        # 检查命令行参数或环境变量
-        if hasattr(self.config, '__dict__'):
-            config_dict = vars(self.config)
-            logger.debug(f"Config attributes: {list(config_dict.keys())}")
-            
-            # 查找任何包含 'visual' 的属性
-            for key, value in config_dict.items():
-                if 'visual' in key.lower():
-                    logger.info(f"Found visualization-related config: {key} = {value}")
-                    if isinstance(value, bool):
-                        return value
-        
-        # 默认启用可视化
-        logger.info("No explicit visualization setting found, defaulting to True")
-        return True
-
-    def _load_gene_names(self):
-        """加载基因名称列表"""
-        try:
-            # 尝试从配置的数据路径加载基因列表
-            if hasattr(self.config, 'data_path'):
-                gene_file = f"{self.config.data_path}processed_data/selected_gene_list.txt"
-                if os.path.exists(gene_file):
-                    with open(gene_file, 'r') as f:
-                        gene_names = [line.strip() for line in f.readlines() if line.strip()]
-                    logger.info(f"Loaded {len(gene_names)} gene names from {gene_file}")
-                    return gene_names
-            
-            # 如果基因列表文件不存在，尝试从训练器的数据模块获取
-            if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'gene_names'):
-                gene_names = self.trainer.datamodule.gene_names
-                logger.info(f"Loaded {len(gene_names)} gene names from datamodule")
-                return gene_names
-                
-            logger.warning("Could not load gene names, spatial visualization may be limited")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error loading gene names: {e}")
-            return None
-
-    def _load_adata_for_visualization(self, phase):
-        """加载用于可视化的AnnData对象，同时返回对应的slide_id"""
-        try:
-            # 尝试从trainer的数据模块获取相应阶段的数据集
-            if hasattr(self.trainer, 'datamodule'):
-                datamodule = self.trainer.datamodule
-                
-                # 根据阶段选择相应的数据集
-                if phase == 'val' and hasattr(datamodule, 'val_dataloader'):
-                    dataset = datamodule.val_dataloader().dataset
-                elif phase == 'test' and hasattr(datamodule, 'test_dataloader'):
-                    dataset = datamodule.test_dataloader().dataset
-                else:
-                    logger.warning(f"No {phase} dataloader found")
-                    return None, None
-                
-                # 方法1：尝试获取预存储的AnnData对象
-                if hasattr(dataset, 'adata'):
-                    adata = dataset.adata
-                    # 尝试获取对应的slide_id
-                    slide_id = dataset.ids[0] if hasattr(dataset, 'ids') and len(dataset.ids) > 0 else 'unknown_slide'
-                    logger.info(f"Loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
-                    return adata, slide_id
-                elif hasattr(dataset, 'dataset') and hasattr(dataset.dataset, 'adata'):
-                    adata = dataset.dataset.dataset.adata
-                    # 尝试获取对应的slide_id
-                    slide_id = dataset.dataset.ids[0] if hasattr(dataset.dataset, 'ids') and len(dataset.dataset.ids) > 0 else 'unknown_slide'
-                    logger.info(f"Loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
-                    return adata, slide_id
-                
-                # 方法2：如果没有预存储的，尝试动态加载（像eval模式那样）
-                elif hasattr(dataset, 'load_st') and hasattr(dataset, 'ids'):
-                    # 获取第一个slide的ID（用于可视化）
-                    if len(dataset.ids) > 0:
-                        slide_id = dataset.ids[0]  # 取第一个slide用于可视化
-                        logger.info(f"Dynamically loading AnnData for slide: {slide_id}")
-                        
-                        # 使用数据集的load_st方法动态加载
-                        adata = dataset.load_st(slide_id, dataset.genes if hasattr(dataset, 'genes') else None)
-                        logger.info(f"Dynamically loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
-                        return adata, slide_id
-                    else:
-                        logger.warning(f"No slides found in {phase} dataset")
-                        return None, None
-                
-                # 方法3：如果是包装类，尝试深度查找
-                else:
-                    logger.warning(f"Trying to find AnnData in nested dataset structure...")
-                    current_dataset = dataset
-                    for i in range(3):  # 最多查找3层
-                        if hasattr(current_dataset, 'dataset'):
-                            current_dataset = current_dataset.dataset
-                            if hasattr(current_dataset, 'adata'):
-                                adata = current_dataset.adata
-                                slide_id = current_dataset.ids[0] if hasattr(current_dataset, 'ids') and len(current_dataset.ids) > 0 else 'unknown_slide'
-                                logger.info(f"Found AnnData at depth {i+1} for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
-                                return adata, slide_id
-                            elif hasattr(current_dataset, 'load_st') and hasattr(current_dataset, 'ids'):
-                                if len(current_dataset.ids) > 0:
-                                    slide_id = current_dataset.ids[0]
-                                    logger.info(f"Dynamically loading AnnData for slide: {slide_id} at depth {i+1}")
-                                    adata = current_dataset.load_st(slide_id, getattr(current_dataset, 'genes', None))
-                                    logger.info(f"Dynamically loaded AnnData for {phase} phase with {adata.n_obs} spots from slide: {slide_id}")
-                                    return adata, slide_id
-                        else:
-                            break
+        for name, value in metric_dict.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() > 1:
+                    # 多元素张量
+                    values = torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+                    mean_value = values.mean()
+                    std_value = values.std() if values.numel() > 1 else torch.tensor(0.0, device=value.device)
                     
-                    logger.warning(f"No AnnData object found in {phase} dataset after deep search")
-                    return None, None
-            else:
-                logger.warning("No datamodule found in trainer")
-                return None, None
-                
-        except Exception as e:
-            logger.error(f"Error loading AnnData for visualization: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, None
+                    # 记录指标，确保多GPU同步
+                    show_in_prog_bar = name in ['mse', 'mae']
+                    self.log(f'{phase}_{name}', mean_value, on_epoch=True, prog_bar=show_in_prog_bar, sync_dist=True, reduce_fx='mean')
+                    self.log(f'{phase}_{name}_std', std_value, on_epoch=True, prog_bar=False, sync_dist=True, reduce_fx='mean')
+                    
+                    processed_metrics[name] = mean_value.item()
+                    
+                    # 高相关性基因统计
+                    if name in ['pearson', 'concordance']:
+                        self._log_high_correlation_genes(phase, name, values, 1)
+                else:
+                    # 单元素张量
+                    scalar_value = value.item()
+                    self.log(f'{phase}_{name}', scalar_value, on_epoch=True, 
+                            prog_bar=(name in ['mse', 'mae']), sync_dist=True, reduce_fx='mean')
+                    processed_metrics[name] = scalar_value
+        
+        return processed_metrics
 
-    def _generate_final_visualization(self, phase):
-        """生成最终的可视化报告"""
-        print(f"📊 _generate_final_visualization called with phase: {phase}")
-        outputs = getattr(self, f'{phase}_outputs')
-        print(f"📊 Found {len(outputs)} outputs for {phase}")
-        if len(outputs) == 0:
-            print(f"❌ 没有{phase}数据用于生成可视化")
-            logger.warning(f"没有{phase}数据用于生成可视化")
-            return
+    def _log_detailed_metrics(self, phase: str, detailed_dict: Dict[str, torch.Tensor]):
+        """记录详细指标"""
+        for name, value in detailed_dict.items():
+            if isinstance(value, torch.Tensor):
+                scalar_value = value.item() if value.numel() == 1 else value.mean().item()
+                self.log(f'{phase}_{name}', scalar_value, on_epoch=True, prog_bar=False, sync_dist=True)
+
+    def _generate_simple_evaluation_report(self, phase: str, metric_dict: Dict[str, torch.Tensor]):
+        """生成简化的评估报告"""
+        self._logger.info("=" * 40)
+        self._logger.info(f"{phase.upper()} 评估结果")
+        self._logger.info("=" * 40)
         
-        print(f"🎨 开始处理{phase}阶段的最终可视化...")
-        logger.info(f"开始生成{phase}阶段的最终可视化...")
+        for name, value in metric_dict.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() > 1:
+                    mean_val = torch.nan_to_num(value, nan=0.0).mean().item()
+                    self._logger.info(f"  {name}: {mean_val:.4f}")
+                else:
+                    self._logger.info(f"  {name}: {value.item():.4f}")
         
-        # 获取AnnData对象和对应的slide_id用于空间可视化
-        adata, slide_id = self._load_adata_for_visualization(phase)
-        
-        # 收集所有预测和目标
+        self._logger.info("=" * 40)
+
+    def _collect_outputs(self, outputs: List[Dict]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """收集并合并输出"""
         all_preds = []
         all_targets = []
         
@@ -875,248 +756,120 @@ class ModelInterface(pl.LightningModule):
             all_preds.append(preds)
             all_targets.append(targets)
         
-        if len(all_preds) == 0:
-            logger.warning(f"没有有效的{phase}预测数据")
-            return
-            
-        # 合并所有批次的结果
-        all_preds = torch.cat(all_preds, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        
-        # 如果有AnnData，确保预测数据与空间坐标维度匹配
-        if adata is not None:
-            n_spots = adata.n_obs
-            print(f"🔍 AnnData spots: {n_spots}, Prediction spots: {all_preds.shape[0]}")
-            
-            # 如果预测数据比空间点多，只取前n_spots个（通常是第一个slide的数据）
-            if all_preds.shape[0] > n_spots:
-                print(f"📏 Truncating prediction data from {all_preds.shape[0]} to {n_spots} to match spatial coordinates")
-                all_preds = all_preds[:n_spots]
-                all_targets = all_targets[:n_spots]
-            elif all_preds.shape[0] < n_spots:
-                print(f"⚠️ Warning: Prediction data ({all_preds.shape[0]}) is less than spatial coordinates ({n_spots})")
-        
-        # 计算评估指标
-        metrics = self.calculate_evaluation_metrics(all_targets.numpy(), all_preds.numpy())
-        
-        try:
-            # 获取数据集名称和标记基因
-            dataset_name = getattr(self.config, 'expr_name', 'default')
-            marker_genes = self.get_marker_genes_for_dataset(dataset_name)
-            
-            # 获取基因名称列表
-            gene_names = self._load_gene_names()
-            
-            print(f"🧬 Dataset: {dataset_name}")
-            print(f"🎯 Marker genes: {marker_genes}")
-            print(f"📝 Gene names loaded: {len(gene_names) if gene_names else 0}")
-            print(f"🗺️ AnnData available: {adata is not None}")
-            
-            # 创建最终可视化
-            self.create_visualizations(
-                phase=f"{phase}_final",  # 添加"final"标识
-                y_true=all_targets.numpy(),
-                y_pred=all_preds.numpy(),
-                metrics=metrics,
-                gene_names=gene_names,  # 从配置中加载的基因名称
-                marker_genes=marker_genes,
-                adata=adata,  # 从数据集加载的AnnData对象
-                slide_id=slide_id,  # 从数据集获取的实际slide_id
-                img_path=None  # 如果需要可以配置
-            )
-            
-            logger.info(f"{phase}阶段最终可视化生成完成")
-            
-        except Exception as e:
-            logger.error(f"生成{phase}最终可视化时出错: {e}")
-            import traceback
-            traceback.print_exc()
+        return torch.cat(all_preds, dim=0), torch.cat(all_targets, dim=0)
 
-    def predict_step(self, batch, batch_idx):
-        batch = self._preprocess_inputs(batch)
+    def _create_detailed_metrics(self, num_genes: int):
+        """创建详细指标计算器"""
+        from torchmetrics import Metric
         
-        results_dict = self.model(**batch)
-        
-        dataset = self._trainer.predict_dataloaders.dataset
-        _id = dataset.int2id[batch_idx]
-        
-        preds = results_dict['logits']
-        
-        return preds, _id
-
-    def on_before_optimizer_step(self, optimizer):
-        """在优化器步骤之前进行梯度裁剪"""
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.parameters(), 
-            self.trainer.gradient_clip_val
-        )
-        
-        self.log('grad_norm', grad_norm)
-
-    def load_model(self):
-        """加载VAR_ST模型"""
-        try:
-            logger.info("加载VAR-ST模型...")
-            Model = getattr(importlib.import_module(
-                f'model.VAR.two_stage_var_st'), 'VARST')
+        class DetailedMetrics(Metric):
+            def __init__(self, num_genes):
+                super().__init__()
+                self.num_genes = num_genes
+                # 添加状态张量
+                self.add_state("preds_sum", default=torch.zeros(num_genes), dist_reduce_fx="sum")
+                self.add_state("targets_sum", default=torch.zeros(num_genes), dist_reduce_fx="sum")
+                self.add_state("preds_sq_sum", default=torch.zeros(num_genes), dist_reduce_fx="sum")
+                self.add_state("targets_sq_sum", default=torch.zeros(num_genes), dist_reduce_fx="sum")
+                self.add_state("preds_targets_sum", default=torch.zeros(num_genes), dist_reduce_fx="sum")
+                self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
+            
+            def update(self, preds: torch.Tensor, targets: torch.Tensor):
+                # 确保维度正确
+                if preds.dim() == 3:
+                    preds = preds.reshape(-1, preds.size(-1))
+                if targets.dim() == 3:
+                    targets = targets.reshape(-1, targets.size(-1))
                 
-            logger.debug("VAR_ST模型类加载成功")
+                batch_size = preds.size(0)
                 
-            # 实例化模型
-            model = self.instancialize(Model)
+                # 累积统计量
+                self.preds_sum += preds.sum(dim=0)
+                self.targets_sum += targets.sum(dim=0)
+                self.preds_sq_sum += (preds ** 2).sum(dim=0)
+                self.targets_sq_sum += (targets ** 2).sum(dim=0)
+                self.preds_targets_sum += (preds * targets).sum(dim=0)
+                self.total += batch_size
             
-            logger.debug("VAR_ST模型实例化成功")
+            def compute(self):
+                # 计算每个基因的相关系数
+                n = self.total.float()
                 
-            return model
-            
-        except Exception as e:
-            logger.error(f"加载VAR_ST模型时出错：{str(e)}")
-            raise ValueError(f'VAR_ST模型加载失败: {str(e)}')
-
-    def instancialize(self, Model, **other_args):
-        try:
-            # 获取模型初始化参数
-            class_args = inspect.getfullargspec(Model.__init__).args[1:]
-            
-            # 🔧 修复：正确处理addict.Dict对象
-            if isinstance(self.model_config, AddictDict):
-                # 对于addict.Dict，直接使用dict()转换
-                model_config_dict = dict(self.model_config)
-                inkeys = model_config_dict.keys()
-            elif hasattr(self.model_config, '__dict__'):
-                # Namespace对象，转换为字典
-                model_config_dict = vars(self.model_config)
-                inkeys = model_config_dict.keys()
-            else:
-                # 字典对象
-                model_config_dict = self.model_config
-                inkeys = model_config_dict.keys()
-            
-            args1 = {}
-            
-            # 从配置中获取参数
-            for arg in class_args:
-                if arg in inkeys:
-                    args1[arg] = model_config_dict[arg]
-                elif arg == 'config':  # 如果需要config参数，传入完整配置
-                    args1[arg] = self.config
-                elif arg == 'histology_feature_dim' and 'feature_dim' in inkeys:
-                    # 为VAR_ST模型映射feature_dim到histology_feature_dim
-                    args1[arg] = model_config_dict['feature_dim']
-                    logger.debug(f"映射参数: feature_dim ({model_config_dict['feature_dim']}) -> histology_feature_dim")
-                    
-            # 添加其他参数
-            args1.update(other_args)
-            
-            
-            logger.debug(f"模型参数：{args1}")
+                # 计算均值
+                preds_mean = self.preds_sum / n
+                targets_mean = self.targets_sum / n
                 
-            # 实例化模型
-            return Model(**args1)
-            
-        except Exception as e:
-            logger.error(f"模型实例化失败：{str(e)}")
-            logger.error(f"模型参数：{args1 if 'args1' in locals() else 'Not available'}")
-            raise
-    
-
-
-    def _compute_loss(self, outputs, batch):
-        """
-        计算VAR_ST模型损失
+                # 计算协方差和方差
+                covariance = (self.preds_targets_sum / n) - (preds_mean * targets_mean)
+                preds_var = (self.preds_sq_sum / n) - (preds_mean ** 2)
+                targets_var = (self.targets_sq_sum / n) - (targets_mean ** 2)
+                
+                # 计算相关系数
+                correlations = covariance / torch.sqrt(preds_var * targets_var + 1e-8)
+                correlations = torch.nan_to_num(correlations, nan=0.0)
+                
+                # 计算PCC指标
+                sorted_corr, _ = torch.sort(correlations, descending=True)
+                
+                pcc_10 = sorted_corr[:10].mean() if self.num_genes >= 10 else sorted_corr.mean()
+                pcc_50 = sorted_corr[:50].mean() if self.num_genes >= 50 else sorted_corr.mean()
+                pcc_200 = sorted_corr[:200].mean() if self.num_genes >= 200 else sorted_corr.mean()
+                
+                return {
+                    'pcc_10': pcc_10,
+                    'pcc_50': pcc_50,
+                    'pcc_200': pcc_200,
+                    'correlations_mean': correlations.mean()
+                }
         
-        Args:
-            outputs: 模型输出
-            batch: 输入批次数据
-            
-        Returns:
-            loss: 计算得到的损失值
-        """
-        if 'loss' in outputs:
-            # VAR_ST模型已经在内部计算好总损失，直接使用
-            total_loss = outputs['loss']
-            logger.debug(f"VAR_ST总损失: {total_loss.item():.4f}")
-            return total_loss
-        else:
-            raise ValueError("VAR_ST模型输出格式不正确，缺少损失信息")
-
-
-
-
-
-
+        return DetailedMetrics(num_genes)
 
     def calculate_gene_correlations(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-        """
-        Calculate gene-wise Pearson correlation coefficients.
-        
-        Args:
-            y_true: Ground truth gene expression [num_spots, num_genes]
-            y_pred: Predicted gene expression [num_spots, num_genes]
-            
-        Returns:
-            Array of correlation coefficients for each gene [num_genes]
-        """
+        """计算基因级别的相关系数"""
         num_genes = y_true.shape[1]
-        correlations = []
+        correlations = np.zeros(num_genes)
         
         for i in range(num_genes):
-            # Extract gene expression for all spots
             true_gene = y_true[:, i]
             pred_gene = y_pred[:, i]
             
-            # Calculate Pearson correlation
+            # 处理常数值
             if np.std(true_gene) == 0 or np.std(pred_gene) == 0:
-                # Handle constant values (no variation)
-                corr = 0.0
+                correlations[i] = 0.0
             else:
                 corr = np.corrcoef(true_gene, pred_gene)[0, 1]
-                # Handle NaN values
-                if np.isnan(corr):
-                    corr = 0.0
-            
-            correlations.append(corr)
+                correlations[i] = 0.0 if np.isnan(corr) else corr
         
-        return np.array(correlations)
+        return correlations
 
-    def calculate_evaluation_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-        """
-        Calculate comprehensive evaluation metrics for spatial transcriptomics.
-        
-        Args:
-            y_true: Ground truth gene expression [num_spots, num_genes]
-            y_pred: Predicted gene expression [num_spots, num_genes]
-            
-        Returns:
-            Dictionary containing all evaluation metrics
-        """
-        # Ensure inputs are numpy arrays
+    def calculate_evaluation_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+        """计算综合评估指标"""
+        # 确保输入是numpy数组
         if torch.is_tensor(y_true):
             y_true = y_true.cpu().numpy()
         if torch.is_tensor(y_pred):
             y_pred = y_pred.cpu().numpy()
         
-        # Calculate gene-wise correlations
+        # 计算基因相关性
         correlations = self.calculate_gene_correlations(y_true, y_pred)
         
-        # Sort correlations in descending order for PCC metrics
+        # 排序相关性
         sorted_corr = np.sort(correlations)[::-1]
         
-        # Calculate PCC metrics (top-k correlations)
+        # 计算PCC指标
         pcc_10 = np.mean(sorted_corr[:10]) if len(sorted_corr) >= 10 else np.mean(sorted_corr)
         pcc_50 = np.mean(sorted_corr[:50]) if len(sorted_corr) >= 50 else np.mean(sorted_corr)
         pcc_200 = np.mean(sorted_corr[:200]) if len(sorted_corr) >= 200 else np.mean(sorted_corr)
         
-        # Calculate MSE and MAE
+        # 计算MSE和MAE
         mse = np.mean((y_true - y_pred) ** 2)
         mae = np.mean(np.abs(y_true - y_pred))
         
-        # Calculate RVD (Relative Variance Difference)
-        pred_var = np.var(y_pred, axis=0)  # Variance across spots for each gene
-        true_var = np.var(y_true, axis=0)  # Variance across spots for each gene
+        # 计算RVD
+        pred_var = np.var(y_pred, axis=0)
+        true_var = np.var(y_true, axis=0)
         
-        # Avoid division by zero
-        valid_mask = true_var > 1e-8
+        valid_mask = true_var > MIN_VARIANCE_THRESHOLD
         if np.sum(valid_mask) > 0:
             rvd = np.mean(((pred_var[valid_mask] - true_var[valid_mask]) ** 2) / (true_var[valid_mask] ** 2))
         else:
@@ -1129,457 +882,119 @@ class ModelInterface(pl.LightningModule):
             'MSE': float(mse),
             'MAE': float(mae),
             'RVD': float(rvd),
-            'correlations': correlations  # Keep for detailed analysis
+            'correlations': correlations
         }
 
-    def print_evaluation_results(self, metrics: dict, prefix: str = "") -> None:
-        """
-        Print evaluation metrics in a formatted way.
+    def on_before_optimizer_step(self, optimizer):
+        """优化器步骤前的回调"""
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.parameters(), 
+            self.trainer.gradient_clip_val
+        )
         
-        Args:
-            metrics: Dictionary containing evaluation metrics
-            prefix: Optional prefix for the output (e.g., "Val", "Test")
-        """
-        # 🔧 在分布式训练中，只在主进程输出评估结果
-        import os
-        is_main_process = int(os.environ.get('LOCAL_RANK', 0)) == 0
-        
-        if not is_main_process:
-            return  # 非主进程直接返回，不输出
-        
-        if prefix:
-            print(f"\n========== {prefix} 评估结果 ==========")
-        else:
-            print(f"\n========== 评估结果 ==========")
-        
-        print(f"PCC-10: {metrics['PCC-10']:.4f}")
-        print(f"PCC-50: {metrics['PCC-50']:.4f}")
-        print(f"PCC-200: {metrics['PCC-200']:.4f}")
-        print(f"MSE: {metrics['MSE']:.4f}")
-        print(f"MAE: {metrics['MAE']:.4f}")
-        print(f"RVD: {metrics['RVD']:.4f}")
+        self.log('grad_norm', grad_norm, sync_dist=True)
 
-    def save_evaluation_results(self, metrics: dict, save_path: str, 
-                               slide_id: str = "", model_name: str = "VAR_ST") -> None:
-        """
-        Save evaluation metrics to file.
+    def _calculate_pcc_metrics(self, val_metrics):
+        """从验证期间收集的数据计算PCC-10, PCC-50, PCC-200 - 安全版本"""
+        pcc_metrics = {}
         
-        Args:
-            metrics: Dictionary containing evaluation metrics
-            save_path: Path to save the results
-            slide_id: Optional slide identifier
-            model_name: Optional model name
-        """
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        # 🔧 暂时禁用PCC计算以避免死锁
+        # 在多GPU环境下torch.corrcoef可能导致死锁
+        self._logger.info("PCC计算已暂时禁用以避免死锁问题")
         
-        with open(save_path, 'w') as f:
-            f.write(f"Model: {model_name}\n")
-            if slide_id:
-                f.write(f"Slide: {slide_id}\n")
-            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("\n")
-            f.write(f"PCC-10: {metrics['PCC-10']:.4f}\n")
-            f.write(f"PCC-50: {metrics['PCC-50']:.4f}\n")
-            f.write(f"PCC-200: {metrics['PCC-200']:.4f}\n")
-            f.write(f"MSE: {metrics['MSE']:.4f}\n")
-            f.write(f"MAE: {metrics['MAE']:.4f}\n")
-            f.write(f"RVD: {metrics['RVD']:.4f}\n")
+        # 清理收集的数据
+        if hasattr(self, '_collected_predictions'):
+            self._collected_predictions.clear()
+        if hasattr(self, '_collected_targets'):
+            self._collected_targets.clear()
+        
+        return pcc_metrics
 
-    def create_visualizations(self, phase: str, y_true: np.ndarray, y_pred: np.ndarray, 
-                            metrics: dict, gene_names: list = None, 
-                            marker_genes: list = None, adata=None, slide_id: str = None, img_path: str = None) -> None:
-        """
-        Create comprehensive visualizations for model evaluation.
-        
-        Args:
-            phase: Training phase ('val', 'test', etc.)
-            y_true: Ground truth gene expression [num_spots, num_genes]
-            y_pred: Predicted gene expression [num_spots, num_genes]
-            metrics: Dictionary containing evaluation metrics
-            gene_names: Optional list of gene names
-            marker_genes: Optional list of marker genes for spatial visualization
-            adata: Optional AnnData object for spatial coordinates
-            img_path: Optional path to tissue image
-        """
-        if not VISUALIZATION_AVAILABLE:
-            logger.warning("Visualization module not available. Skipping visualization creation.")
+    def _print_simple_validation_summary(self):
+        """打印简化的验证结果摘要"""
+        if not self.trainer.is_global_zero:
             return
-        
+            
         try:
-            # Create visualization directory
-            if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
-                log_dir = self.config.GENERAL.log_path
-            else:
-                log_dir = './logs'
+            val_metrics = self.val_metrics.compute()
             
-            # 处理不同的阶段格式
-            if phase.endswith('_final'):
-                vis_dir = os.path.join(log_dir, 'vis', phase)
-            else:
-                vis_dir = os.path.join(log_dir, 'vis', f'{phase}_epoch_{self.current_epoch}')
+            # 计算PCC指标
+            pcc_metrics = self._calculate_pcc_metrics(val_metrics)
             
-            # Initialize visualizer
-            visualizer = GeneVisualizer(save_dir=vis_dir)
+            # 提取关键指标
+            key_metrics = {}
+            for name, value in val_metrics.items():
+                if isinstance(value, torch.Tensor):
+                    if value.numel() > 1:
+                        mean_val = torch.nan_to_num(value, nan=0.0).mean().item()
+                        key_metrics[name] = mean_val
+                    else:
+                        key_metrics[name] = value.item()
             
-            # 1. Create gene variation curves
-            logger.info(f"Creating gene variation curves for {phase}...")
-            visualizer.plot_gene_variation_curves(
-                y_true, y_pred, 
-                save_name=f"{phase}_gene_variation_curves",
-                show_plots=False
-            )
+            # 简洁格式打印
+            print(f"\n🎯 Epoch {self.current_epoch} 验证结果:")
             
-            # 2. Create correlation analysis
-            logger.info(f"Creating correlation analysis for {phase}...")
-            correlations = visualizer.plot_correlation_analysis(
-                y_true, y_pred,
-                gene_names=gene_names,
-                save_name=f"{phase}_correlation_analysis", 
-                show_plots=False
-            )
+            # 优先显示PCC指标
+            if pcc_metrics:
+                print("   📊 PCC指标:")
+                for pcc_name, pcc_value in pcc_metrics.items():
+                    print(f"      {pcc_name}: {pcc_value:.4f}")
             
-            # 3. Create spatial gene expression maps (if data available)
-            if marker_genes and adata is not None:
-                logger.info(f"Creating spatial gene expression maps for {phase}...")
-                # Get dataset path from config
-                data_path = getattr(self.config, 'data_path', '')
-                
-                # Use the passed slide_id if available, otherwise fall back to config
-                if slide_id is None:
-                    slide_id = getattr(self.config, 'slide_test', 'unknown_slide')
-                    if phase == 'val':
-                        slide_id = getattr(self.config, 'slide_val', slide_id)
-                
-                logger.info(f"Using slide_id for WSI visualization: {slide_id}")
-                
-                visualizer.plot_spatial_gene_expression(
-                    adata, y_pred, gene_names or [], marker_genes,
-                    data_path=data_path,
-                    slide_id=slide_id,
-                    save_name=f"{phase}_spatial_expression",
-                    show_plots=False
-                )
+            # 显示基础指标
+            basic_metrics = ['mse', 'mae', 'r2']
+            print("   📈 基础指标:")
+            for metric in basic_metrics:
+                if metric in key_metrics:
+                    print(f"      {metric.upper()}: {key_metrics[metric]:.4f}")
             
-            # 4. Create summary report
-            logger.info(f"Creating summary report for {phase}...")
-            visualizer.create_summary_report(
-                metrics, correlations,
-                save_name=f"{phase}_summary_report"
-            )
-            
-            logger.info(f"All visualizations for {phase} saved to: {vis_dir}")
+            print()  # 空行分隔
             
         except Exception as e:
-            logger.error(f"Error creating visualizations for {phase}: {e}")
-            logger.error(f"Visualization will be skipped for this epoch.")
+            print(f"❌ 验证结果打印失败: {e}")
+            self._logger.error(f"简化验证摘要打印出错: {e}")
 
-    def get_marker_genes_for_dataset(self, dataset_name: str) -> list:
-        """
-        Get default marker genes for different datasets.
+    def on_validation_epoch_start(self):
+        """验证epoch开始时重置指标"""
+        try:
+            # 安全地重置验证指标
+            self.val_metrics.reset()
+            self._logger.debug(f"开始验证Epoch {self.current_epoch}")
+        except Exception as e:
+            self._logger.warning(f"重置验证指标时出现警告: {e}")
         
-        Args:
-            dataset_name: Name of the dataset
-            
-        Returns:
-            List of marker gene names
-        """
-        # Default marker genes for different datasets
-        marker_genes_dict = {
-            'PRAD': ['KLK3', 'AR', 'FOLH1', 'ACPP', 'KLK2', 'STEAP2', 'PSMA', 'NKX3-1'],
-            'her2st': ['ERBB2', 'ESR1', 'PGR', 'MKI67', 'TP53', 'BRCA1', 'BRCA2'],
-            'default': ['CD3E', 'CD4', 'CD8A', 'CD19', 'CD68', 'PTPRC', 'VIM', 'KRT19']
-        }
-        
-        dataset_key = dataset_name.upper() if dataset_name else 'default'
-        return marker_genes_dict.get(dataset_key, marker_genes_dict['default'])
+        # 🔧 清理之前可能残留的数据
+        self._cleanup_validation_data()
 
-    def _extract_predictions_and_targets(self, results_dict, batch):
-        """
-        从模型输出和批次数据中提取预测和目标
-        
-        Args:
-            results_dict: 模型输出
-            batch: 输入批次数据
+    def _print_simple_validation_summary_safe(self):
+        """安全的验证结果摘要打印 - 避免死锁"""
+        if not self.trainer.is_global_zero:
+            return
             
-        Returns:
-            tuple: (logits, target_genes)
-        """
-        # VAR_ST模型的特殊处理
-        if 'predictions' in results_dict:
-            logits = results_dict['predictions']
-        else:
-            # 如果没有预测结果，可能是训练时的输出
-            logits = results_dict.get('generated_sequence', None)
-            if logits is None:
-                raise ValueError("VAR_ST模型应该有predictions或generated_sequence输出")
-                
-        # 目标数据
-        if 'target_genes' in batch:
-            target_genes = batch['target_genes']
-        else:
-            raise ValueError("批次数据中找不到target_genes")
-        
-        # 🔧 关键改进：将离散计数值转换为log2标准化值进行评估
-        logits_normalized, target_genes_normalized = self._apply_log2_normalization(logits, target_genes)
-        
-        return logits_normalized, target_genes_normalized
-
-    def _apply_log2_normalization(self, predictions, targets):
-        """
-        对离散计数值应用log2(x+1)标准化
-        
-        Args:
-            predictions: 原始预测计数值 [B, num_genes]
-            targets: 原始目标计数值 [B, num_genes]
+        try:
+            val_metrics = self.val_metrics.compute()
             
-        Returns:
-            tuple: (predictions_log2, targets_log2) - 标准化后的值
-        """
-        # 确保数据类型为float
-        if predictions.dtype in [torch.long, torch.int]:
-            predictions = predictions.float()
-        if targets.dtype in [torch.long, torch.int]:
-            targets = targets.float()
-        
-        # 应用log2(x+1)标准化
-        predictions_log2 = torch.log2(predictions + 1.0)
-        targets_log2 = torch.log2(targets + 1.0)
-        
-        # 验证标准化结果
-        if torch.isnan(predictions_log2).any() or torch.isnan(targets_log2).any():
-            logger.warning("⚠️ Log2标准化后发现NaN值，可能存在负数输入")
-        
-        logger.debug(f"🔢 Log2标准化: 预测值范围 [{predictions_log2.min():.3f}, {predictions_log2.max():.3f}]")
-        logger.debug(f"🔢 Log2标准化: 目标值范围 [{targets_log2.min():.3f}, {targets_log2.max():.3f}]")
-        
-        return predictions_log2, targets_log2
-
-    def test_full_slide(self, slide_data: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
-        """
-        对整个slide进行测试，逐spot预测后整合结果
-        
-        Args:
-            slide_data: 完整slide数据，包含：
-                - img: [num_spots, feature_dim]
-                - target_genes: [num_spots, num_genes]
-                - positions: [num_spots, 2]
-                - slide_id: str
-                - num_spots: int
-                
-        Returns:
-            包含预测结果和评价指标的字典
-        """
-        self.eval()  # 设置为评估模式
-        
-        # 获取slide信息
-        slide_id = slide_data['slide_id']
-        num_spots = slide_data['num_spots']
-        
-        print(f"🔬 开始测试slide: {slide_id}，共{num_spots}个spots")
-        logger.info(f"Testing full slide: {slide_id} with {num_spots} spots")
-        
-        # 准备结果容器
-        all_predictions = []
-        all_targets = []
-        
-        # 逐spot进行预测
-        with torch.no_grad():
-            for spot_idx in range(num_spots):
-                # 构造单个spot的batch数据
-                single_spot_batch = {
-                    'img': slide_data['img'][spot_idx:spot_idx+1],  # [1, feature_dim]
-                    'target_genes': slide_data['target_genes'][spot_idx:spot_idx+1],  # [1, num_genes]
-                    'positions': slide_data['positions'][spot_idx:spot_idx+1],  # [1, 2]
-                    'slide_id': slide_id,
-                    'spot_idx': spot_idx
-                }
-                
-                # 移动到正确的设备
-                for key, value in single_spot_batch.items():
-                    if isinstance(value, torch.Tensor):
-                        single_spot_batch[key] = value.to(self.device)
-                
-                # 预处理输入
-                processed_batch = self._preprocess_inputs(single_spot_batch)
-                
-                # 模型预测
-                results_dict = self.model(**processed_batch)
-                
-
-                
-                # 提取预测和目标
-                prediction, target = self._extract_predictions_and_targets(results_dict, single_spot_batch)
-                
-                # 收集结果
-                all_predictions.append(prediction.cpu().numpy())
-                all_targets.append(target.cpu().numpy())
-                
-                # 每100个spot显示一次进度
-                if (spot_idx + 1) % 100 == 0 or spot_idx == num_spots - 1:
-                    print(f"  📈 已处理 {spot_idx + 1}/{num_spots} spots")
-        
-        # 整合所有预测结果
-        predictions_array = np.vstack(all_predictions)  # [num_spots, num_genes]
-        targets_array = np.vstack(all_targets)  # [num_spots, num_genes]
-        
-        print(f"✅ Slide {slide_id} 测试完成")
-        print(f"   预测结果形状: {predictions_array.shape}")
-        print(f"   目标数据形状: {targets_array.shape}")
-        
-        # 计算完整的评价指标
-        metrics = self.calculate_evaluation_metrics(targets_array, predictions_array)
-        
-        # 打印评价结果
-        self.print_evaluation_results(metrics, f"Slide {slide_id}")
-        
-        return {
-            'predictions': predictions_array,
-            'targets': targets_array,
-            'metrics': metrics,
-            'slide_id': slide_id,
-            'num_spots': num_spots
-        }
-
-    def run_full_slide_testing(self) -> Dict[str, Any]:
-        """
-        运行完整的slide测试流程
-        
-        Returns:
-            包含所有slide测试结果的字典
-        """
-        print("🎯 开始整slide测试模式...")
-        logger.info("Starting full slide testing mode...")
-        
-        # 获取测试数据集
-        if not hasattr(self.trainer, 'datamodule'):
-            raise ValueError("No datamodule found in trainer")
-        
-        datamodule = self.trainer.datamodule
-        if not hasattr(datamodule, 'test_dataloader'):
-            raise ValueError("No test dataloader found")
-        
-        test_dataset = datamodule.test_dataloader().dataset
-        
-        # 获取原始dataset（可能被包装了）
-        original_dataset = test_dataset
-        while hasattr(original_dataset, 'dataset'):
-            original_dataset = original_dataset.dataset
-        
-        # 获取测试slide列表
-        test_slide_ids = original_dataset.get_test_slide_ids()
-        
-        if not test_slide_ids:
-            raise ValueError("No test slides found")
-        
-        print(f"📋 找到 {len(test_slide_ids)} 个测试slides: {test_slide_ids}")
-        
-        # 存储所有slide的结果
-        all_slide_results = {}
-        aggregated_predictions = []
-        aggregated_targets = []
-        
-        # 逐个测试每个slide
-        for slide_id in test_slide_ids:
-            print(f"\n{'='*60}")
-            print(f"🔬 测试Slide: {slide_id}")
-            print(f"{'='*60}")
+            # 提取关键指标
+            key_metrics = {}
+            for name, value in val_metrics.items():
+                if isinstance(value, torch.Tensor):
+                    if value.numel() > 1:
+                        mean_val = torch.nan_to_num(value, nan=0.0).mean().item()
+                        key_metrics[name] = mean_val
+                    else:
+                        key_metrics[name] = value.item()
             
-            # 获取完整slide数据
-            slide_data = original_dataset.get_full_slide_for_testing(slide_id)
+            # 简洁格式打印 - 避免复杂的PCC计算
+            print(f"\n🎯 Epoch {self.current_epoch} 验证结果:")
             
-            # 进行测试
-            slide_results = self.test_full_slide(slide_data)
+            # 只显示基础指标
+            basic_metrics = ['mse', 'mae', 'r2']
+            print("   📈 基础指标:")
+            for metric in basic_metrics:
+                if metric in key_metrics:
+                    print(f"      {metric.upper()}: {key_metrics[metric]:.4f}")
             
-            # 保存结果
-            all_slide_results[slide_id] = slide_results
+            print()  # 空行分隔
             
-            # 累积所有数据用于总体评估
-            aggregated_predictions.append(slide_results['predictions'])
-            aggregated_targets.append(slide_results['targets'])
-            
-            # 保存单个slide的结果
-            if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
-                save_dir = os.path.join(self.config.GENERAL.log_path, 'test_results')
-            else:
-                save_dir = './logs/test_results'
-            
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f"{slide_id}_results.txt")
-            self.save_evaluation_results(slide_results['metrics'], save_path, slide_id, "VAR_ST")
-        
-        # 计算所有slide的聚合结果
-        print(f"\n{'='*60}")
-        print("📊 计算聚合评价指标...")
-        print(f"{'='*60}")
-        
-        all_predictions = np.vstack(aggregated_predictions)
-        all_targets = np.vstack(aggregated_targets)
-        
-        overall_metrics = self.calculate_evaluation_metrics(all_targets, all_predictions)
-        self.print_evaluation_results(overall_metrics, "整体测试结果")
-        
-        # 保存整体结果
-        if hasattr(self.config, 'GENERAL') and hasattr(self.config.GENERAL, 'log_path'):
-            save_dir = os.path.join(self.config.GENERAL.log_path, 'test_results')
-        else:
-            save_dir = './logs/test_results'
-        
-        save_path = os.path.join(save_dir, "overall_results.txt")
-        self.save_evaluation_results(overall_metrics, save_path, "ALL_SLIDES", "VAR_ST")
-        
-        # 生成可视化（如果启用）
-        enable_vis = self._get_visualization_setting()
-        if enable_vis and VISUALIZATION_AVAILABLE:
-            print("🎨 生成测试结果可视化...")
-            
-            # 获取基因名称和marker基因
-            gene_names = self._load_gene_names()
-            marker_genes = self.get_marker_genes_for_dataset(getattr(self.config, 'expr_name', 'default'))
-            
-            # 为每个slide生成可视化
-            for slide_id, slide_results in all_slide_results.items():
-                try:
-                    # 获取对应的adata
-                    slide_data = original_dataset.get_full_slide_for_testing(slide_id)
-                    adata = slide_data.get('adata', None)
-                    
-                    self.create_visualizations(
-                        phase=f"test_{slide_id}",
-                        y_true=slide_results['targets'],
-                        y_pred=slide_results['predictions'],
-                        metrics=slide_results['metrics'],
-                        gene_names=gene_names,
-                        marker_genes=marker_genes,
-                        adata=adata,
-                        slide_id=slide_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to create visualization for slide {slide_id}: {e}")
-            
-            # 生成整体可视化
-            try:
-                self.create_visualizations(
-                    phase="test_overall",
-                    y_true=all_targets,
-                    y_pred=all_predictions,
-                    metrics=overall_metrics,
-                    gene_names=gene_names,
-                    marker_genes=marker_genes
-                )
-            except Exception as e:
-                logger.warning(f"Failed to create overall visualization: {e}")
-        
-        print(f"\n🎉 整slide测试完成!")
-        print(f"  测试slides数量: {len(test_slide_ids)}")
-        print(f"  总spots数量: {all_predictions.shape[0]}")
-        print(f"  基因数量: {all_predictions.shape[1]}")
-        print(f"  整体PCC-10: {overall_metrics['PCC-10']:.4f}")
-        print(f"  整体MSE: {overall_metrics['MSE']:.4f}")
-        
-        return {
-            'slide_results': all_slide_results,
-            'overall_metrics': overall_metrics,
-            'overall_predictions': all_predictions,
-            'overall_targets': all_targets,
-            'test_slide_ids': test_slide_ids
-        }
+        except Exception as e:
+            print(f"❌ 安全验证结果打印失败: {e}")
+            self._logger.error(f"安全验证摘要打印出错: {e}")

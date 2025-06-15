@@ -21,11 +21,11 @@ class STDataset(Dataset):
                  encoder_name: str = 'uni',    # 编码器类型
                  use_augmented: bool = False,  # 是否使用增强
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
-                 normalize: bool = True,       # 数据归一化 (STEm方式: log2(+1))
+                 normalize: bool = True,       # 保留参数兼容性，实际使用原始计数
                  use_var_st_genes: bool = False,  # 🆕 是否使用VAR-ST的196基因模式
                  var_st_gene_count: int = 196,   # 🆕 VAR-ST模式的基因数量
-                 gene_count_mode: str = 'discrete_tokens',  # 🆕 基因计数模式（固定为离散）
-                 max_gene_count: int = 4095):   # 🆕 最大基因计数值
+                 gene_count_mode: str = 'discrete_tokens',  # 🆕 基因计数模式（使用原始计数）
+                 max_gene_count: int = 4095):   # 🆕 最大基因计数值（超出时截断）
         """
         空间转录组学数据集
         
@@ -40,7 +40,7 @@ class STDataset(Dataset):
             expand_augmented: 是否将3D增强嵌入展开为7倍训练样本
                 - True: 每个spot变成7个训练样本 (真正的数据增强)
                 - False: 只使用第一个增强版本 (原图)
-            normalize: 是否进行数据归一化 (STEm方式: log2(+1))
+            normalize: 保留参数兼容性，实际使用原始基因计数值
             use_var_st_genes: 🆕 是否使用VAR-ST基因模式
                 - True: 使用前196个基因 (适合VAR模型的14x14空间排列)
                 - False: 使用数据集原生的基因列表 (如PRAD的200基因)
@@ -80,9 +80,9 @@ class STDataset(Dataset):
         self.gene_count_mode = gene_count_mode  # 🆕 基因计数模式（固定为离散）
         self.max_gene_count = max_gene_count  # 🆕 最大基因计数
         
-        # 离散模式不归一化
+        # 使用原始计数模式
         self.norm_param = {'normalize': False}
-        print(f"🔢 使用离散token模式: 基因计数范围 [0, {max_gene_count}]")
+        print(f"🔢 使用原始基因计数模式: 计数范围 [0, {max_gene_count}]")
         
         # 构建路径
         self.st_dir = f"{data_path}st"
@@ -100,7 +100,7 @@ class STDataset(Dataset):
         print(f"  - 编码器: {encoder_name}")
         print(f"  - 使用增强: {use_augmented}")
         print(f"  - 🆕 VAR-ST基因模式: {use_var_st_genes}")
-        print(f"  - 🔢 基因计数模式: {gene_count_mode}")
+        print(f"  - 🔢 基因计数模式: {gene_count_mode} (保持原始计数)")
         
         if self.use_var_st_genes:
             print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count} (前{var_st_gene_count}个基因)")
@@ -436,22 +436,16 @@ class STDataset(Dataset):
                 
                 adata = adata[:, common_genes].copy()
 
-            # 数据归一化 - 遵循STEm的简单标准化方式
-            if kwargs.get('normalize', True):
-
-                
-                # STEm方式: 只使用log2(+1)变换
-
-                if sparse.issparse(adata.X):
-                    X = adata.X.toarray()
-                else:
-                    X = adata.X.copy()
-                
-                # 应用log2(+1)变换
-                X = np.log2(X + 1)
-                adata.X = sparse.csr_matrix(X) if sparse.issparse(adata.X) else X
-                
-
+            # 保持原始基因计数，不进行log2变换
+            # 基因计数本身就是离散的，直接使用原始计数值作为训练目标
+            if sparse.issparse(adata.X):
+                X = adata.X.toarray()
+            else:
+                X = adata.X.copy()
+            
+            # 确保计数值为非负整数
+            X = np.maximum(0, X)  # 确保非负
+            adata.X = sparse.csr_matrix(X) if sparse.issparse(adata.X) else X
             
             # 保存标准化后的坐标
             adata.obsm['positions'] = coords
@@ -675,16 +669,21 @@ class STDataset(Dataset):
 
     def _process_gene_expression(self, gene_expr: np.ndarray) -> torch.Tensor:
         """
-        处理基因表达数据为离散token
+        处理基因表达数据 - 保持原始计数值
         
         Args:
             gene_expr: 原始基因表达数组 [num_genes]
             
         Returns:
-            处理后的基因表达tensor (long)
+            处理后的基因表达tensor (long) - 保持原始计数值
         """
-        # 离散token模式：将基因计数值转换为long tensor并截断
+        # 直接使用原始计数值，不进行log2变换
+        # 确保是非负整数，并截断超出范围的值
+        gene_expr = np.maximum(0, gene_expr)  # 确保非负
         gene_expr = np.round(gene_expr).astype(np.int64)  # 确保是整数
+        
+        # 只有当计数值超过max_gene_count时才截断
         gene_tokens = torch.clamp(torch.from_numpy(gene_expr).long(), 0, self.max_gene_count)
+        
         return gene_tokens
 

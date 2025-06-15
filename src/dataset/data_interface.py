@@ -22,7 +22,7 @@ class DataInterface(pl.LightningDataModule):
         print(f"  - 数据路径: {config.data_path}")
         print(f"  - 编码器: {config.encoder_name}")
         print(f"  - 使用增强: {config.use_augmented}")
-        print(f"  - 🧬 模型: VAR_ST")
+        print(f"  - 🧬 模型: VAR_ST (使用原始基因计数)")
         
         if use_var_st_genes:
             print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count}")

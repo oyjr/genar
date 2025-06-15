@@ -199,10 +199,12 @@ def load_callbacks(cfg: Dict):
             monitor = ckpt_cfg.get('monitor', default_monitor)
             save_top_k = ckpt_cfg['save_top_k']
             mode = ckpt_cfg.get('mode', default_mode)
+            filename = ckpt_cfg.get('filename', checkpoint_filename)
         else:
             monitor = getattr(ckpt_cfg, 'monitor', default_monitor)
             save_top_k = ckpt_cfg.save_top_k
             mode = getattr(ckpt_cfg, 'mode', default_mode)
+            filename = getattr(ckpt_cfg, 'filename', checkpoint_filename)
             
         # 确保目录存在
         os.makedirs(cfg.GENERAL.log_path, exist_ok=True)
@@ -212,10 +214,14 @@ def load_callbacks(cfg: Dict):
             monitor=str(monitor),  # 确保是字符串
             save_top_k=int(save_top_k),  # 确保是整数
             mode=str(mode),  # 确保是字符串
-            filename=checkpoint_filename  # 使用动态生成的文件名
+            filename=filename,  # 使用配置中的文件名模板
+            verbose=True  # 🔧 启用详细日志
         )
         Mycallbacks.append(model_checkpoint)
-        print(f"   ✅ Model Checkpoint: {monitor} -> {checkpoint_filename}")
+        print(f"   ✅ Model Checkpoint: {monitor} -> {filename}")
+        print(f"      📁 保存路径: {cfg.GENERAL.log_path}")
+        print(f"      🔍 监控模式: {mode} (save_top_k={save_top_k})")
+        print(f"      📝 详细日志: 已启用")
     
     return Mycallbacks
 

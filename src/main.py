@@ -47,34 +47,45 @@ DATASETS = {
     }
 }
 
-# VAR_ST 模型配置
+# Multi-Scale Gene VAR 模型配置
 VAR_ST_CONFIG = {
-    'model_name': 'VAR_ST',
-    'num_genes': 200,
-    'histology_feature_dim': 1024,  # 依赖编码器
-    'spatial_coord_dim': 2,
-    # VAR Transformer 配置
-    'var_config': {
+        'model_name': 'VAR_ST',
+        'num_genes': 200,
+        'histology_feature_dim': 1024,  # 依赖编码器
+        'spatial_coord_dim': 2,
+        
+        # Multi-Scale VAR 配置 (内存优化版本)
+        'gene_patch_nums': (1, 2, 4, 6, 8, 10, 15),  # 7个尺度，最后一个改为14减少序列长度
         'vocab_size': 4096,
-        'embed_dim': 640,
-        'num_heads': 8,
-        'num_layers': 12,
-        'feedforward_dim': 2560,
-        'dropout': 0.1,
-        'max_sequence_length': 1500,
-        'condition_embed_dim': 640
-    }
+        'embed_dim': 512,  # 减少嵌入维度 768->512
+        'num_heads': 8,    # 减少注意力头数 12->8
+        'num_layers': 8,   # 减少层数 12->8
+        'mlp_ratio': 3.0,  # 减少MLP倍数 4.0->3.0
+        
+        # Dropout 参数
+        'drop_rate': 0.0,
+        'attn_drop_rate': 0.0,
+        'drop_path_rate': 0.1,
+        
+        # 条件相关参数
+        'condition_embed_dim': 512,  # 匹配embed_dim
+        'cond_drop_rate': 0.1,
+        
+        # 其他参数
+        'norm_eps': 1e-6,
+        'shared_aln': False,
+        'attn_l2_norm': True
 }
 
-# 默认训练配置 - 从base_config.yaml提取的核心配置
+# 默认训练配置 
 DEFAULT_CONFIG = {
     'GENERAL': {
         'seed': 2021,
-        'log_path': './logs',  # Will be updated to dataset-specific path
+        'log_path': './logs', 
         'debug': False
     },
     'DATA': {
-        'normalize': True,  # STEm方式: log2(+1)变换
+        'normalize': True,  # 保留参数兼容性，实际使用原始基因计数
         'train_dataloader': {
             'batch_size': 256,
             'num_workers': 4,
@@ -127,7 +138,7 @@ DEFAULT_CONFIG = {
         }
     },
     'MULTI_GPU': {
-        'find_unused_parameters': True,
+        'find_unused_parameters': True,  # 🔧 启用未使用参数检测：VAR模型可能有未使用参数
         'accumulate_grad_batches': 1
     }
 }
@@ -148,7 +159,7 @@ Examples:
   # Basic usage
   python src/main.py --dataset PRAD --gpus 4
   
-  # With custom parameters  
+  # With custom parameters
   python src/main.py --dataset PRAD --encoder uni \\
       --gpus 4 --epochs 200 --batch_size 256 --lr 1e-4
   
@@ -316,16 +327,17 @@ def build_config_from_args(args):
     config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     config.MODEL.gene_count_mode = config.gene_count_mode
     config.MODEL.max_gene_count = config.max_gene_count
-    # VAR-ST使用val_loss作为监控指标
-    config.TRAINING.monitor = 'val_loss'
+    # VAR-ST使用train_loss作为监控指标
+    config.TRAINING.monitor = 'train_loss'
     config.TRAINING.mode = 'min'
-    config.CALLBACKS.early_stopping.monitor = 'val_loss'
+    config.CALLBACKS.early_stopping.monitor = 'train_loss'
     config.CALLBACKS.early_stopping.mode = 'min'
-    config.CALLBACKS.model_checkpoint.monitor = 'val_loss'
+    config.CALLBACKS.model_checkpoint.monitor = 'train_loss'
     config.CALLBACKS.model_checkpoint.mode = 'min'
-    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-val_loss={val_loss:.4f}'
-    print(f"   - VAR-ST监控指标: val_loss")
-    print(f"   - 基因计数模式: discrete_tokens")
+    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-train_loss={train_loss:.4f}'
+    print(f"   - VAR-ST监控指标: train_loss")
+    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-train_loss={{train_loss:.4f}}")
+    print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
     print(f"   - 最大基因计数: {config.max_gene_count}")
     
     print(f"✅ 配置构建完成:")
