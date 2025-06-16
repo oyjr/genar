@@ -53,8 +53,8 @@ class DataInterface(pl.LightningDataModule):
             'normalize': self.config.DATA.normalize,
             'use_var_st_genes': self.use_var_st_genes,  # 🆕 VAR-ST基因模式
             'var_st_gene_count': self.var_st_gene_count,  # 🆕 VAR-ST基因数量
-            'gene_count_mode': getattr(self.config, 'gene_count_mode', 'continuous'),  # 🆕 基因计数模式
-            'max_gene_count': getattr(self.config, 'max_gene_count', 4095),  # 🆕 最大基因计数
+            'gene_count_mode': getattr(self.config, 'gene_count_mode', 'discrete_tokens'),  # 🆕 基因计数模式
+            'max_gene_count': getattr(self.config, 'max_gene_count', 200),  # 🆕 最大基因计数
         }
         
         print(f"基础参数配置: {base_params}")

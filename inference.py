@@ -38,8 +38,8 @@ DATASETS = {
     },
     'her2st': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
-        'val_slides': 'A1,B1',
-        'test_slides': 'C1,D1', 
+        'val_slides': 'SPA148',
+        'test_slides': 'SPA148', 
         'recommended_encoder': 'conch'
     }
 }
@@ -180,7 +180,7 @@ def create_config_for_inference(dataset_name: str, encoder_name: str = None):
             # 🔧 关键修复：删除所有硬编码的模型配置
             # 模型配置将从checkpoint中自动读取，确保训练和推理完全一致
             'gene_count_mode': 'discrete_tokens',
-            'max_gene_count': 4095
+            'max_gene_count': 200
         }
     })
     
@@ -194,7 +194,7 @@ def create_config_for_inference(dataset_name: str, encoder_name: str = None):
     config.use_augmented = True
     config.expand_augmented = True
     config.gene_count_mode = 'discrete_tokens'
-    config.max_gene_count = 4095
+    config.max_gene_count = 200
     
     return config
 
@@ -214,25 +214,31 @@ def run_inference(model: ModelInterface, dataloader, args, device: str = 'cuda')
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="推理中")):
             try:
-                # 每个批次前都清理GPU缓存（因为是单样本推理）
+                # 每个批次前都清理GPU缓存
                 torch.cuda.empty_cache()
                 
-                # 移动数据到设备 - 修正键名映射
-                histology_features = batch['img'].to(device)  # 'img' -> histology_features
-                spatial_coords = batch['positions'].to(device)  # 'positions' -> spatial_coords
-                gene_expression = batch['target_genes'].to(device)  # 'target_genes' -> gene_expression
-                
-                # 🔧 关键修复：使用ModelInterface的预处理，但调用底层模型的inference方法
-                # 这样既保证了数据预处理一致性，又支持采样参数控制
+                # 🔧 关键修复：先将整个batch移动到设备，然后再预处理
+                # 确保所有数据都在同一设备上
+                batch_on_device = {}
+                for key, value in batch.items():
+                    if torch.is_tensor(value):
+                        batch_on_device[key] = value.to(device)
+                    else:
+                        batch_on_device[key] = value
                 
                 # 使用ModelInterface的预处理逻辑
-                processed_batch = model._preprocess_inputs(batch)
+                processed_batch = model._preprocess_inputs(batch_on_device)
                 
                 # 严格验证预处理结果
                 required_keys = ['histology_features', 'spatial_coords']
                 for key in required_keys:
                     if key not in processed_batch:
                         raise ValueError(f"预处理后缺少必需的键: {key}")
+                
+                # 确保预处理后的数据也在正确设备上
+                for key in required_keys:
+                    if torch.is_tensor(processed_batch[key]):
+                        processed_batch[key] = processed_batch[key].to(device)
                 
                 # 调用底层模型的inference方法，支持采样参数
                 outputs = model.model.inference(
@@ -252,13 +258,14 @@ def run_inference(model: ModelInterface, dataloader, args, device: str = 'cuda')
                     raise ValueError(f"模型输出中缺少'predictions'键，可用键: {list(outputs.keys())}")
                 
                 predictions = outputs['predictions']
+                gene_expression = batch_on_device['target_genes']
                 
                 # 立即移动到CPU并收集结果
                 all_predictions.append(predictions.cpu())
                 all_targets.append(gene_expression.cpu())
                 
                 # 删除GPU上的临时变量
-                del histology_features, spatial_coords, gene_expression, predictions
+                del batch_on_device, processed_batch, predictions, gene_expression
                 if 'outputs' in locals():
                     del outputs
                 

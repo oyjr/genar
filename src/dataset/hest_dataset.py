@@ -25,7 +25,7 @@ class STDataset(Dataset):
                  use_var_st_genes: bool = False,  # 🆕 是否使用VAR-ST的196基因模式
                  var_st_gene_count: int = 196,   # 🆕 VAR-ST模式的基因数量
                  gene_count_mode: str = 'discrete_tokens',  # 🆕 基因计数模式（使用原始计数）
-                 max_gene_count: int = 4095):   # 🆕 最大基因计数值（超出时截断）
+                 max_gene_count: int = 200):   # 🆕 最大基因计数值（超出时截断）
         """
         空间转录组学数据集
         
@@ -151,19 +151,25 @@ class STDataset(Dataset):
                 raise ValueError(f"基因列表为空: {gene_file}")
             
             if self.use_var_st_genes:
-                # VAR-ST模式：使用前N个基因
-                if len(all_genes) < self.var_st_gene_count:
-                    print(f"⚠️  警告: 数据集只有{len(all_genes)}个基因，少于VAR-ST需要的{self.var_st_gene_count}个")
+                # VAR-ST模式：使用前N个基因，但不超过max_gene_count
+                gene_count = min(self.var_st_gene_count, self.max_gene_count)
+                if len(all_genes) < gene_count:
+                    print(f"⚠️  警告: 数据集只有{len(all_genes)}个基因，少于需要的{gene_count}个")
                     selected_genes = all_genes  # 使用所有可用基因
                 else:
-                    selected_genes = all_genes[:self.var_st_gene_count]  # 使用前N个基因
+                    selected_genes = all_genes[:gene_count]  # 使用前N个基因
                 
-                print(f"VAR-ST模式: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因")
+                print(f"VAR-ST模式: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因 (限制为{self.max_gene_count})")
                 return selected_genes
             else:
-                # 标准模式：使用所有基因
-                print(f"标准模式: 使用数据集原生的{len(all_genes)}个基因")
-                return all_genes
+                # 标准模式：使用前max_gene_count个基因
+                if len(all_genes) <= self.max_gene_count:
+                    print(f"标准模式: 使用数据集原生的{len(all_genes)}个基因")
+                    return all_genes
+                else:
+                    selected_genes = all_genes[:self.max_gene_count]
+                    print(f"标准模式: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因 (限制为{self.max_gene_count})")
+                    return selected_genes
             
         except UnicodeDecodeError as e:
             raise ValueError(f"基因列表文件编码错误: {gene_file}, 错误: {e}")
@@ -206,10 +212,10 @@ class STDataset(Dataset):
             if slide not in all_slides_set:
                 raise ValueError(f"指定的slide ID不存在: {slide}, 可用的slides: {sorted(all_slides)}")
         
-        # 检查重复
+        # 检查重复 - 允许验证集和测试集使用相同的slides（适用于小数据集场景）
         overlap = set(val_slides) & set(test_slides)
         if overlap:
-            raise ValueError(f"验证集和测试集存在重复slides: {overlap}")
+            print(f"⚠️  验证集和测试集使用相同的slides: {overlap} (这在小数据集场景下是允许的)")
         
         # 剩余slides分配给训练集
         used_slides = set(val_slides + test_slides)

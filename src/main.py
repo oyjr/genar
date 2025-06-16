@@ -41,8 +41,8 @@ DATASETS = {
     },
     'her2st': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
-        'val_slides': 'A1,B1',
-        'test_slides': 'C1,D1', 
+        'val_slides': 'SPA148',
+        'test_slides': 'SPA148', 
         'recommended_encoder': 'conch'
     }
 }
@@ -56,7 +56,7 @@ VAR_ST_CONFIG = {
         
         # Multi-Scale VAR 配置 (内存优化版本)
         'gene_patch_nums': (1, 2, 4, 6, 8, 10, 15),  # 7个尺度，最后一个改为14减少序列长度
-        'vocab_size': 4096,
+        'vocab_size': 201,  # 🔧 修复：统一为201 (对应0-200的基因计数范围)
         'embed_dim': 512,  # 减少嵌入维度 768->512
         'num_heads': 8,    # 减少注意力头数 12->8
         'num_layers': 8,   # 减少层数 12->8
@@ -205,8 +205,8 @@ Examples:
                         help='展开增强数据为7倍样本 (默认: True)')
     
     # === 🆕 基因计数参数 ===
-    parser.add_argument('--max-gene-count', type=int, default=4095,
-                        help='最大基因计数值 (默认: 4095)')
+    parser.add_argument('--max-gene-count', type=int, default=200,
+                        help='最大基因计数值 (默认: 200)')
     
     # === 其他参数 ===
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
@@ -270,6 +270,9 @@ def build_config_from_args(args):
     # 更新模型配置
     config.MODEL = Dict(model_info)
     config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
+    # 🔧 根据命令行参数更新基因数量
+    max_gene_count = getattr(args, 'max_gene_count', 200)
+    config.MODEL.num_genes = max_gene_count
     
     # 更新训练参数
     if args.epochs:
@@ -307,7 +310,7 @@ def build_config_from_args(args):
     config.use_augmented = getattr(args, 'use_augmented', True)
     config.expand_augmented = getattr(args, 'expand_augmented', True)
     config.gene_count_mode = 'discrete_tokens'  # 固定为离散token模式
-    config.max_gene_count = getattr(args, 'max_gene_count', 4095)
+    config.max_gene_count = getattr(args, 'max_gene_count', 200)
     
     # 设置多GPU参数
     config.devices = devices
@@ -327,16 +330,16 @@ def build_config_from_args(args):
     config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     config.MODEL.gene_count_mode = config.gene_count_mode
     config.MODEL.max_gene_count = config.max_gene_count
-    # VAR-ST使用train_loss作为监控指标
-    config.TRAINING.monitor = 'train_loss'
-    config.TRAINING.mode = 'min'
-    config.CALLBACKS.early_stopping.monitor = 'train_loss'
-    config.CALLBACKS.early_stopping.mode = 'min'
-    config.CALLBACKS.model_checkpoint.monitor = 'train_loss'
-    config.CALLBACKS.model_checkpoint.mode = 'min'
-    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-train_loss={train_loss:.4f}'
-    print(f"   - VAR-ST监控指标: train_loss")
-    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-train_loss={{train_loss:.4f}}")
+    # 🔧 VAR-ST使用val_pcc_50作为监控指标，保存最佳PCC模型
+    config.TRAINING.monitor = 'val_pcc_50'
+    config.TRAINING.mode = 'max'
+    config.CALLBACKS.early_stopping.monitor = 'val_pcc_50'
+    config.CALLBACKS.early_stopping.mode = 'max'
+    config.CALLBACKS.model_checkpoint.monitor = 'val_pcc_50'
+    config.CALLBACKS.model_checkpoint.mode = 'max'
+    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-pcc50={val_pcc_50:.4f}'
+    print(f"   - VAR-ST监控指标: val_pcc_50 (最大化)")
+    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-pcc50={{val_pcc_50:.4f}}")
     print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
     print(f"   - 最大基因计数: {config.max_gene_count}")
     

@@ -54,7 +54,7 @@ class MultiScaleGeneVAR(nn.Module):
         # Gene-related parameters
         num_genes: int = 200,
         gene_patch_nums: Tuple[int, ...] = (1, 2, 4, 6, 8, 10, 15),
-        vocab_size: int = 4096,
+        vocab_size: int = 201,
         
         # Model architecture parameters
         embed_dim: int = 768,
@@ -157,8 +157,8 @@ class MultiScaleGeneVAR(nn.Module):
         logger.info(f"📈 Model parameters: ~{self._count_parameters()/1e6:.1f}M")
     
     def _count_parameters(self) -> int:
-        """Count total parameters"""
-        return sum(p.numel() for p in self.parameters())
+        """Count the number of trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def init_weights(self, init_std: float = 0.02):
         """Initialize model weights following VAR initialization"""
@@ -255,10 +255,17 @@ class MultiScaleGeneVAR(nn.Module):
             
             # Build input sequence with teacher forcing
             start_token = torch.zeros(B, 1, dtype=torch.long, device=device)
+            # 🔧 关键修复：为了预测gene_count个基因，输入序列需要gene_count+1个位置
+            # 输入：[start_token, g1, g2, ..., g_{gene_count-1}, placeholder]
+            # 预测：[g1, g2, ..., g_{gene_count-1}, g_{gene_count}]
             if gene_count > 1:
-                scale_input = torch.cat([start_token, scale_target[:, :-1]], dim=1)
+                # 添加一个占位符位置，这样我们就有gene_count+1个输入位置
+                placeholder = torch.zeros(B, 1, dtype=torch.long, device=device)
+                scale_input = torch.cat([start_token, scale_target[:, :-1], placeholder], dim=1)  # [B, gene_count+1]
             else:
-                scale_input = start_token
+                # 对于只有1个基因的情况，我们需要2个位置：start_token + placeholder
+                placeholder = torch.zeros(B, 1, dtype=torch.long, device=device)
+                scale_input = torch.cat([start_token, placeholder], dim=1)  # [B, 2]
             
             input_sequences.append(scale_input)
             target_sequences.append(scale_target)
@@ -304,14 +311,15 @@ class MultiScaleGeneVAR(nn.Module):
         for scale_idx, (input_seq, target_seq) in enumerate(zip(input_sequences, target_sequences)):
             seq_len = input_seq.shape[1]
             end_idx = start_idx + seq_len
+            gene_count = target_seq.shape[1]
             
-            # Predict next tokens
-            if seq_len > 1:
-                pred_logits = logits[:, start_idx:end_idx-1, :]  # Prediction positions
-                pred_targets = target_seq[:, 1:]  # Target positions
-            else:
-                pred_logits = logits[:, start_idx:end_idx, :]
-                pred_targets = target_seq
+            # 🔧 修复：正确处理预测位置
+            # 对于每个尺度，我们预测从start_token之后的所有基因位置
+            pred_start = start_idx + 1
+            pred_end = start_idx + 1 + gene_count
+            
+            pred_logits = logits[:, pred_start:pred_end, :]  # 预测位置：start_token之后的gene_count个位置
+            pred_targets = target_seq  # 目标：完整的基因序列
             
             loss_logits.append(pred_logits.reshape(-1, self.vocab_size))
             loss_targets.append(pred_targets.reshape(-1))
@@ -339,25 +347,24 @@ class MultiScaleGeneVAR(nn.Module):
         
         # 计算最后一个尺度在预测序列中的位置
         final_scale_idx = len(input_sequences) - 1
-        final_scale_input_seq = input_sequences[final_scale_idx]
+        final_scale_target_seq = target_sequences[final_scale_idx]  # 使用target序列而不是input序列
         
         # 计算最后一个尺度的预测起始位置
         pred_offset = 0
         for i in range(final_scale_idx):
-            seq_len = input_sequences[i].shape[1]
-            pred_offset += (seq_len - 1)  # 除了start token之外的预测位置
+            gene_count = target_sequences[i].shape[1]
+            pred_offset += gene_count  # 每个尺度的预测位置数等于基因数量
         
-        # 提取最后一个尺度的预测
-        final_seq_len = final_scale_input_seq.shape[1]
-        final_pred_count = final_seq_len - 1  # 除了start token之外的预测位置
+        # 提取最后一个尺度的基因数量
+        final_gene_count = final_scale_target_seq.shape[1]  # 直接从target序列获取基因数量
         
         # 验证最后一个尺度确实包含200个基因
-        assert final_pred_count == self.num_genes, f"最后尺度预测数量({final_pred_count})必须等于目标基因数量({self.num_genes})"
+        assert final_gene_count == self.num_genes, f"最后尺度基因数量({final_gene_count})必须等于目标基因数量({self.num_genes})"
         
         # 从predictions中提取最后一个尺度的预测
         final_pred_start = pred_offset
-        final_scale_pred_flat = predictions[final_pred_start * B:(final_pred_start + final_pred_count) * B]
-        final_scale_predictions = final_scale_pred_flat.view(B, final_pred_count)  # [B, 200]
+        final_scale_pred_flat = predictions[final_pred_start * B:(final_pred_start + final_gene_count) * B]
+        final_scale_predictions = final_scale_pred_flat.view(B, final_gene_count)  # [B, 200]
         
         return {
             'loss': loss,
@@ -379,120 +386,131 @@ class MultiScaleGeneVAR(nn.Module):
         seed: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Inference forward pass - following the correct design philosophy:
-        1. Each scale depends on ALL previous scales (inter-scale dependency)
-        2. Within each scale, ALL tokens are generated in parallel (intra-scale parallelism)
-        
-        This matches the original VAR design and your intended architecture.
+        Correct inference implementation following original VAR design:
+        1. Enable KV caching to avoid recomputing attention for previous tokens
+        2. Each scale generates only NEW tokens, building on previous context
+        3. No causal mask needed during inference (KV cache handles causality)
+        4. Scale-by-scale generation with proper token accumulation
         """
         B = condition_embed.shape[0]
         device = condition_embed.device
         
-        # 🔧 设置随机种子以确保可重复性（如果提供）
+        # Set random seed for reproducibility
         if seed is not None:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
         
-        # Store completed scales
-        completed_scales = []
-        generated_genes = []
+        # 🔧 Step 1: Enable KV caching for inference
+        self.enable_kv_cache()
         
-        # Generate each scale sequentially (inter-scale dependency)
-        for scale_idx, gene_count in enumerate(self.cumulative_gene_counts):
-            logger.info(f"🔄 Generating scale {scale_idx + 1}/{self.num_scales}, target genes: {gene_count}")
+        try:
+            # Initialize generation
+            all_generated_tokens = []
+            scale_predictions = []
             
-            # Prepare input for current scale
-            start_token = torch.zeros(B, 1, dtype=torch.long, device=device)
+            # 🔧 Step 2: Generate each scale sequentially (inter-scale dependency)
+            for scale_idx, gene_count in enumerate(self.cumulative_gene_counts):
+                logger.info(f"🔄 Generating scale {scale_idx + 1}/{self.num_scales}, target genes: {gene_count}")
+                
+                if scale_idx == 0:
+                    # 🔧 First scale: Start with condition-based initialization
+                    # Create initial input for the first scale
+                    current_scale_tokens = gene_count + 1  # +1 for start token
+                    
+                    # Initialize with start token + placeholders
+                    x = torch.zeros(B, current_scale_tokens, self.embed_dim, device=device)
+                    
+                    # Use start token embedding for first position
+                    x[:, 0, :] = self.start_token_embeds[scale_idx]
+                    
+                    # Add position embeddings for this scale
+                    pos_start = 0
+                    pos_end = current_scale_tokens
+                    x = x + self.pos_embedding[:, pos_start:pos_end, :]
+                    
+                    # Add scale embeddings
+                    scale_embed = self.scale_embedding(torch.tensor(scale_idx, device=device))
+                    x = x + scale_embed.unsqueeze(0).unsqueeze(0).expand(B, current_scale_tokens, -1)
+                    
+                    # Process through transformer
+                    for block in self.transformer_blocks:
+                        x = block(x, condition_embed, attn_mask=None)  # No mask needed with KV cache
+                    
+                    # Generate tokens for this scale (positions 1 to gene_count)
+                    x = self.head_norm(x, condition_embed)
+                    logits = self.output_head(x)  # [B, current_scale_tokens, vocab_size]
+                    
+                    # Sample tokens for gene positions (skip start token position)
+                    gene_logits = logits[:, 1:gene_count+1, :]  # [B, gene_count, vocab_size]
+                    scale_tokens = self._sample_multiple_tokens(gene_logits, temperature, top_k, top_p)
+                    
+                    # Store results
+                    all_generated_tokens.append(scale_tokens)
+                    scale_predictions.append(scale_tokens)
+                    
+                else:
+                    # 🔧 Subsequent scales: Generate only NEW tokens
+                    prev_gene_count = self.cumulative_gene_counts[scale_idx - 1]
+                    new_gene_count = gene_count - prev_gene_count
+                    
+                    if new_gene_count <= 0:
+                        # No new genes to generate, reuse previous result
+                        scale_predictions.append(scale_tokens[:, :gene_count])
+                        continue
+                    
+                    # Create input for new token positions only
+                    new_tokens = new_gene_count + 1  # +1 for scale start token
+                    x = torch.zeros(B, new_tokens, self.embed_dim, device=device)
+                    
+                    # Scale start token
+                    x[:, 0, :] = self.start_token_embeds[scale_idx]
+                    
+                    # Add position embeddings (continuing from previous scales)
+                    prev_total_length = sum(self.cumulative_gene_counts[i] + 1 for i in range(scale_idx))
+                    pos_start = prev_total_length
+                    pos_end = prev_total_length + new_tokens
+                    x = x + self.pos_embedding[:, pos_start:pos_end, :]
+                    
+                    # Add scale embeddings
+                    scale_embed = self.scale_embedding(torch.tensor(scale_idx, device=device))
+                    x = x + scale_embed.unsqueeze(0).unsqueeze(0).expand(B, new_tokens, -1)
+                    
+                    # Process through transformer (KV cache will handle previous context)
+                    for block in self.transformer_blocks:
+                        x = block(x, condition_embed, attn_mask=None)  # No mask needed
+                    
+                    # Generate new tokens
+                    x = self.head_norm(x, condition_embed)
+                    logits = self.output_head(x)  # [B, new_tokens, vocab_size]
+                    
+                    # Sample new gene tokens (skip scale start token)
+                    new_gene_logits = logits[:, 1:new_gene_count+1, :]  # [B, new_gene_count, vocab_size]
+                    new_tokens = self._sample_multiple_tokens(new_gene_logits, temperature, top_k, top_p)
+                    
+                    # Combine with previous tokens to get full scale prediction
+                    prev_tokens = scale_tokens[:, :prev_gene_count]
+                    scale_tokens = torch.cat([prev_tokens, new_tokens], dim=1)  # [B, gene_count]
+                    
+                    # Store results
+                    all_generated_tokens.append(new_tokens)
+                    scale_predictions.append(scale_tokens)
+                
+                logger.info(f"✅ Scale {scale_idx + 1} completed: generated {scale_tokens.shape[1]} genes")
             
-            if scale_idx == 0:
-                # First scale: start token + positions for gene_count genes
-                # We create placeholder positions that will be filled by the model
-                current_scale_input = start_token.expand(B, gene_count + 1)  # [B, gene_count + 1]
-                # Only the first position is start token, others will be predicted
-                current_scale_input = current_scale_input.clone()
-                current_scale_input[:, 1:] = 0  # Initialize prediction positions to 0
-            else:
-                # Subsequent scales: start token + positions for gene_count genes
-                current_scale_input = torch.zeros(B, gene_count + 1, dtype=torch.long, device=device)
-                # First position is start token, others are prediction positions
+            # Final predictions (use the last scale which contains all genes)
+            final_predictions = scale_predictions[-1][:, :self.num_genes].float()
             
-            # Build complete input: all previous scales + current scale template
-            if completed_scales:
-                full_input = torch.cat(completed_scales + [current_scale_input], dim=1)
-            else:
-                full_input = current_scale_input
+            return {
+                'predictions': final_predictions,  # [B, num_genes] - final gene expressions
+                'token_predictions': scale_predictions[-1][:, :self.num_genes],  # [B, num_genes] - token IDs
+                'all_scale_predictions': scale_predictions,
+                'scale_tokens': all_generated_tokens
+            }
             
-            seq_len = full_input.shape[1]
-            
-            # Token embeddings
-            input_embeds = self.gene_embedding(full_input)  # [B, seq_len, embed_dim]
-            
-            # Position embeddings
-            pos_embeds = self.pos_embedding[:, :seq_len, :]
-            input_embeds = input_embeds + pos_embeds
-            
-            # Scale embeddings - correctly assign scale IDs
-            scale_indicators = []
-            # Previous completed scales
-            for s_idx, scale in enumerate(completed_scales):
-                scale_indicators.extend([s_idx] * scale.shape[1])
-            # Current scale
-            scale_indicators.extend([scale_idx] * current_scale_input.shape[1])
-            
-            scale_ids = torch.tensor(scale_indicators, dtype=torch.long, device=device)
-            scale_embeds = self.scale_embedding(scale_ids).unsqueeze(0).expand(B, -1, -1)
-            input_embeds = input_embeds + scale_embeds
-            
-            # Create multi-scale causal mask (same as training)
-            if completed_scales:
-                sequence_lengths = [scale.shape[1] for scale in completed_scales] + [current_scale_input.shape[1]]
-            else:
-                sequence_lengths = [current_scale_input.shape[1]]
-            
-            causal_mask = self.create_multiscale_causal_mask(sequence_lengths).to(device)
-            
-            # Transformer processing with full context
-            hidden_states = input_embeds
-            for block in self.transformer_blocks:
-                hidden_states = block(hidden_states, condition_embed, causal_mask)
-            
-            # Get predictions for current scale
-            hidden_states = self.head_norm(hidden_states, condition_embed)
-            logits = self.output_head(hidden_states)  # [B, seq_len, vocab_size]
-            
-            # Extract logits for current scale's prediction positions
-            current_scale_start_idx = sum(scale.shape[1] for scale in completed_scales)
-            current_scale_logits = logits[:, current_scale_start_idx + 1:current_scale_start_idx + 1 + gene_count, :]
-            # Shape: [B, gene_count, vocab_size]
-            
-            # Sample all tokens for current scale in parallel (key improvement!)
-            scale_tokens = self._sample_multiple_tokens(current_scale_logits, temperature, top_k, top_p)
-            # Shape: [B, gene_count]
-            
-            # Build complete current scale sequence
-            current_scale_complete = torch.cat([start_token, scale_tokens], dim=1)  # [B, gene_count + 1]
-            
-            # Add to completed scales
-            completed_scales.append(current_scale_complete)
-            generated_genes.append(scale_tokens)
-            
-            logger.info(f"✅ Scale {scale_idx + 1} completed: {scale_tokens.shape[1]} genes generated in parallel")
-        
-        # Final results
-        full_sequence = torch.cat(completed_scales, dim=1)
-        final_token_predictions = generated_genes[-1][:, :self.num_genes]  # Take only the required number of genes
-        
-        # 🔧 关键修复：将token ID转换为基因表达值
-        # Token ID直接对应基因计数值（0-4095）
-        final_predictions = final_token_predictions.float()  # 转换为浮点数
-        
-        return {
-            'predictions': final_predictions,  # [B, num_genes] - 基因表达值（浮点数）
-            'token_predictions': final_token_predictions,  # [B, num_genes] - token ID（整数）
-            'all_scale_predictions': generated_genes,
-            'generated_sequence': full_sequence
-        }
+        finally:
+            # 🔧 Step 3: Always disable KV caching after inference
+            self.disable_kv_cache()
     
     def _sample_next_token(
         self,
@@ -721,6 +739,16 @@ class MultiScaleGeneVAR(nn.Module):
             'vocab_size': self.vocab_size,
             'total_sequence_length': self.total_length
         }
+
+    def enable_kv_cache(self):
+        """Enable KV caching for all transformer blocks during inference"""
+        for block in self.transformer_blocks:
+            block.enable_kv_cache(True)
+    
+    def disable_kv_cache(self):
+        """Disable KV caching for all transformer blocks during training"""
+        for block in self.transformer_blocks:
+            block.enable_kv_cache(False)
 
 
 # Backward compatibility alias

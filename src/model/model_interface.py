@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # PyTorch Lightning相关
 import pytorch_lightning as pl
@@ -70,6 +71,7 @@ class ModelInterface(pl.LightningModule):
         # 初始化输出缓存（只用于验证和测试）
         self.val_outputs = []
         self.test_outputs = []
+        self.validation_step_outputs = []
 
         # 初始化指标
         self._init_metrics()
@@ -172,6 +174,12 @@ class ModelInterface(pl.LightningModule):
         # 预处理
         original_batch = batch.copy() if isinstance(batch, dict) else batch
         processed_batch = self._preprocess_inputs(batch)
+        
+        # 🔧 关键修复：验证和测试时移除target_genes以启用真正的推理模式
+        if phase in ['val', 'test'] and 'target_genes' in processed_batch:
+            # 保存target_genes用于损失计算，但从模型输入中移除
+            _ = processed_batch.pop('target_genes')
+        
         # 前向传播
         results_dict = self.model(**processed_batch)
         # 计算损失
@@ -223,12 +231,17 @@ class ModelInterface(pl.LightningModule):
                 sync_dist=True,  # 🔧 关键修复：启用同步确保ModelCheckpoint正确工作
                 reduce_fx='mean')  # 明确指定reduce函数
         
-        # 返回验证结果，但不进行同步操作
-        return {
+        # 🔧 收集验证输出用于PCC计算
+        output = {
             'val_loss': loss,
             'predictions': predictions.detach().cpu(),  # 移到CPU减少GPU内存
             'targets': targets.detach().cpu()
         }
+        
+        # 添加到验证输出列表
+        self.validation_step_outputs.append(output)
+        
+        return output
 
     def test_step(self, batch, batch_idx):
         """测试步骤"""
@@ -248,7 +261,7 @@ class ModelInterface(pl.LightningModule):
         # 空间坐标处理
         if 'positions' in inputs:
             processed['spatial_coords'] = inputs['positions']
-        # 基因表达数据处理
+        # 基因表达数据处理 - 保留原始逻辑，让_common_step处理推理逻辑
         if 'target_genes' in inputs:
             processed['target_genes'] = inputs['target_genes']
         return processed
@@ -288,12 +301,22 @@ class ModelInterface(pl.LightningModule):
         """计算损失"""
         try:
             if 'loss' not in outputs:
-                # 尝试备选方案
-                if 'ce_loss' in outputs and 'reg_loss' in outputs:
+                # 🔧 处理推理模式：模型输出中没有损失值时手动计算
+                if 'predictions' in outputs and 'target_genes' in batch:
+                    predictions = outputs['predictions']  # [B, 200] token IDs
+                    targets = batch['target_genes']       # [B, 200] token IDs
+                    
+                    # 🔧 关键修复：与baseline保持一致，使用log2(x+1)变换后的MSE损失
+                    # 将token IDs当作基因计数值，应用log2变换后计算MSE
+                    predictions_log2 = torch.log2(predictions.float() + 1.0)
+                    targets_log2 = torch.log2(targets.float() + 1.0)
+                    total_loss = F.mse_loss(predictions_log2, targets_log2)
+                    self._logger.debug(f"推理模式：使用log2(x+1)变换后的MSE损失={total_loss:.4f}")
+                elif 'ce_loss' in outputs and 'reg_loss' in outputs:
                     total_loss = outputs['ce_loss'] + outputs['reg_loss']
                     self._logger.warning("使用备选损失计算方案")
                 else:
-                    raise KeyError("模型输出中找不到损失值")
+                    raise KeyError("模型输出中找不到损失值，且无法计算替代损失")
             else:
                 total_loss = outputs['loss']
             
@@ -559,42 +582,50 @@ class ModelInterface(pl.LightningModule):
         pass  # 训练数据不再累积
     
     def on_validation_epoch_end(self):
-        """验证epoch结束时的回调 - 增强监控和调试"""
-        # 🔧 增强验证完成监控
-        if self.trainer.is_global_zero:
+        """验证epoch结束时的回调 - 计算和打印PCC指标"""
+        
+        # 🔧 收集验证数据并计算PCC指标
+        if hasattr(self, 'validation_step_outputs') and self.validation_step_outputs:
             try:
-                # 获取当前验证损失
-                current_val_loss = None
-                if hasattr(self.trainer.callback_metrics, 'val_loss'):
-                    current_val_loss = self.trainer.callback_metrics['val_loss']
-                elif 'val_loss' in self.trainer.callback_metrics:
-                    current_val_loss = self.trainer.callback_metrics['val_loss']
+                # 收集所有验证数据
+                all_predictions = []
+                all_targets = []
                 
-                print(f"\n✅ Epoch {self.current_epoch} 验证完成")
-                if current_val_loss is not None:
-                    print(f"   📊 当前验证损失: {current_val_loss:.4f}")
-                    
-                    # 检查ModelCheckpoint状态
-                    for callback in self.trainer.callbacks:
-                        if hasattr(callback, 'best_model_score') and callback.best_model_score is not None:
-                            best_score = callback.best_model_score.item() if hasattr(callback.best_model_score, 'item') else callback.best_model_score
-                            print(f"   🏆 最佳验证损失: {best_score:.4f}")
-                            print(f"   💾 最佳模型路径: {callback.best_model_path}")
-                            
-                            # 检查是否应该保存新checkpoint
-                            if current_val_loss < best_score:
-                                print(f"   🎯 发现更好的模型! {current_val_loss:.4f} < {best_score:.4f}")
-                            else:
-                                print(f"   ⏸️  当前模型未超越最佳: {current_val_loss:.4f} >= {best_score:.4f}")
-                            break
-                else:
-                    print(f"   ⚠️  警告: 无法获取val_loss值")
-                    print(f"   📋 可用指标: {list(self.trainer.callback_metrics.keys())}")
+                for output in self.validation_step_outputs:
+                    all_predictions.append(output['predictions'])
+                    all_targets.append(output['targets'])
                 
-                print("   🔄 继续训练...\n")
+                # 合并数据
+                predictions = torch.cat(all_predictions, dim=0)  # [N, genes]
+                targets = torch.cat(all_targets, dim=0)  # [N, genes]
+                
+                # 计算PCC指标
+                pcc_metrics = self._calculate_comprehensive_pcc_metrics(predictions, targets)
+                
+                # 记录PCC指标到wandb
+                for metric_name, value in pcc_metrics.items():
+                    self.log(f'val_{metric_name}', value, on_epoch=True, prog_bar=False, sync_dist=True)
+                
+                # 在主进程打印详细结果
+                if self.trainer.is_global_zero:
+                    val_loss = self.trainer.callback_metrics.get('val_loss', 0.0)
+                    print(f"\n🎯 Epoch {self.current_epoch} 验证结果:")
+                    print(f"   Loss: {val_loss:.6f}")
+                    print(f"   PCC-10:  {pcc_metrics['pcc_10']:.4f}")
+                    print(f"   PCC-50:  {pcc_metrics['pcc_50']:.4f}")
+                    print(f"   PCC-200: {pcc_metrics['pcc_200']:.4f}")
+                    print(f"   MSE:     {pcc_metrics['mse']:.6f}")
+                    print(f"   MAE:     {pcc_metrics['mae']:.6f}")
+                    print(f"   RVD:     {pcc_metrics['rvd']:.6f}")
+                    print()
+                
+                # 清理验证输出数据
+                self.validation_step_outputs.clear()
                 
             except Exception as e:
-                self._logger.warning(f"验证epoch结束处理警告: {e}")
+                self._logger.error(f"计算PCC指标时出错: {e}")
+                import traceback
+                traceback.print_exc()
         
         # 清理验证数据（安全操作）
         self._cleanup_validation_data()
@@ -998,3 +1029,70 @@ class ModelInterface(pl.LightningModule):
         except Exception as e:
             print(f"❌ 安全验证结果打印失败: {e}")
             self._logger.error(f"安全验证摘要打印出错: {e}")
+
+    def _calculate_comprehensive_pcc_metrics(self, predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
+        """计算综合PCC指标 - 与推理脚本保持一致"""
+        import numpy as np
+        
+        # 转换为numpy数组
+        if torch.is_tensor(predictions):
+            predictions = predictions.cpu().numpy()
+        if torch.is_tensor(targets):
+            targets = targets.cpu().numpy()
+        
+        # 应用log2(x+1)变换用于评估指标计算（与推理脚本保持一致）
+        y_true_log2 = np.log2(targets + 1.0)
+        y_pred_log2 = np.log2(predictions + 1.0)
+        
+        # 检查NaN值
+        if np.isnan(y_true_log2).any() or np.isnan(y_pred_log2).any():
+            self._logger.warning("⚠️ Log2变换后发现NaN值，将使用原始值")
+            y_true_log2 = targets
+            y_pred_log2 = predictions
+        
+        # 计算基因级别的相关性
+        num_genes = y_true_log2.shape[1]
+        correlations = np.zeros(num_genes)
+        
+        for i in range(num_genes):
+            true_gene = y_true_log2[:, i]
+            pred_gene = y_pred_log2[:, i]
+            
+            # 处理常数值
+            if np.std(true_gene) == 0 or np.std(pred_gene) == 0:
+                correlations[i] = 0.0
+            else:
+                corr = np.corrcoef(true_gene, pred_gene)[0, 1]
+                correlations[i] = 0.0 if np.isnan(corr) else corr
+        
+        # 排序相关性
+        sorted_corr = np.sort(correlations)[::-1]
+        
+        # 计算PCC指标
+        pcc_10 = np.mean(sorted_corr[:10]) if len(sorted_corr) >= 10 else np.mean(sorted_corr)
+        pcc_50 = np.mean(sorted_corr[:50]) if len(sorted_corr) >= 50 else np.mean(sorted_corr)
+        pcc_200 = np.mean(sorted_corr[:200]) if len(sorted_corr) >= 200 else np.mean(sorted_corr)
+        
+        # 计算MSE和MAE（使用log2变换后的值）
+        mse = np.mean((y_true_log2 - y_pred_log2) ** 2)
+        mae = np.mean(np.abs(y_true_log2 - y_pred_log2))
+        
+        # 计算RVD (Relative Variance Difference)（使用log2变换后的值）
+        MIN_VARIANCE_THRESHOLD = 1e-8
+        pred_var = np.var(y_pred_log2, axis=0)
+        true_var = np.var(y_true_log2, axis=0)
+        
+        valid_mask = true_var > MIN_VARIANCE_THRESHOLD
+        if np.sum(valid_mask) > 0:
+            rvd = np.mean(((pred_var[valid_mask] - true_var[valid_mask]) ** 2) / (true_var[valid_mask] ** 2))
+        else:
+            rvd = 0.0
+        
+        return {
+            'pcc_10': float(pcc_10),
+            'pcc_50': float(pcc_50), 
+            'pcc_200': float(pcc_200),
+            'mse': float(mse),
+            'mae': float(mae),
+            'rvd': float(rvd)
+        }
