@@ -11,13 +11,14 @@ import torch
 import pytorch_lightning as pl
 
 # 导入项目模块
-from dataset.data_interface import DataInterface
+from dataset.hest_dataset import STDataset
 from model import ModelInterface
 from utils import (
     load_callbacks,
     load_loggers,
     fix_seed
 )
+from torch.utils.data import DataLoader
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
@@ -351,16 +352,17 @@ def build_config_from_args(args):
     config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     config.MODEL.gene_count_mode = config.gene_count_mode
     config.MODEL.max_gene_count = config.max_gene_count
-    # 🔧 VAR-ST使用val_pcc_50作为监控指标，保存最佳PCC模型
-    config.TRAINING.monitor = 'val_pcc_50'
-    config.TRAINING.mode = 'max'
-    config.CALLBACKS.early_stopping.monitor = 'val_pcc_50'
-    config.CALLBACKS.early_stopping.mode = 'max'
-    config.CALLBACKS.model_checkpoint.monitor = 'val_pcc_50'
-    config.CALLBACKS.model_checkpoint.mode = 'max'
-    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-pcc50={val_pcc_50:.4f}'
-    print(f"   - VAR-ST监控指标: val_pcc_50 (最大化)")
-    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-pcc50={{val_pcc_50:.4f}}")
+    # 🔧 暂时使用val_loss作为监控指标，避免第一个epoch的EarlyStopping错误
+    # TODO: 后续可以改回val_pcc_50，但需要确保第一个epoch验证完成后才检查
+    config.TRAINING.monitor = 'val_loss'
+    config.TRAINING.mode = 'min'
+    config.CALLBACKS.early_stopping.monitor = 'val_loss'
+    config.CALLBACKS.early_stopping.mode = 'min'
+    config.CALLBACKS.model_checkpoint.monitor = 'val_loss'
+    config.CALLBACKS.model_checkpoint.mode = 'min'
+    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-loss={val_loss:.6f}'
+    print(f"   - VAR-ST监控指标: val_loss (最小化) - 临时使用，避免第一个epoch错误")
+    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-loss={{val_loss:.6f}}")
     print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
     print(f"   - 最大基因计数: {config.max_gene_count}")
     print(f"   - 词汇表大小: {vocab_size} (动态计算: {max_gene_count} + 1)")
@@ -379,6 +381,52 @@ def build_config_from_args(args):
     return config
 
 
+def create_dataloaders(config):
+    """创建数据加载器"""
+    # 基础参数
+    base_params = {
+        'data_path': config.data_path,
+        'expr_name': config.expr_name,
+        'slide_val': config.slide_val,
+        'slide_test': config.slide_test,
+        'encoder_name': config.encoder_name,
+        'use_augmented': config.use_augmented,
+        'max_gene_count': getattr(config, 'max_gene_count', 500),
+    }
+    
+    # 创建数据集
+    train_dataset = STDataset(mode='train', expand_augmented=config.expand_augmented, **base_params)
+    val_dataset = STDataset(mode='val', expand_augmented=False, **base_params)
+    test_dataset = STDataset(mode='test', expand_augmented=False, **base_params)
+    
+    # 创建DataLoader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.DATA.train_dataloader.batch_size,
+        shuffle=config.DATA.train_dataloader.shuffle,
+        num_workers=config.DATA.train_dataloader.num_workers,
+        pin_memory=config.DATA.train_dataloader.pin_memory
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.DATA.val_dataloader.batch_size,
+        shuffle=config.DATA.val_dataloader.shuffle,
+        num_workers=config.DATA.val_dataloader.num_workers,
+        pin_memory=config.DATA.val_dataloader.pin_memory
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.DATA.val_dataloader.batch_size,
+        shuffle=False,
+        num_workers=config.DATA.val_dataloader.num_workers,
+        pin_memory=config.DATA.val_dataloader.pin_memory
+    )
+    
+    return train_loader, val_loader, test_loader
+
+
 def main(config):
     if config.mode == 'train':
         print("🚀 开始训练...")
@@ -388,8 +436,10 @@ def main(config):
     # 设置随机种子
     fix_seed(config.GENERAL.seed)
 
+    # 创建数据加载器
+    train_loader, val_loader, test_loader = create_dataloaders(config)
+    
     # 初始化组件
-    dataset = DataInterface(config)
     model = ModelInterface(config)
     logger = load_loggers(config)
     callbacks = load_callbacks(config)
@@ -426,11 +476,10 @@ def main(config):
 
     # 根据模式执行不同的操作
     if config.mode == 'train':
-        trainer.fit(model, datamodule=dataset)
+        trainer.fit(model, train_loader, val_loader)
     elif config.mode == 'test':
         print(f"📂 从checkpoint加载模型: {config.ckpt_path}")
-        # 使用PyTorch Lightning的test方法，自动加载checkpoint
-        trainer.test(model, datamodule=dataset, ckpt_path=config.ckpt_path)
+        trainer.test(model, test_loader, ckpt_path=config.ckpt_path)
         print("✅ 测试完成！")
 
     return model

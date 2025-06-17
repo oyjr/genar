@@ -204,29 +204,31 @@ class MultiScaleGeneVAR(nn.Module):
         self,
         histology_features: torch.Tensor,   # [B, 1024]
         spatial_coords: torch.Tensor,       # [B, 2]
-        target_genes: Optional[torch.Tensor] = None  # [B, 200] for training
+        target_genes: Optional[torch.Tensor] = None,  # [B, 200] for training
+        top_k: Optional[int] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Main forward pass
-        
-        Args:
-            histology_features: Histology features [B, 1024]
-            spatial_coords: Spatial coordinates [B, 2]
-            target_genes: Target gene expressions [B, 200] (for training)
-            
-        Returns:
-            Dictionary containing predictions and loss (if training)
+        Main forward pass for the model.
+        Dispatches to either training or inference pass based on the model's training state.
         """
-        
-        # Process condition information
+        # Condition embedding
         condition_embed = self.condition_processor(histology_features, spatial_coords)
         
-        if target_genes is not None:
-            # Training mode: use teacher forcing
+        # Dispatch based on the model's training state and presence of target_genes
+        if self.training:
+            # Training mode: use teacher forcing, target_genes must be provided
+            if target_genes is None:
+                raise ValueError("target_genes must be provided during training.")
             return self.forward_training(condition_embed, target_genes)
         else:
-            # Inference mode: autoregressive generation
-            return self.forward_inference(condition_embed)
+            # Evaluation/Inference mode
+            if target_genes is not None:
+                # If targets are provided (e.g., for loss calculation in validation)
+                # still use forward_training which involves teacher forcing
+                return self.forward_training(condition_embed, target_genes)
+            else:
+                # Pure inference without targets, possibly with sampling
+                return self.forward_inference(condition_embed, top_k=top_k)
     
     def forward_training(
         self,
@@ -361,7 +363,7 @@ class MultiScaleGeneVAR(nn.Module):
         # Calculate total loss
         all_logits = torch.cat(loss_logits, dim=0)
         all_targets = torch.cat(loss_targets, dim=0)
-        loss = F.cross_entropy(all_logits, all_targets)
+        loss = self._compute_weighted_cross_entropy_loss(all_logits, all_targets)
         
         # Calculate accuracy
         predictions = all_logits.argmax(dim=-1)
@@ -380,6 +382,9 @@ class MultiScaleGeneVAR(nn.Module):
         # 验证最后一个尺度确实包含200个基因
         assert final_scale_predictions.shape[1] == self.num_genes, f"最后尺度基因数量({final_scale_predictions.shape[1]})必须等于目标基因数量({self.num_genes})"
         
+        # 记录训练指标
+        logger.debug(f"加权交叉熵损失={loss:.4f}, 准确率={accuracy:.4f}, 困惑度={perplexity:.4f}")
+        
         return {
             'loss': loss,
             'logits': all_logits.view(B, -1, self.vocab_size),  # 确保输出logits用于期望值损失 [B, total_predictions, vocab_size]
@@ -397,7 +402,7 @@ class MultiScaleGeneVAR(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Inference with inter-scale autoregressive generation
@@ -420,14 +425,14 @@ class MultiScaleGeneVAR(nn.Module):
         predicted_genes = None
         
         for scale_idx, gene_count in enumerate(self.cumulative_gene_counts):
-            logger.info(f"🔄 推理尺度 {scale_idx + 1}/{self.num_scales}, 目标基因数: {gene_count}")
+            # logger.info(f"🔄 推理尺度 {scale_idx + 1}/{self.num_scales}, 目标基因数: {gene_count}")
             
             start_token = torch.zeros(B, 1, dtype=torch.long, device=device)
             
             if scale_idx == 0:
                 # 第一个尺度：输入[START] → 预测[g1]
                 scale_input = start_token  # [B, 1]
-                logger.info(f"📝 尺度{scale_idx + 1}: 输入形状 {scale_input.shape}")
+                # logger.info(f"📝 尺度{scale_idx + 1}: 输入形状 {scale_input.shape}")
             else:
                 # 其他尺度：使用前一个尺度的预测结果
                 # 输入: [START, 预测g1, ..., 预测g_prev] → 预测: [g1, ..., g_curr]
@@ -441,7 +446,7 @@ class MultiScaleGeneVAR(nn.Module):
                 prev_genes = predicted_genes[:, :prev_gene_count]  # [B, prev_gene_count]
                 scale_input = torch.cat([start_token, prev_genes], dim=1)  # [B, prev_gene_count + 1]
                 
-                logger.info(f"📝 尺度{scale_idx + 1}: 输入形状 {scale_input.shape}, 使用前{prev_gene_count}个预测基因")
+                # logger.info(f"📝 尺度{scale_idx + 1}: 输入形状 {scale_input.shape}, 使用前{prev_gene_count}个预测基因")
             
             # Token embeddings
             input_embeds = self.gene_embedding(scale_input)  # [B, seq_len, embed_dim]
@@ -472,7 +477,6 @@ class MultiScaleGeneVAR(nn.Module):
                 
                 if temperature != 1.0 or top_k is not None or top_p is not None:
                     scale_predictions = self._sample_next_token(gene_logits.squeeze(1), temperature, top_k, top_p)
-                    scale_predictions = scale_predictions.unsqueeze(1)  # [B, 1]
                 else:
                     scale_predictions = gene_logits.argmax(dim=-1)  # [B, 1]
             else:
@@ -503,12 +507,12 @@ class MultiScaleGeneVAR(nn.Module):
             # 更新已预测的基因
             predicted_genes = scale_predictions
             
-            logger.info(f"✅ 尺度 {scale_idx + 1} 完成: 预测了 {predicted_genes.shape[1]} 个基因")
+            # logger.info(f"✅ 尺度 {scale_idx + 1} 完成: 预测了 {predicted_genes.shape[1]} 个基因")
         
         # 最终预测（最后一个尺度包含所有200个基因）
         final_predictions = predicted_genes[:, :self.num_genes].float()
         
-        logger.info(f"🎯 最终预测形状: {final_predictions.shape}, 期望: [B, {self.num_genes}]")
+        # logger.info(f"🎯 最终预测形状: {final_predictions.shape}, 期望: [B, {self.num_genes}]")
         
         return {
             'predictions': final_predictions,  # [B, num_genes] - 最终基因表达预测
@@ -752,6 +756,42 @@ class MultiScaleGeneVAR(nn.Module):
         """Disable KV caching for all transformer blocks during training"""
         for block in self.transformer_blocks:
             block.enable_kv_cache(False)
+
+    def _compute_weighted_cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        加权交叉熵损失，考虑token之间的距离关系
+        距离越近的错误预测，惩罚越小
+        
+        Args:
+            logits: [total_predictions, vocab_size]
+            targets: [total_predictions]
+        """
+        vocab_size = logits.shape[-1]
+        
+        # 计算距离权重矩阵
+        token_ids = torch.arange(vocab_size, device=logits.device, dtype=torch.float32)  # [vocab_size]
+        target_values = targets.float().unsqueeze(1)  # [total_predictions, 1]
+        
+        # 计算每个预测token与真实token的距离
+        distances = torch.abs(token_ids.unsqueeze(0) - target_values)  # [total_predictions, vocab_size]
+        
+        # 距离加权：使用高斯权重，距离越近权重越大
+        sigma = vocab_size * 0.1  # 可调参数
+        weights = torch.exp(-distances ** 2 / (2 * sigma ** 2))  # 高斯权重 [total_predictions, vocab_size]
+        
+        # 计算log概率
+        log_probs = F.log_softmax(logits, dim=-1)  # [total_predictions, vocab_size]
+        
+        # 应用距离权重
+        weighted_log_probs = log_probs * weights  # [total_predictions, vocab_size]
+        
+        # 选择目标位置的加权log概率
+        target_log_probs = weighted_log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # [total_predictions]
+        
+        # 计算加权交叉熵损失
+        loss = -target_log_probs.mean()
+        
+        return loss
 
 
 # Backward compatibility alias

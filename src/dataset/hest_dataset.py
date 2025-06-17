@@ -5,13 +5,13 @@ from scipy import sparse
 import torch
 import scanpy as sc
 import anndata as ad
-from scipy.ndimage import gaussian_filter
 from torch.utils.data import Dataset
-from torchvision import transforms
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Optional
 
 
 class STDataset(Dataset):
+    """空间转录组学数据集"""
+    
     def __init__(self,
                  mode: str,                    # 'train', 'val', 'test'
                  data_path: str,               # 数据集根路径
@@ -21,48 +21,31 @@ class STDataset(Dataset):
                  encoder_name: str = 'uni',    # 编码器类型
                  use_augmented: bool = False,  # 是否使用增强
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
-                 normalize: bool = True,       # 保留参数兼容性，实际使用原始计数
-                 use_var_st_genes: bool = False,  # 🆕 保留兼容性，实际固定使用200个基因
-                 var_st_gene_count: int = 196,   # 🆕 保留兼容性，实际固定使用200个基因
-                 gene_count_mode: str = 'discrete_tokens',  # 🆕 基因计数模式（使用原始计数）
-                 max_gene_count: int = 500):   # 🆕 基因表达计数值上限（用于截断基因表达值，不影响基因数量选择）
+                 max_gene_count: int = 500):   # 基因表达计数值上限
         """
         空间转录组学数据集
         
         Args:
             mode: 数据集模式 ('train', 'val', 'test')
             data_path: 数据集根路径
-            expr_name: 数据集名称 (如 'PRAD', 'her2st')
+            expr_name: 数据集名称
             slide_val: 验证集slides (逗号分隔)
             slide_test: 测试集slides (逗号分隔)
             encoder_name: 编码器类型 ('uni', 'conch')
             use_augmented: 是否使用增强数据
             expand_augmented: 是否展开增强数据为多个样本
-            normalize: 保留参数兼容性，实际使用原始基因计数值
-            use_var_st_genes: 🆕 保留兼容性参数，实际固定使用200个基因
-            var_st_gene_count: 🆕 保留兼容性参数，实际固定使用200个基因
-            gene_count_mode: 🆕 基因计数处理模式（固定为discrete_tokens）
-            max_gene_count: 🆕 基因表达计数值上限（用于截断基因表达值，不影响基因数量选择）
+            max_gene_count: 基因表达计数值上限
         """
-        super(STDataset, self).__init__()
+        super().__init__()
         
         # 验证输入参数
         if mode not in ['train', 'val', 'test']:
-            raise ValueError(f"mode must be one of ['train', 'val', 'test'], but got {mode}")
-        
+            raise ValueError(f"mode must be one of ['train', 'val', 'test'], got {mode}")
         if encoder_name not in ['uni', 'conch']:
-            raise ValueError(f"encoder_name must be one of ['uni', 'conch'], but got {encoder_name}")
+            raise ValueError(f"encoder_name must be one of ['uni', 'conch'], got {encoder_name}")
         
-        # 固定使用离散token模式
-        gene_count_mode = 'discrete_tokens'
-        
-        # expand_augmented只在use_augmented=True且mode='train'时有效
-        if expand_augmented and not use_augmented:
-            print("⚠️  警告: expand_augmented=True但use_augmented=False，将被忽略")
-            expand_augmented = False
-        
-        if expand_augmented and mode != 'train':
-            print("⚠️  警告: expand_augmented只在训练模式有效，其他模式将使用第一个增强版本")
+        # expand_augmented只在训练模式且使用增强时有效
+        if expand_augmented and (not use_augmented or mode != 'train'):
             expand_augmented = False
         
         self.mode = mode
@@ -71,16 +54,7 @@ class STDataset(Dataset):
         self.encoder_name = encoder_name
         self.use_augmented = use_augmented
         self.expand_augmented = expand_augmented
-        self.use_var_st_genes = use_var_st_genes  # 🆕 VAR-ST基因模式
-        self.var_st_gene_count = var_st_gene_count  # 🆕 VAR-ST基因数量
-        self.gene_count_mode = gene_count_mode  # 🆕 基因计数模式（固定为离散）
-        self.max_gene_count = max_gene_count  # 🆕 最大基因计数
-        
-        # 使用原始计数模式
-        self.norm_param = {'normalize': False}
-        print(f"🔢 使用原始基因计数模式: 计数范围 [0, {max_gene_count}]")
-        print(f"📊 基因数量: 固定使用200个基因 (不受max_gene_count影响)")
-        print(f"🎯 max_gene_count({max_gene_count})仅用于截断基因表达计数值")
+        self.max_gene_count = max_gene_count
         
         # 构建路径
         self.st_dir = f"{data_path}st"
@@ -90,107 +64,46 @@ class STDataset(Dataset):
         emb_suffix = "_aug" if use_augmented else ""
         self.emb_dir = f"{self.processed_dir}/1spot_{encoder_name}_ebd{emb_suffix}"
         
-        # 打印初始化信息
-        print(f"🔧 初始化STDataset:")
-        print(f"  - 模式: {mode}")
-        print(f"  - 数据路径: {data_path}")
-        print(f"  - 数据集名称: {expr_name}")
-        print(f"  - 编码器: {encoder_name}")
-        print(f"  - 使用增强: {use_augmented}")
-        print(f"  - 🆕 VAR-ST基因模式: {use_var_st_genes}")
-        print(f"  - 🔢 基因计数模式: {gene_count_mode} (保持原始计数)")
+        print(f"初始化STDataset: {mode}模式, {expr_name}数据集, {encoder_name}编码器")
         
-        if self.use_var_st_genes:
-            print(f"  - 🧬 VAR-ST基因数量: {var_st_gene_count} (前{var_st_gene_count}个基因)")
-        
-        if self.expand_augmented:
-            print(f"  - 🚀 增强模式: 7倍样本展开 (每个spot变成7个训练样本)")
-        elif self.use_augmented:
-            print(f"  - 📊 增强模式: 只使用第一个增强版本 (原图)")
-        else:
-            print(f"  - 🔧 标准模式: 使用原始2D嵌入")
-        
-        print(f"  - ST目录: {self.st_dir}")
-        print(f"  - 嵌入目录: {self.emb_dir}")
-        
-        # 加载基因列表 - 🆕 强制使用前200个基因
-        
-        self.genes = self.load_gene_list()
-        print(f"  - 加载基因数量: {len(self.genes)}")
+        # 加载基因列表（固定使用前200个基因）
+        self.genes = self._load_gene_list()
         
         # 加载和划分slides
-        self.slide_splits = self.load_slide_splits(slide_val, slide_test)
+        self.slide_splits = self._load_slide_splits(slide_val, slide_test)
         self.ids = self.slide_splits[mode]
-        
-        print(f"  - {mode}集slide数量: {len(self.ids)}")
-        print(f"  - {mode}集slides: {self.ids}")
-        
         self.int2id = dict(enumerate(self.ids))
         
+        print(f"加载{len(self.genes)}个基因, {len(self.ids)}个slides")
+        
         # 根据模式初始化
-        if self.mode == 'train':
+        if mode == 'train':
             self._init_train_mode()
-        
-        print(f"✅ STDataset初始化完成")
 
-    def load_gene_list(self) -> List[str]:
-        """从基因列表文件读取基因列表 - 🆕 强制使用前200个基因"""
-        
-        # 总是从数据集原生基因列表开始
+    def _load_gene_list(self) -> List[str]:
+        """加载基因列表，固定使用前200个基因"""
         gene_file = f"{self.processed_dir}/selected_gene_list.txt"
         
         if not os.path.exists(gene_file):
             raise FileNotFoundError(f"基因列表文件不存在: {gene_file}")
         
-        try:
-            with open(gene_file, 'r', encoding='utf-8') as f:
-                all_genes = [line.strip() for line in f.readlines() if line.strip()]
-            
-            if len(all_genes) == 0:
-                raise ValueError(f"基因列表为空: {gene_file}")
-            
-            # 🔧 修复：强制使用前200个基因，确保所有数据集维度一致
-            target_gene_count = 200  # 固定为200个基因
-            
-            if len(all_genes) < target_gene_count:
-                raise ValueError(f"数据集只有{len(all_genes)}个基因，少于需要的{target_gene_count}个基因")
-            
-            selected_genes = all_genes[:target_gene_count]  # 始终使用前200个基因
-            print(f"基因选择: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因 (固定为200个)")
-            print(f"注意: max_gene_count({self.max_gene_count})仅用于控制基因表达计数值范围[0,{self.max_gene_count}]")
-            
-            return selected_genes
-            
-        except UnicodeDecodeError as e:
-            raise ValueError(f"基因列表文件编码错误: {gene_file}, 错误: {e}")
-        except PermissionError as e:
-            raise PermissionError(f"没有权限读取基因列表文件: {gene_file}, 错误: {e}")
-        except IOError as e:
-            raise IOError(f"读取基因列表文件时发生IO错误: {gene_file}, 错误: {e}")
+        with open(gene_file, 'r', encoding='utf-8') as f:
+            all_genes = [line.strip() for line in f.readlines() if line.strip()]
+        
+        if len(all_genes) < 200:
+            raise ValueError(f"数据集只有{len(all_genes)}个基因，少于需要的200个基因")
+        
+        return all_genes[:200]  # 固定使用前200个基因
 
-    def load_slide_splits(self, slide_val: str, slide_test: str) -> Dict[str, List[str]]:
+    def _load_slide_splits(self, slide_val: str, slide_test: str) -> Dict[str, List[str]]:
         """加载和划分slides"""
-        # 读取所有slide列表
         slide_file = f"{self.processed_dir}/all_slide_lst.txt"
-
+        
         if not os.path.exists(slide_file):
             raise FileNotFoundError(f"Slide列表文件不存在: {slide_file}")
         
-        try: 
-            with open(slide_file, 'r', encoding='utf-8') as f:
-                all_slides = [line.strip() for line in f.readlines() if line.strip()]
-            
-            if len(all_slides) == 0:
-                raise ValueError(f"Slide列表为空: {slide_file}")
-            
-            print(f"从{slide_file}加载{len(all_slides)}个slides")
-        
-        except UnicodeDecodeError as e:
-            raise ValueError(f"Slide列表文件编码错误: {slide_file}, 错误: {e}")
-        except PermissionError as e:
-            raise PermissionError(f"没有权限读取Slide列表文件: {slide_file}, 错误: {e}")
-        except IOError as e:
-            raise IOError(f"读取Slide列表文件时发生IO错误: {slide_file}, 错误: {e}")
+        with open(slide_file, 'r', encoding='utf-8') as f:
+            all_slides = [line.strip() for line in f.readlines() if line.strip()]
         
         # 解析验证集和测试集slides
         val_slides = [s.strip() for s in slide_val.split(',') if s.strip()] if slide_val else []
@@ -200,485 +113,272 @@ class STDataset(Dataset):
         all_slides_set = set(all_slides)
         for slide in val_slides + test_slides:
             if slide not in all_slides_set:
-                raise ValueError(f"指定的slide ID不存在: {slide}, 可用的slides: {sorted(all_slides)}")
+                raise ValueError(f"指定的slide ID不存在: {slide}")
         
-        # 检查重复 - 允许验证集和测试集使用相同的slides（适用于小数据集场景）
-        overlap = set(val_slides) & set(test_slides)
-        if overlap:
-            print(f"⚠️  验证集和测试集使用相同的slides: {overlap} (这在小数据集场景下是允许的)")
+        # 计算训练集slides
+        train_slides = [s for s in all_slides if s not in val_slides and s not in test_slides]
         
-        # 剩余slides分配给训练集
-        used_slides = set(val_slides + test_slides)
-        train_slides = [s for s in all_slides if s not in used_slides]
-        
-        splits = {
+        return {
             'train': train_slides,
             'val': val_slides,
             'test': test_slides
         }
-        
-        print(f"Slide划分:")
-        print(f"  - 训练集: {len(train_slides)} slides")
-        print(f"  - 验证集: {len(val_slides)} slides")
-        print(f"  - 测试集: {len(test_slides)} slides")
-        
-        return splits
 
     def _init_train_mode(self):
         """初始化训练模式"""
-        print("初始化训练模式数据加载...")
-        
-        # 预加载ST数据
+        # 预加载所有训练数据的adata
         self.adata_dict = {}
+        lengths = []
+        
         for slide_id in self.ids:
-            self.adata_dict[slide_id] = self.load_st(slide_id, self.genes, **self.norm_param)
+            adata = self._load_st(slide_id)
+            self.adata_dict[slide_id] = adata
+            
+            if self.expand_augmented:
+                # 展开增强：每个spot变成7个样本
+                lengths.append(len(adata) * 7)
+                # 预处理展开的数据
+                self._prepare_expanded_data(slide_id, adata)
+            else:
+                lengths.append(len(adata))
+        
+        self.cumlen = np.cumsum(lengths)
         
         if self.expand_augmented:
-            print("🚀 启用增强样本展开模式：每个spot扩展为7个训练样本")
-            
-            # 在展开模式下，预加载并展开嵌入数据
+            print(f"训练模式：展开增强，总样本数 {self.cumlen[-1]}")
+        else:
+            print(f"训练模式：标准模式，总样本数 {self.cumlen[-1]}")
+
+    def _prepare_expanded_data(self, slide_id: str, adata: ad.AnnData):
+        """准备展开的增强数据"""
+        if not hasattr(self, 'expanded_emb_dict'):
             self.expanded_emb_dict = {}
             self.expanded_adata_dict = {}
-            
-            for slide_id in self.ids:
-                
-                # 加载3D嵌入数据
-                emb = self.load_emb(slide_id, None, 'all')  # [num_spots, 7, feature_dim]
-                original_adata = self.adata_dict[slide_id]
-                
-                if len(emb.shape) == 3:
-                    # 展开嵌入：[num_spots, 7, feature_dim] -> [num_spots*7, feature_dim]
-                    num_spots, num_augs, feature_dim = emb.shape
-                    expanded_emb = emb.reshape(-1, feature_dim)  # [num_spots*7, feature_dim]
-                    
-                    # 展开基因表达数据：[num_spots, num_genes] -> [num_spots*7, num_genes]
-                    if sparse.issparse(original_adata.X):
-                        original_X = original_adata.X.toarray()
-                    else:
-                        original_X = original_adata.X
-                    
-                    # 每个spot的表达数据重复7次
-                    expanded_X = np.repeat(original_X, num_augs, axis=0)  # [num_spots*7, num_genes]
-                    
-                    # 展开位置信息
-                    expanded_positions = np.repeat(original_adata.obsm['positions'], num_augs, axis=0)
-                    
-                    # 创建展开后的AnnData对象
-                    expanded_adata = ad.AnnData(X=expanded_X, var=original_adata.var.copy())
-                    expanded_adata.var_names = original_adata.var_names
-                    expanded_adata.obsm['positions'] = expanded_positions
-                    
-                    # 添加增强信息到obs
-                    aug_ids = np.tile(np.arange(num_augs), num_spots)  # [0,1,2,3,4,5,6, 0,1,2,3,4,5,6, ...]
-                    spot_ids = np.repeat(np.arange(num_spots), num_augs)  # [0,0,0,0,0,0,0, 1,1,1,1,1,1,1, ...]
-                    
-                    expanded_adata.obs['original_spot_id'] = spot_ids
-                    expanded_adata.obs['aug_id'] = aug_ids
-                    expanded_adata.obs['array_row'] = expanded_positions[:, 0]
-                    expanded_adata.obs['array_col'] = expanded_positions[:, 1]
-                    
-                    self.expanded_emb_dict[slide_id] = expanded_emb
-                    self.expanded_adata_dict[slide_id] = expanded_adata
-                    
-
-                else:
-                    # 如果不是3D格式，保持原样
-
-                    self.expanded_emb_dict[slide_id] = emb
-                    self.expanded_adata_dict[slide_id] = original_adata
-            
-            # 使用展开后的数据计算长度
-            self.lengths = [len(adata) for adata in self.expanded_adata_dict.values()]
-            
+        
+        # 加载增强嵌入（包含所有7个版本的3D tensor）
+        emb = self._load_emb(slide_id, None, 'aug')  # [num_spots, 7, feature_dim] 或 [num_spots*7, feature_dim]
+        
+        # 处理不同的tensor格式
+        if len(emb.shape) == 3:
+            # 3D格式：[num_spots, 7, feature_dim] -> [num_spots*7, feature_dim]
+            num_spots, num_augs, feature_dim = emb.shape
+            expanded_emb = emb.reshape(-1, feature_dim)
         else:
-            # 原有模式：计算累积长度用于索引映射
-            self.lengths = [len(adata) for adata in self.adata_dict.values()]
+            # 已经是展开格式：[num_spots*7, feature_dim]
+            expanded_emb = emb
         
-        self.cumlen = np.cumsum(self.lengths)
+        self.expanded_emb_dict[slide_id] = expanded_emb
         
-        print(f"训练数据统计:")
-        print(f"  - 各slide样本数量: {self.lengths}")
-        print(f"  - 累积长度: {self.cumlen}")
-        print(f"  - 总样本数量: {self.cumlen[-1]}")
-        if self.expand_augmented:
-            original_total = sum(len(self.adata_dict[slide_id]) for slide_id in self.ids)
-            print(f"  - 原始spot数量: {original_total}")
-            print(f"  - 扩展倍数: {self.cumlen[-1] / original_total:.1f}x")
+        # 展开AnnData
+        expanded_obs_data = []
+        expanded_X_data = []
+        expanded_positions = []
+        
+        for aug_idx in range(7):
+            for spot_idx in range(len(adata)):
+                expanded_obs_data.append({
+                    'original_spot_id': spot_idx,
+                    'aug_id': aug_idx
+                })
+                expanded_X_data.append(adata.X[spot_idx])
+                expanded_positions.append(adata.obsm['positions'][spot_idx])
+        
+        # 创建展开的AnnData
+        obs_df = pd.DataFrame(expanded_obs_data)
+        obs_df.index = obs_df.index.astype(str)  # 确保索引是字符串类型，避免警告
 
-    def load_emb(self, slide_id: str, idx: Optional[int] = None, mode: str = 'first') -> torch.Tensor:
+        expanded_adata = ad.AnnData(
+            X=sparse.vstack(expanded_X_data) if sparse.issparse(adata.X) else np.vstack(expanded_X_data),
+            obs=obs_df,
+            var=adata.var.copy()
+        )
+        expanded_adata.obsm['positions'] = np.array(expanded_positions)
+        
+        self.expanded_adata_dict[slide_id] = expanded_adata
+
+    def _load_emb(self, slide_id: str, idx: Optional[int] = None, mode: str = 'standard') -> torch.Tensor:
         """加载嵌入特征
         
         Args:
             slide_id: slide标识符
             idx: spot索引，如果None则返回所有spots
-            mode: 3D增强嵌入的处理模式
-                - 'first': 使用第一个增强版本 (原图)
-                - 'all': 返回所有7个版本 (用于expand_augmented)
+            mode: 'standard' 使用标准嵌入, 'aug' 使用增强嵌入
         """
-        # 构建文件名，增强嵌入需要添加_aug后缀
-        if self.use_augmented:
+        if mode == 'aug' and self.use_augmented:
             emb_file = f"{self.emb_dir}/{slide_id}_{self.encoder_name}_aug.pt"
         else:
-            emb_file = f"{self.emb_dir}/{slide_id}_{self.encoder_name}.pt"
+            # 标准模式或者不使用增强时
+            base_dir = self.emb_dir.replace('_aug', '')  # 确保使用标准目录
+            emb_file = f"{base_dir}/{slide_id}_{self.encoder_name}.pt"
         
         if not os.path.exists(emb_file):
             raise FileNotFoundError(f"嵌入文件不存在: {emb_file}")
         
-        try:
-            # 使用weights_only=True确保安全
-            emb = torch.load(emb_file, weights_only=True)
-            
-            if not isinstance(emb, torch.Tensor):
-                raise TypeError(f"嵌入文件格式错误，期望torch.Tensor，得到{type(emb)}")
-            
-            # 处理不同的tensor维度
-            if len(emb.shape) == 4:
-                # 4D tensor: [batch, channel, num_spots, feature_dim] 
-                # 这种情况通常出现在某些增强嵌入文件中
-                print(f"检测到4D嵌入格式: {emb.shape}")
-                batch, channel, num_spots, feature_dim = emb.shape
-                
-                if batch == 1 and channel == 1:
-                    # 去掉前两个维度: [1, 1, num_spots, feature_dim] -> [num_spots, feature_dim]
-                    emb = emb.squeeze(0).squeeze(0)  # [num_spots, feature_dim]
-                    print(f"  -> 转换为标准格式: {emb.shape}")
-                elif batch == 1:
-                    # 去掉batch维度，保留channel作为augmentation维度: [1, C, num_spots, feature_dim] -> [num_spots, C, feature_dim]
-                    emb = emb.squeeze(0).transpose(0, 1)  # [num_spots, C, feature_dim]
-                    print(f"  -> 转换为增强格式: {emb.shape}")
-                    # 然后按照3D逻辑处理
-                    if mode == 'first':
-                        emb = emb[:, 0, :]  # [num_spots, feature_dim]
-                        print(f"  -> 使用第一个增强版本: {emb.shape}")
-                else:
-                    raise ValueError(f"不支持的4D嵌入格式: {emb.shape}，期望batch维度为1")
-                    
-            elif len(emb.shape) == 3:
-                # 3D tensor: [num_spots, num_augmentations, feature_dim]
-                if mode == 'first':
-                    # 使用第一个增强版本（原图）
-                    emb = emb[:, 0, :]  # [num_spots, feature_dim]
-                elif mode == 'all':
-                    # 返回所有增强版本 (用于expand_augmented)
-                    pass  # 保持原始3D格式
-                else:
-                    raise ValueError(f"不支持的模式: {mode}，只支持 'first' 或 'all'")
-                    
-            elif len(emb.shape) == 2:
-                # 2D tensor: [num_spots, feature_dim] (标准格式)
-                pass
-            else:
-                raise ValueError(f"嵌入维度错误，期望2D、3D或4D tensor，得到{emb.shape}")
-            
-            # 根据编码器类型验证特征维度
-            expected_dim = 1024 if self.encoder_name == 'uni' else 512
-            final_dim = emb.shape[-1]  # 获取最后一维
-            if final_dim != expected_dim:
-                raise ValueError(f"嵌入特征维度错误，{self.encoder_name}编码器期望{expected_dim}维，得到{final_dim}维")
-            
-            # 返回指定索引或全部
+        features = torch.load(emb_file, map_location='cpu', weights_only=True)
+        
+        # 处理3D增强嵌入格式
+        if mode == 'aug' and len(features.shape) == 3:
+            # 3D格式：[num_spots, num_augs, feature_dim]
             if idx is not None:
-                if idx >= emb.shape[0]:
-                    raise IndexError(f"索引越界: {idx} >= {emb.shape[0]}")
-                if mode == 'all' and len(emb.shape) == 3:
-                    return emb[idx]  # [num_augmentations, feature_dim]
-                else:
-                    return emb[idx]  # [feature_dim]
+                return features[idx, 0, :]  # 返回第一个增强版本 [feature_dim]
             else:
-                return emb  # [num_spots, feature_dim] 或 [num_spots, num_augmentations, feature_dim]
-                
-        except FileNotFoundError:
-            raise FileNotFoundError(f"嵌入文件不存在: {emb_file}")
-        except PermissionError as e:
-            raise PermissionError(f"没有权限读取嵌入文件: {emb_file}, 错误: {e}")
-        except torch.serialization.pickle.UnpicklingError as e:
-            raise ValueError(f"嵌入文件损坏或格式不正确: {emb_file}, 错误: {e}")
-        except RuntimeError as e:
-            raise RuntimeError(f"加载嵌入文件时发生运行时错误: {emb_file}, 错误: {e}")
-        except Exception as e:
-            raise ValueError(f"加载嵌入文件失败 {emb_file}: {e}")
+                return features  # 返回完整3D tensor
+        
+        # 标准2D格式处理
+        if idx is not None:
+            return features[idx]  # [feature_dim]
+        else:
+            return features  # [num_spots, feature_dim]
 
-    def load_st(self, slide_id: str, genes: Optional[List[str]] = None, **kwargs) -> ad.AnnData:
+    def _load_st(self, slide_id: str) -> ad.AnnData:
         """加载ST数据"""
         st_file = f"{self.st_dir}/{slide_id}.h5ad"
         
         if not os.path.exists(st_file):
             raise FileNotFoundError(f"ST文件不存在: {st_file}")
-    
         
-        try:
-            adata = sc.read_h5ad(st_file)
-            
-            # 检查必要的键
-            if 'spatial' not in adata.obsm:
-                raise ValueError(f"ST数据缺少spatial坐标: {st_file}")
-            
+        adata = sc.read_h5ad(st_file)
+        
+        # 选择指定的基因
+        adata = adata[:, self.genes].copy()
+        
+        # 处理位置信息
+        if 'spatial' in adata.obsm:
             # 标准化坐标到0-1范围
             coords = adata.obsm['spatial'].copy()
             coords = (coords - coords.min(axis=0)) / (coords.max(axis=0) - coords.min(axis=0))
-            
-            # 添加array_row和array_col到obs（如果不存在）
-            if 'array_row' not in adata.obs.columns:
-                adata.obs['array_row'] = adata.obsm['spatial'][:, 0]
-                adata.obs['array_col'] = adata.obsm['spatial'][:, 1]
-            
-            # 基因过滤
-            if genes is not None:
-                
-                common_genes = list(set(genes).intersection(set(adata.var_names)))
-                if len(common_genes) < len(genes):
-                    missing_genes = list(set(genes) - set(common_genes))
-                    print(f"警告: {len(missing_genes)}个基因在{slide_id}中不存在: {missing_genes[:5]}...")
-                
-                adata = adata[:, common_genes].copy()
-
-            # 保持原始基因计数，不进行log2变换
-            # 基因计数本身就是离散的，直接使用原始计数值作为训练目标
-            if sparse.issparse(adata.X):
-                X = adata.X.toarray()
-            else:
-                X = adata.X.copy()
-            
-            # 确保计数值为非负整数
-            X = np.maximum(0, X)  # 确保非负
-            adata.X = sparse.csr_matrix(X) if sparse.issparse(adata.X) else X
-            
-            # 保存标准化后的坐标
             adata.obsm['positions'] = coords
-            
-
-            return adata
-            
-        except Exception as e:
-            raise ValueError(f"加载ST数据失败 {st_file}: {e}")
+        elif 'positions' not in adata.obsm:
+            # 如果没有位置信息，创建默认位置
+            import numpy as np
+            adata.obsm['positions'] = np.random.rand(adata.n_obs, 2)
+        
+        return adata
 
     def __len__(self) -> int:
         if self.mode == 'train':
             return self.cumlen[-1] if len(self.cumlen) > 0 else 0
         else:
-            # 验证/测试模式：返回所有spots的总数，而不是slide数量
-            # 这样验证时也会逐个spot处理，保持与训练的一致性
-            if hasattr(self, 'val_cumlen'):
-                return self.val_cumlen[-1] if len(self.val_cumlen) > 0 else 0
-            else:
-                # 计算验证/测试模式的累积长度 - 动态加载数据计算长度
-                val_lengths = []
-                for slide_id in self.ids:
-                    # 动态加载ST数据来计算长度
-                    adata = self.load_st(slide_id, self.genes, **self.norm_param)
-                    val_lengths.append(len(adata))
-                self.val_cumlen = np.cumsum(val_lengths)
-                return self.val_cumlen[-1] if len(self.val_cumlen) > 0 else 0
+            # 验证/测试模式：计算总spot数
+            if not hasattr(self, 'total_spots'):
+                self.total_spots = sum(len(self._load_st(slide_id)) for slide_id in self.ids)
+            return self.total_spots
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """统一的数据获取方法"""
         if self.mode == 'train':
             return self._get_train_item(index)
         else:
-            # 验证/测试模式：也使用单spot处理
-            return self._get_eval_item_single_spot(index)
+            return self._get_eval_item(index)
 
     def _get_train_item(self, index: int) -> Dict[str, torch.Tensor]:
-        """训练模式获取单个spot数据"""
+        """训练模式获取数据"""
         # 找到对应的slide和样本索引
         i = 0
         while index >= self.cumlen[i]:
             i += 1
         
-        sample_idx = index
-        if i > 0:
-            sample_idx = index - self.cumlen[i-1]
-        
+        sample_idx = index - (self.cumlen[i-1] if i > 0 else 0)
         slide_id = self.int2id[i]
         
-        if self.expand_augmented and hasattr(self, 'expanded_emb_dict'):
+        if self.expand_augmented:
             # 使用预展开的数据
-            features = self.expanded_emb_dict[slide_id][sample_idx]  # [feature_dim]
-            
-            # 从展开的AnnData中获取基因表达
+            features = self.expanded_emb_dict[slide_id][sample_idx]
             expanded_adata = self.expanded_adata_dict[slide_id]
             expression = expanded_adata[sample_idx].X
+            positions = expanded_adata.obsm['positions'][sample_idx]
             
-            if sparse.issparse(expression):
-                expression = expression.toarray().squeeze(0)
-            else:
-                expression = expression.squeeze(0)
-            
-            # 获取位置信息
-            positions = expanded_adata.obsm['positions'][sample_idx]  # [2]
-            
-            # 获取增强信息（可选，用于调试）
+            # 获取增强信息
             original_spot_id = int(expanded_adata.obs['original_spot_id'].iloc[sample_idx])
             aug_id = int(expanded_adata.obs['aug_id'].iloc[sample_idx])
             
             return {
-                'img': torch.FloatTensor(features),  # [feature_dim]
-                'target_genes': self._process_gene_expression(expression),  # [num_genes]
-                'positions': torch.FloatTensor(positions),  # [2]
+                'img': torch.FloatTensor(features),
+                'target_genes': self._process_gene_expression(expression),
+                'positions': torch.FloatTensor(positions),
                 'slide_id': slide_id,
                 'spot_idx': sample_idx,
-                'original_spot_id': original_spot_id,  # 原始spot ID
-                'aug_id': aug_id  # 增强版本ID (0-6)
+                'original_spot_id': original_spot_id,
+                'aug_id': aug_id
             }
         else:
-            # 原有模式：动态加载
-            features = self.load_emb(slide_id, sample_idx, 'first')  # [feature_dim]
-            
-            # 加载基因表达
+            # 标准模式
+            features = self._load_emb(slide_id, sample_idx, 'standard')
             adata = self.adata_dict[slide_id]
             expression = adata[sample_idx].X
-            
-            if sparse.issparse(expression):
-                expression = expression.toarray().squeeze(0)
-            else:
-                expression = expression.squeeze(0)
-            
-            # 加载位置信息
-            positions = adata.obsm['positions'][sample_idx]  # [2]
+            positions = adata.obsm['positions'][sample_idx]
             
             return {
-                'img': features,  # [feature_dim]
-                'target_genes': self._process_gene_expression(expression),  # [num_genes]
-                'positions': torch.FloatTensor(positions),  # [2]
+                'img': features,
+                'target_genes': self._process_gene_expression(expression),
+                'positions': torch.FloatTensor(positions),
                 'slide_id': slide_id,
                 'spot_idx': sample_idx
             }
 
-    def _get_eval_item_single_spot(self, index: int) -> Dict[str, torch.Tensor]:
-        """验证/测试模式获取单个spot数据 - 与训练保持一致"""
-        # 确保val_cumlen已初始化
-        if not hasattr(self, 'val_cumlen'):
-            val_lengths = []
-            for slide_id in self.ids:
-                # 动态加载ST数据来计算长度
-                adata = self.load_st(slide_id, self.genes, **self.norm_param)
-                val_lengths.append(len(adata))
-            self.val_cumlen = np.cumsum(val_lengths)
+    def _get_eval_item(self, index: int) -> Dict[str, torch.Tensor]:
+        """验证/测试模式获取数据"""
+        # 计算累积长度（如果还没有）
+        if not hasattr(self, 'eval_cumlen'):
+            lengths = [len(self._load_st(slide_id)) for slide_id in self.ids]
+            self.eval_cumlen = np.cumsum(lengths)
         
         # 找到对应的slide和样本索引
         i = 0
-        while index >= self.val_cumlen[i]:
+        while index >= self.eval_cumlen[i]:
             i += 1
         
-        sample_idx = index
-        if i > 0:
-            sample_idx = index - self.val_cumlen[i-1]
-        
+        sample_idx = index - (self.eval_cumlen[i-1] if i > 0 else 0)
         slide_id = self.int2id[i]
         
-        # 加载单个spot的嵌入特征
-        features = self.load_emb(slide_id, sample_idx, 'first')  # [feature_dim]
-        
-        # 动态加载单个spot的基因表达
-        adata = self.load_st(slide_id, self.genes, **self.norm_param)
+        # 加载数据
+        features = self._load_emb(slide_id, sample_idx, 'standard')
+        adata = self._load_st(slide_id)
         expression = adata[sample_idx].X
-        
-        if sparse.issparse(expression):
-            expression = expression.toarray().squeeze(0)
-        else:
-            expression = expression.squeeze(0)
-        
-        # 加载位置信息
-        positions = adata.obsm['positions'][sample_idx]  # [2]
+        positions = adata.obsm['positions'][sample_idx]
         
         return {
-            'img': torch.FloatTensor(features),  # [feature_dim] - 单个spot
-            'target_genes': self._process_gene_expression(expression),  # [num_genes] - 单个spot
-            'positions': torch.FloatTensor(positions),  # [2] - 单个spot
+            'img': torch.FloatTensor(features),
+            'target_genes': self._process_gene_expression(expression),
+            'positions': torch.FloatTensor(positions),
             'slide_id': slide_id,
             'spot_idx': sample_idx
         }
 
-    def _get_eval_item(self, index: int) -> Dict[str, torch.Tensor]:
-        """验证/测试模式获取整个slide数据 - 保留原方法以备需要"""
-        slide_id = self.int2id[index]
-        
-        # 加载嵌入特征
-        features = self.load_emb(slide_id, None, 'first')  # [num_spots, feature_dim]
-        
-        # 加载ST数据
-        adata = self.load_st(slide_id, self.genes, **self.norm_param)
-        
-        # 加载基因表达
-        expression = adata.X
-        if sparse.issparse(expression):
-            expression = expression.toarray()
-        
-        # 加载位置信息
-        positions = adata.obsm['positions']  # [num_spots, 2]
-        
-        return {
-            'img': features,  # [num_spots, feature_dim]
-            'target_genes': self._process_gene_expression(expression),  # [num_spots, num_genes]
-            'positions': torch.FloatTensor(positions),  # [num_spots, 2]
-            'slide_id': slide_id,
-            'num_spots': adata.n_obs
-        }
-
     def get_full_slide_for_testing(self, slide_id: str) -> Dict[str, torch.Tensor]:
-        """
-        获取完整slide的所有spot数据用于测试
+        """获取完整slide的所有spot数据用于测试"""
+        features = self._load_emb(slide_id, None, 'standard')  # [num_spots, feature_dim]
+        adata = self._load_st(slide_id)
         
-        Args:
-            slide_id: slide标识符
-            
-        Returns:
-            包含所有spot数据的字典，格式为：
-            {
-                'img': [num_spots, feature_dim],
-                'target_genes': [num_spots, num_genes],
-                'positions': [num_spots, 2],
-                'slide_id': str,
-                'num_spots': int
-            }
-        """
-        # 加载嵌入特征
-        features = self.load_emb(slide_id, None, 'first')  # [num_spots, feature_dim]
-        
-        # 加载ST数据
-        adata = self.load_st(slide_id, self.genes, **self.norm_param)
-        
-        # 加载基因表达
         expression = adata.X
         if sparse.issparse(expression):
             expression = expression.toarray()
         
-        # 加载位置信息
-        positions = adata.obsm['positions']  # [num_spots, 2]
+        positions = adata.obsm['positions']
         
         return {
-            'img': torch.FloatTensor(features),  # [num_spots, feature_dim]
-            'target_genes': self._process_gene_expression(expression),  # [num_spots, num_genes]
-            'positions': torch.FloatTensor(positions),  # [num_spots, 2]
+            'img': torch.FloatTensor(features),
+            'target_genes': self._process_gene_expression(expression),
+            'positions': torch.FloatTensor(positions),
             'slide_id': slide_id,
             'num_spots': adata.n_obs,
-            'adata': adata  # 保存adata用于后续分析
+            'adata': adata
         }
 
     def get_test_slide_ids(self) -> List[str]:
-        """
-        获取测试集的slide ID列表
-        """
-        if self.mode == 'test':
-            return self.ids
-        else:
-            return self.slide_splits['test']
+        """获取测试集的slide ID列表"""
+        return self.slide_splits['test'] if self.mode != 'test' else self.ids
 
-    def _process_gene_expression(self, gene_expr: np.ndarray) -> torch.Tensor:
-        """
-        处理基因表达数据 - 保持原始计数值
+    def _process_gene_expression(self, gene_expr) -> torch.Tensor:
+        """处理基因表达数据，保持原始计数值"""
+        if sparse.issparse(gene_expr):
+            gene_expr = gene_expr.toarray().squeeze()
+        else:
+            gene_expr = np.asarray(gene_expr).squeeze()
         
-        Args:
-            gene_expr: 原始基因表达数组 [num_genes]
-            
-        Returns:
-            处理后的基因表达tensor (long) - 保持原始计数值
-        """
-        # 直接使用原始计数值，不进行log2变换
-        # 确保是非负整数，并截断超出范围的值
-        gene_expr = np.maximum(0, gene_expr)  # 确保非负
-        gene_expr = np.round(gene_expr).astype(np.int64)  # 确保是整数
-        
-        # 只有当计数值超过max_gene_count时才截断
+        # 确保非负整数并截断
+        gene_expr = np.maximum(0, gene_expr)
+        gene_expr = np.round(gene_expr).astype(np.int64)
         gene_tokens = torch.clamp(torch.from_numpy(gene_expr).long(), 0, self.max_gene_count)
         
         return gene_tokens
