@@ -51,10 +51,10 @@ class MultiScaleGeneVAR(nn.Module):
     
     def __init__(
         self,
-        # Gene-related parameters
+        # Gene-related parameters (必需参数在前)
+        vocab_size: int,  # 必需参数，从配置中动态传入 (max_gene_count + 1)
         num_genes: int = 200,
         gene_patch_nums: Tuple[int, ...] = (1, 2, 4, 6, 8, 10, 15),
-        vocab_size: int = 201,
         
         # Model architecture parameters
         embed_dim: int = 768,
@@ -382,13 +382,13 @@ class MultiScaleGeneVAR(nn.Module):
         
         return {
             'loss': loss,
-            'logits': all_logits.view(B, -1, self.vocab_size),  # 重新整形为[B, total_predictions, vocab_size]
+            'logits': all_logits.view(B, -1, self.vocab_size),  # 确保输出logits用于期望值损失 [B, total_predictions, vocab_size]
             'predictions': final_scale_predictions,  # 最终200个基因预测 [B, 200]
             'all_scale_predictions': all_predictions,  # 所有尺度的预测结果
             'accuracy': accuracy,
             'perplexity': perplexity,
             'top5_accuracy': top5_accuracy,
-            'full_target': full_target
+            'full_target': all_targets.view(B, -1)  # 确保target维度匹配 [B, total_predictions]
         }
     
     def forward_inference(
@@ -693,9 +693,9 @@ class MultiScaleGeneVAR(nn.Module):
         
         # Create model with saved configuration
         model = cls(
+            vocab_size=checkpoint['vocab_size'],
             num_genes=checkpoint['num_genes'],
             gene_patch_nums=checkpoint['gene_patch_nums'],
-            vocab_size=checkpoint['vocab_size'],
             embed_dim=checkpoint['embed_dim'],
             num_heads=checkpoint['num_heads'],
             num_layers=checkpoint['num_layers'],

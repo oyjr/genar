@@ -22,31 +22,27 @@ class STDataset(Dataset):
                  use_augmented: bool = False,  # 是否使用增强
                  expand_augmented: bool = False,  # 是否展开增强为多个样本
                  normalize: bool = True,       # 保留参数兼容性，实际使用原始计数
-                 use_var_st_genes: bool = False,  # 🆕 是否使用VAR-ST的196基因模式
-                 var_st_gene_count: int = 196,   # 🆕 VAR-ST模式的基因数量
+                 use_var_st_genes: bool = False,  # 🆕 保留兼容性，实际固定使用200个基因
+                 var_st_gene_count: int = 196,   # 🆕 保留兼容性，实际固定使用200个基因
                  gene_count_mode: str = 'discrete_tokens',  # 🆕 基因计数模式（使用原始计数）
-                 max_gene_count: int = 200):   # 🆕 最大基因计数值（超出时截断）
+                 max_gene_count: int = 500):   # 🆕 基因表达计数值上限（用于截断基因表达值，不影响基因数量选择）
         """
         空间转录组学数据集
         
         Args:
-            mode: 数据模式 ('train', 'val', 'test')
+            mode: 数据集模式 ('train', 'val', 'test')
             data_path: 数据集根路径
-            expr_name: 数据集名称 (如 'PRAD')
-            slide_val: 验证集slide IDs，逗号分隔
-            slide_test: 测试集slide IDs，逗号分隔
-            encoder_name: 编码器类型 ('uni' 或 'conch')
-            use_augmented: 是否使用增强嵌入文件
-            expand_augmented: 是否将3D增强嵌入展开为7倍训练样本
-                - True: 每个spot变成7个训练样本 (真正的数据增强)
-                - False: 只使用第一个增强版本 (原图)
+            expr_name: 数据集名称 (如 'PRAD', 'her2st')
+            slide_val: 验证集slides (逗号分隔)
+            slide_test: 测试集slides (逗号分隔)
+            encoder_name: 编码器类型 ('uni', 'conch')
+            use_augmented: 是否使用增强数据
+            expand_augmented: 是否展开增强数据为多个样本
             normalize: 保留参数兼容性，实际使用原始基因计数值
-            use_var_st_genes: 🆕 是否使用VAR-ST基因模式
-                - True: 使用前196个基因 (适合VAR模型的14x14空间排列)
-                - False: 使用数据集原生的基因列表 (如PRAD的200基因)
-            var_st_gene_count: 🆕 VAR-ST模式使用的基因数量 (默认196 = 14x14)
+            use_var_st_genes: 🆕 保留兼容性参数，实际固定使用200个基因
+            var_st_gene_count: 🆕 保留兼容性参数，实际固定使用200个基因
             gene_count_mode: 🆕 基因计数处理模式（固定为discrete_tokens）
-            max_gene_count: 🆕 最大基因计数值（用于截断）
+            max_gene_count: 🆕 基因表达计数值上限（用于截断基因表达值，不影响基因数量选择）
         """
         super(STDataset, self).__init__()
         
@@ -83,6 +79,8 @@ class STDataset(Dataset):
         # 使用原始计数模式
         self.norm_param = {'normalize': False}
         print(f"🔢 使用原始基因计数模式: 计数范围 [0, {max_gene_count}]")
+        print(f"📊 基因数量: 固定使用200个基因 (不受max_gene_count影响)")
+        print(f"🎯 max_gene_count({max_gene_count})仅用于截断基因表达计数值")
         
         # 构建路径
         self.st_dir = f"{data_path}st"
@@ -115,7 +113,8 @@ class STDataset(Dataset):
         print(f"  - ST目录: {self.st_dir}")
         print(f"  - 嵌入目录: {self.emb_dir}")
         
-        # 加载基因列表 - 🆕 支持VAR-ST模式
+        # 加载基因列表 - 🆕 强制使用前200个基因
+        
         self.genes = self.load_gene_list()
         print(f"  - 加载基因数量: {len(self.genes)}")
         
@@ -135,7 +134,7 @@ class STDataset(Dataset):
         print(f"✅ STDataset初始化完成")
 
     def load_gene_list(self) -> List[str]:
-        """从基因列表文件读取基因列表 - 🆕 支持VAR-ST模式"""
+        """从基因列表文件读取基因列表 - 🆕 强制使用前200个基因"""
         
         # 总是从数据集原生基因列表开始
         gene_file = f"{self.processed_dir}/selected_gene_list.txt"
@@ -150,26 +149,17 @@ class STDataset(Dataset):
             if len(all_genes) == 0:
                 raise ValueError(f"基因列表为空: {gene_file}")
             
-            if self.use_var_st_genes:
-                # VAR-ST模式：使用前N个基因，但不超过max_gene_count
-                gene_count = min(self.var_st_gene_count, self.max_gene_count)
-                if len(all_genes) < gene_count:
-                    print(f"⚠️  警告: 数据集只有{len(all_genes)}个基因，少于需要的{gene_count}个")
-                    selected_genes = all_genes  # 使用所有可用基因
-                else:
-                    selected_genes = all_genes[:gene_count]  # 使用前N个基因
-                
-                print(f"VAR-ST模式: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因 (限制为{self.max_gene_count})")
-                return selected_genes
-            else:
-                # 标准模式：使用前max_gene_count个基因
-                if len(all_genes) <= self.max_gene_count:
-                    print(f"标准模式: 使用数据集原生的{len(all_genes)}个基因")
-                    return all_genes
-                else:
-                    selected_genes = all_genes[:self.max_gene_count]
-                    print(f"标准模式: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因 (限制为{self.max_gene_count})")
-                    return selected_genes
+            # 🔧 修复：强制使用前200个基因，确保所有数据集维度一致
+            target_gene_count = 200  # 固定为200个基因
+            
+            if len(all_genes) < target_gene_count:
+                raise ValueError(f"数据集只有{len(all_genes)}个基因，少于需要的{target_gene_count}个基因")
+            
+            selected_genes = all_genes[:target_gene_count]  # 始终使用前200个基因
+            print(f"基因选择: 从{len(all_genes)}个基因中选择前{len(selected_genes)}个基因 (固定为200个)")
+            print(f"注意: max_gene_count({self.max_gene_count})仅用于控制基因表达计数值范围[0,{self.max_gene_count}]")
+            
+            return selected_genes
             
         except UnicodeDecodeError as e:
             raise ValueError(f"基因列表文件编码错误: {gene_file}, 错误: {e}")

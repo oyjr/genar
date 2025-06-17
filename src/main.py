@@ -56,7 +56,7 @@ VAR_ST_CONFIG = {
         
         # Multi-Scale VAR 配置 (内存优化版本)
         'gene_patch_nums': (1, 2, 4, 6, 8, 10, 15),  # 7个尺度，最后一个改为14减少序列长度
-        'vocab_size': 201,  # 🔧 修复：统一为201 (对应0-200的基因计数范围)
+        # vocab_size 将根据 max_gene_count 动态计算 (max_gene_count + 1)
         'embed_dim': 512,  # 减少嵌入维度 768->512
         'num_heads': 8,    # 减少注意力头数 12->8
         'num_layers': 8,   # 减少层数 12->8
@@ -166,8 +166,9 @@ Examples:
   # Single GPU training
   python src/main.py --dataset her2st --gpus 1
   
-  # Test mode
-  python src/main.py --dataset PRAD --gpus 1 --mode test
+  # Test mode with checkpoint
+  python src/main.py --dataset her2st --mode test --gpus 1 \\
+      --ckpt_path logs/her2st/VAR_ST/best-epoch=epoch=02-pcc50=val_pcc_50=0.7688.ckpt
         """
     )
     
@@ -205,14 +206,18 @@ Examples:
                         help='展开增强数据为7倍样本 (默认: True)')
     
     # === 🆕 基因计数参数 ===
-    parser.add_argument('--max-gene-count', type=int, default=200,
-                        help='最大基因计数值 (默认: 200)')
+    parser.add_argument('--max-gene-count', type=int, default=500,
+                        help='最大基因计数值 (默认: 500)')
     
     # === 其他参数 ===
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
                         help='运行模式 (默认: train)')
     parser.add_argument('--seed', type=int,
                         help='随机种子 (默认: 2021)')
+    
+    # === 🆕 测试模式参数 ===
+    parser.add_argument('--ckpt_path', type=str,
+                        help='测试模式时使用的checkpoint路径 (必须在--mode test时指定)')
     
     # === 向后兼容参数 (保留最少必要的) ===
     parser.add_argument('--config', type=str,
@@ -245,7 +250,14 @@ def build_config_from_args(args):
     if args.dataset not in DATASETS:
         raise ValueError(f"不支持的数据集: {args.dataset}，支持的数据集: {list(DATASETS.keys())}")
     
-    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型=VAR_ST")
+    # 🆕 检查测试模式参数
+    if args.mode == 'test' and not args.ckpt_path:
+        raise ValueError("测试模式必须指定 --ckpt_path 参数")
+    
+    if args.ckpt_path and not os.path.exists(args.ckpt_path):
+        raise ValueError(f"Checkpoint文件不存在: {args.ckpt_path}")
+    
+    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型=VAR_ST, 模式={args.mode}")
     
     # 获取数据集信息
     dataset_info = DATASETS[args.dataset]
@@ -271,8 +283,13 @@ def build_config_from_args(args):
     config.MODEL = Dict(model_info)
     config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     # 🔧 根据命令行参数更新基因数量
-    max_gene_count = getattr(args, 'max_gene_count', 200)
-    config.MODEL.num_genes = max_gene_count
+    max_gene_count = getattr(args, 'max_gene_count', 500)
+    # num_genes保持200不变，不被max_gene_count影响
+    
+    # 🆕 动态计算vocab_size = max_gene_count + 1 (对应0到max_gene_count的计数范围)
+    vocab_size = max_gene_count + 1
+    config.MODEL.vocab_size = vocab_size
+    config.MODEL.max_gene_count = max_gene_count
     
     # 更新训练参数
     if args.epochs:
@@ -310,7 +327,11 @@ def build_config_from_args(args):
     config.use_augmented = getattr(args, 'use_augmented', True)
     config.expand_augmented = getattr(args, 'expand_augmented', True)
     config.gene_count_mode = 'discrete_tokens'  # 固定为离散token模式
-    config.max_gene_count = getattr(args, 'max_gene_count', 200)
+    config.max_gene_count = getattr(args, 'max_gene_count', 500)
+    
+    # 🆕 设置checkpoint路径
+    if args.ckpt_path:
+        config.ckpt_path = args.ckpt_path
     
     # 设置多GPU参数
     config.devices = devices
@@ -342,6 +363,7 @@ def build_config_from_args(args):
     print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-pcc50={{val_pcc_50:.4f}}")
     print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
     print(f"   - 最大基因计数: {config.max_gene_count}")
+    print(f"   - 词汇表大小: {vocab_size} (动态计算: {max_gene_count} + 1)")
     
     print(f"✅ 配置构建完成:")
     print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
@@ -352,12 +374,16 @@ def build_config_from_args(args):
     print(f"   - 批次大小: {config.DATA.train_dataloader.batch_size}")
     print(f"   - 学习率: {config.TRAINING.learning_rate}")
     print(f"   - Patience机制: {patience_status}")
+    print(f"   - 基因计数范围: 0-{max_gene_count} (vocab_size: {vocab_size})")
     
     return config
 
 
 def main(config):
-    print("🚀 开始训练...")
+    if config.mode == 'train':
+        print("🚀 开始训练...")
+    else:
+        print("🧪 开始测试...")
     
     # 设置随机种子
     fix_seed(config.GENERAL.seed)
@@ -398,9 +424,14 @@ def main(config):
         deterministic=False,
     )
 
-    # 开始训练
+    # 根据模式执行不同的操作
     if config.mode == 'train':
         trainer.fit(model, datamodule=dataset)
+    elif config.mode == 'test':
+        print(f"📂 从checkpoint加载模型: {config.ckpt_path}")
+        # 使用PyTorch Lightning的test方法，自动加载checkpoint
+        trainer.test(model, datamodule=dataset, ckpt_path=config.ckpt_path)
+        print("✅ 测试完成！")
 
     return model
 

@@ -65,8 +65,9 @@ class ModelInterface(pl.LightningModule):
         self._logger.info("初始化VAR-ST模型接口")
         self.model = self._load_model()
         
-        # 初始化损失函数
-        self.criterion = torch.nn.MSELoss()
+        # 初始化损失函数（实际在_compute_loss中实现期望值损失）
+        self.criterion = torch.nn.MSELoss()  # 保留作为备用
+        self._logger.info("使用期望值回归损失（在_compute_loss中实现）")
 
         # 初始化输出缓存（只用于验证和测试）
         self.val_outputs = []
@@ -298,27 +299,63 @@ class ModelInterface(pl.LightningModule):
                 raise ValueError("目标基因表达值包含负数")
 
     def _compute_loss(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """计算损失"""
+        """使用期望值回归损失替代交叉熵损失"""
         try:
-            if 'loss' not in outputs:
-                # 🔧 处理推理模式：模型输出中没有损失值时手动计算
-                if 'predictions' in outputs and 'target_genes' in batch:
-                    predictions = outputs['predictions']  # [B, 200] token IDs
-                    targets = batch['target_genes']       # [B, 200] token IDs
-                    
-                    # 🔧 关键修复：与baseline保持一致，使用log2(x+1)变换后的MSE损失
-                    # 将token IDs当作基因计数值，应用log2变换后计算MSE
-                    predictions_log2 = torch.log2(predictions.float() + 1.0)
-                    targets_log2 = torch.log2(targets.float() + 1.0)
-                    total_loss = F.mse_loss(predictions_log2, targets_log2)
-                    self._logger.debug(f"推理模式：使用log2(x+1)变换后的MSE损失={total_loss:.4f}")
-                elif 'ce_loss' in outputs and 'reg_loss' in outputs:
-                    total_loss = outputs['ce_loss'] + outputs['reg_loss']
-                    self._logger.warning("使用备选损失计算方案")
+            # 检查是否有logits输出（用于期望值损失）
+            if 'logits' in outputs and ('full_target' in outputs or 'target_genes' in batch):
+                # 使用期望值回归损失
+                logits = outputs['logits']  # [B, seq_len, vocab_size] 或 [B*seq_len, vocab_size]
+                
+                # 优先使用full_target（VAR模型的多尺度目标），否则使用target_genes
+                if 'full_target' in outputs:
+                    targets = outputs['full_target']  # [B, seq_len] - VAR模型的多尺度目标
                 else:
-                    raise KeyError("模型输出中找不到损失值，且无法计算替代损失")
-            else:
+                    targets = batch['target_genes']   # [B, seq_len] - 标准目标
+                
+                # 确保维度匹配
+                if logits.dim() == 3:
+                    B, seq_len, V = logits.shape
+                    logits = logits.view(-1, V)
+                    targets = targets.view(-1)
+                
+                # 创建token到log2连续值的映射
+                vocab_size = logits.shape[-1]
+                token_values = torch.log2(torch.arange(vocab_size, dtype=torch.float32, device=logits.device) + 1.0)
+                
+                # 计算真实连续值
+                true_continuous = token_values[targets]
+                
+                # 计算期望连续值
+                probs = F.softmax(logits, dim=-1)
+                expected_continuous = torch.sum(probs * token_values[None, :], dim=-1)
+                
+                # 使用MSE损失（与评估指标一致）
+                total_loss = F.mse_loss(expected_continuous, true_continuous)
+                
+                # 记录额外指标
+                with torch.no_grad():
+                    token_acc = (logits.argmax(dim=-1) == targets).float().mean()
+                    self.log('train_token_accuracy', token_acc, prog_bar=False, sync_dist=False)
+                    self.log('train_expected_mse', total_loss.detach(), prog_bar=True, sync_dist=False)
+                
+                self._logger.debug(f"期望值回归损失={total_loss:.4f}")
+                
+            elif 'predictions' in outputs and 'target_genes' in batch:
+                # 推理模式：直接使用预测的token IDs
+                predictions = outputs['predictions']  # [B, 200] token IDs
+                targets = batch['target_genes']       # [B, 200] token IDs
+                predictions_log2 = torch.log2(predictions.float() + 1.0)
+                targets_log2 = torch.log2(targets.float() + 1.0)
+                total_loss = F.mse_loss(predictions_log2, targets_log2)
+                self._logger.debug(f"推理模式：使用log2(x+1)变换后的MSE损失={total_loss:.4f}")
+                
+            elif 'loss' in outputs:
+                # 备用方案：使用模型内部损失
                 total_loss = outputs['loss']
+                self._logger.warning("使用模型内部交叉熵损失（备用方案）")
+                
+            else:
+                raise KeyError("无法计算损失：缺少必要的输出")
             
             # 验证损失值
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -694,20 +731,24 @@ class ModelInterface(pl.LightningModule):
         predictions = all_predictions.to(self.device)
         targets = all_targets.to(self.device)
         
-        # 使用TorchMetrics计算标准指标
+        # 🔧 关键修复：测试阶段也需要应用log2变换来计算指标
+        # 为了与其他模型对比，在计算评估指标时应用log2变换
+        predictions_log2, targets_log2 = self._apply_log2_normalization_for_evaluation(predictions, targets)
+        
+        # 使用TorchMetrics计算标准指标（使用log2变换后的值）
         metrics = getattr(self, f'{phase}_metrics')
         metrics.reset()
-        metrics.update(predictions, targets)
+        metrics.update(predictions_log2, targets_log2)
         metric_dict = metrics.compute()
         
         # 记录标准指标
         self._log_evaluation_metrics(phase, metric_dict)
         
-        # 计算详细指标
+        # 计算详细指标（也使用log2变换后的值）
         if hasattr(self, f'{phase}_detailed_metrics'):
             detailed_metrics = getattr(self, f'{phase}_detailed_metrics')
             detailed_metrics.reset()
-            detailed_metrics.update(predictions, targets)
+            detailed_metrics.update(predictions_log2, targets_log2)
             detailed_dict = detailed_metrics.compute()
             self._log_detailed_metrics(phase, detailed_dict)
         
