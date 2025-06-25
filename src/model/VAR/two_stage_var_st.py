@@ -40,16 +40,31 @@ logger = logging.getLogger(__name__)
 
 class MultiScaleGeneVAR(nn.Module):
     """
-    Hierarchical Gene VAR for Spatial Transcriptomics
+    Hierarchical Gene VAR for Spatial Transcriptomics with Semantic-Aware Embeddings
     
-    This model implements a hierarchical generation process, moving from a coarse,
-    global representation of gene expression to a fine-grained, per-gene prediction.
+    This model implements a hierarchical generation process with improved position embeddings
+    that address semantic mismatches between different scales. Key improvements include:
     
     Architecture:
-    - Condition Processor: Encodes histology and spatial features.
-    - Hierarchical Generation: Sequentially refines predictions across scales (e.g., 1 -> 4 -> 16 -> 64 -> 200).
-    - AdaLN Transformer: Core computation block with deep conditioning.
-    - Teacher Forcing: Uses ground truth averages at each scale to guide the next.
+    - Condition Processor: Encodes histology and spatial features
+    - Hierarchical Position Embeddings: Scale-specific embeddings that preserve semantic meaning
+    - Hierarchical Generation: Sequentially refines predictions across scales (e.g., 1 → 4 → 16 → 64 → 200)
+    - AdaLN Transformer: Core computation block with deep conditioning
+    - Teacher Forcing: Uses ground truth averages at each scale to guide the next
+    
+    Key Features:
+    - Multi-scale cumulative generation (like original VAR)
+    - Semantic-aware position embeddings for each scale
+    - AdaLN conditioning for deep feature fusion
+    - Residual accumulation across scales
+    - KV caching for efficient inference
+    - Soft label training for information preservation
+    
+    Embedding Innovation:
+    - Each scale has dedicated position embeddings with appropriate semantic meaning
+    - Intermediate scales use pool position embeddings (representing gene groups)
+    - Final scale uses gene identity embeddings (representing individual genes)
+    - This eliminates semantic confusion where same position represents different biology
     """
     
     def __init__(
@@ -116,8 +131,19 @@ class MultiScaleGeneVAR(nn.Module):
         # Gene token embedding
         self.gene_embedding = nn.Embedding(vocab_size, embed_dim)
         
-        # Unified position embedding for the maximum sequence length (200 genes + 1 start token)
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_genes + 1, embed_dim) * 0.02)
+        # Hierarchical position embedding - separate embedding for each scale
+        # This solves the semantic mismatch where the same position index
+        # represents different biological meanings at different scales
+        self.hierarchical_pos_embedding = nn.ModuleDict()
+        for i, dim in enumerate(self.scale_dims):
+            # Each scale needs dim+1 positions (+1 for start token)
+            # For example: scale with dim=4 needs positions [0, 1, 2, 3, 4]
+            # where 0=start_token, 1-4=four gene pools
+            self.hierarchical_pos_embedding[f'scale_{i}'] = nn.Embedding(dim + 1, embed_dim)
+        
+        logger.info(f"🔧 Created hierarchical position embeddings:")
+        for i, dim in enumerate(self.scale_dims):
+            logger.info(f"   Scale {i} (dim={dim}): {dim + 1} positions")
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
@@ -158,6 +184,34 @@ class MultiScaleGeneVAR(nn.Module):
         """Count the number of trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
+    def _get_hierarchical_position_embedding(self, scale_idx: int, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        获取指定尺度的位置嵌入
+        
+        这个方法为不同尺度提供语义正确的位置嵌入：
+        - 中间尺度：pool位置嵌入，表示基因组的聚合位置
+        - 最终尺度：基因身份嵌入，表示具体基因的身份特征
+        
+        Args:
+            scale_idx: 当前尺度索引 (0 to num_scales-1)
+            seq_len: 序列长度，包含start token
+            device: 张量设备
+            
+        Returns:
+            位置嵌入张量 [1, seq_len, embed_dim]
+        """
+        # 选择当前尺度的专用位置嵌入层
+        embedding_layer = self.hierarchical_pos_embedding[f'scale_{scale_idx}']
+        
+        # 生成位置索引：[0, 1, 2, ..., seq_len-1]
+        pos_indices = torch.arange(seq_len, device=device)
+        
+        # 获取位置嵌入 [seq_len, embed_dim]
+        pos_embed = embedding_layer(pos_indices)
+        
+        # 扩展批次维度 [1, seq_len, embed_dim]
+        return pos_embed.unsqueeze(0)
+    
     def init_weights(self, init_std: float = 0.02):
         """Initialize model weights following VAR initialization"""
         def _init_weights(module):
@@ -174,7 +228,7 @@ class MultiScaleGeneVAR(nn.Module):
                     nn.init.ones_(module.weight)
         
         self.apply(_init_weights)
-        logger.info("🎯 Model weights initialized")
+        logger.info("🎯 Model weights initialized with hierarchical position embeddings")
 
     def _create_hierarchical_targets(self, target_genes: torch.Tensor) -> HierarchicalTargets:
         """
@@ -416,7 +470,7 @@ class MultiScaleGeneVAR(nn.Module):
             # Add scale and position embeddings
             current_seq_len = x.shape[1]
             scale_embed = self.scale_embedding(torch.tensor([scale_idx], device=device)).view(1, 1, -1)
-            pos_embed = self.pos_embedding[:, :current_seq_len, :]
+            pos_embed = self._get_hierarchical_position_embedding(scale_idx, current_seq_len, device)
             x = x + pos_embed + scale_embed
             
             # Create a causal mask for the current sequence length
@@ -492,7 +546,7 @@ class MultiScaleGeneVAR(nn.Module):
             # Add scale and position embeddings
             current_seq_len = x.shape[1]
             scale_embed = self.scale_embedding(torch.tensor([scale_idx], device=device)).view(1, 1, -1)
-            pos_embed = self.pos_embedding[:, :current_seq_len, :]
+            pos_embed = self._get_hierarchical_position_embedding(scale_idx, current_seq_len, device)
             x = x + pos_embed + scale_embed
 
             # Create causal mask
@@ -663,7 +717,7 @@ class MultiScaleGeneVAR(nn.Module):
         
         condition_params = sum(p.numel() for p in self.condition_processor.parameters())
         transformer_params = sum(p.numel() for p in self.transformer_blocks.parameters())
-        embedding_params = self.gene_embedding.weight.numel() + self.pos_embedding.numel() + self.scale_embedding.weight.numel()
+        embedding_params = self.gene_embedding.weight.numel() + sum(p.numel() for p in self.hierarchical_pos_embedding.parameters()) + self.scale_embedding.weight.numel()
         output_params = sum(p.numel() for p in self.head_norm.parameters()) + sum(p.numel() for p in self.output_head.parameters())
         
         return {
