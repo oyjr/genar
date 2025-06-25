@@ -114,7 +114,7 @@ DEFAULT_CONFIG = {
         'learning_rate': 1.0e-4,
         'weight_decay': 1.0e-4,
         'mode': 'min',
-        'monitor': 'val_loss',
+        'monitor': 'val_loss_final',
         'lr_scheduler': {
             'patience': 0,  # 默认禁用，只有命令行指定时才启用
             'factor': 0.5
@@ -123,23 +123,23 @@ DEFAULT_CONFIG = {
     },
     'CALLBACKS': {
         'early_stopping': {
-            'monitor': 'val_loss',  # 动态更新：Stage1用val_mse, Stage2用val_accuracy
+            'monitor': 'val_loss_final',
             'patience': 10000,  # 默认设置很大值，实际禁用早停
-            'mode': 'min',      # 动态更新：Stage1用min, Stage2用max
+            'mode': 'min',
             'min_delta': 0.0
         },
         'model_checkpoint': {
-            'monitor': 'val_loss',  # 动态更新：Stage1用val_mse, Stage2用val_accuracy  
+            'monitor': 'val_loss_final',
             'save_top_k': 1,
-            'mode': 'min',          # 动态更新：Stage1用min, Stage2用max
-            'filename': 'best-epoch={epoch:02d}-{val_mse:.4f}'  # 动态更新：Stage1和Stage2使用不同命名
+            'mode': 'min',
+            'filename': 'best-epoch={epoch:02d}-loss={val_loss_final:.4f}'
         },
         'learning_rate_monitor': {
             'logging_interval': 'epoch'
         }
     },
     'MULTI_GPU': {
-        'find_unused_parameters': True,  # 🔧 启用未使用参数检测：VAR模型可能有未使用参数
+        'find_unused_parameters': False,  # ✅ 优化：新架构无未使用参数，关闭以提升性能
         'accumulate_grad_batches': 1
     }
 }
@@ -428,15 +428,29 @@ def create_dataloaders(config):
 
 
 def main(config):
-    if config.mode == 'train':
-        print("🚀 开始训练...")
-    else:
-        print("🧪 开始测试...")
-    
-    # 设置随机种子
-    fix_seed(config.GENERAL.seed)
+    """主训练函数"""
 
-    # 创建数据加载器
+    # 1. 初始化和设置
+    # ...
+    
+    # 动态更新监控指标和文件名
+    if config.MODEL.model_name == 'VAR_ST':
+        # ✅ FIX: 强制使用最终尺度损失进行监控，以确保保存最佳PCC性能的模型
+        monitor_metric = 'val_loss_final'
+        monitor_mode = 'min'
+
+        config.TRAINING.monitor = monitor_metric
+        config.TRAINING.mode = monitor_mode
+        config.CALLBACKS.early_stopping.monitor = monitor_metric
+        config.CALLBACKS.early_stopping.mode = monitor_mode
+        config.CALLBACKS.model_checkpoint.monitor = monitor_metric
+        config.CALLBACKS.model_checkpoint.mode = monitor_mode
+        # 使用与监控指标完全一致的动态文件名
+        config.CALLBACKS.model_checkpoint.filename = f'best-epoch={{epoch:02d}}-{monitor_metric}={{{monitor_metric}:.4f}}'
+        print(f"✅ VAR-ST: 监控指标强制更新为 {monitor_metric} (模式: {monitor_mode})")
+
+    # 2. 加载数据加载器
+    # ...
     train_loader, val_loader, test_loader = create_dataloaders(config)
     
     # 初始化组件

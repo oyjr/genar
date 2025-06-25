@@ -21,8 +21,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 from functools import partial
+
+# 软标签类型定义
+SoftTarget = Dict[str, torch.Tensor]  # 软标签字典类型
+HierarchicalTargets = List[Union[torch.Tensor, SoftTarget]]  # 层次化目标类型
 
 from .gene_var_transformer import (
     GeneAdaLNSelfAttn, 
@@ -36,25 +40,24 @@ logger = logging.getLogger(__name__)
 
 class MultiScaleGeneVAR(nn.Module):
     """
-    Multi-Scale Gene VAR for Spatial Transcriptomics
+    Hierarchical Gene VAR for Spatial Transcriptomics
     
-    Based on original VAR architecture with cumulative multi-scale generation.
-    Each scale contains all previous genes plus new ones, finally converging 
-    to the complete 200 gene expressions.
+    This model implements a hierarchical generation process, moving from a coarse,
+    global representation of gene expression to a fine-grained, per-gene prediction.
     
     Architecture:
-    - Condition Processor: Process histology + spatial features with positional encoding
-    - Multi-Scale Generation: Cumulative generation across 7 scales
-    - AdaLN Transformer: Deep conditioning with adaptive layer normalization
-    - Residual Accumulation: Like original VAR's feature accumulation
+    - Condition Processor: Encodes histology and spatial features.
+    - Hierarchical Generation: Sequentially refines predictions across scales (e.g., 1 -> 4 -> 16 -> 64 -> 200).
+    - AdaLN Transformer: Core computation block with deep conditioning.
+    - Teacher Forcing: Uses ground truth averages at each scale to guide the next.
     """
     
     def __init__(
         self,
-        # Gene-related parameters (必需参数在前)
-        vocab_size: int,  # 必需参数，从配置中动态传入 (max_gene_count + 1)
+        # Gene-related parameters
+        vocab_size: int,
         num_genes: int = 200,
-        gene_patch_nums: Tuple[int, ...] = (1, 2, 4, 6, 8, 10, 15),
+        scale_dims: Tuple[int, ...] = (1, 4, 16, 64, 200),
         
         # Model architecture parameters
         embed_dim: int = 768,
@@ -81,8 +84,8 @@ class MultiScaleGeneVAR(nn.Module):
     ):
         super().__init__()
         
+        # Store key parameters
         self.num_genes = num_genes
-        self.gene_patch_nums = gene_patch_nums
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -90,23 +93,18 @@ class MultiScaleGeneVAR(nn.Module):
         self.cond_drop_rate = cond_drop_rate
         self.device = device
         
-        # 保存所有配置参数用于checkpoint
+        # Hierarchical scale configuration
+        self.scale_dims = scale_dims
+        self.num_scales = len(scale_dims)
+        
+        # Store other config parameters for checkpointing
         self.histology_feature_dim = histology_feature_dim
         self.spatial_coord_dim = spatial_coord_dim
         self.condition_embed_dim = condition_embed_dim
         
-        # Calculate cumulative gene counts for each scale
-        self.cumulative_gene_counts = [min(pn * pn, num_genes) for pn in gene_patch_nums]
-        self.num_scales = len(gene_patch_nums)
-        
-        # Calculate sequence lengths for each scale (including start tokens)
-        self.scale_sequence_lengths = [count + 1 for count in self.cumulative_gene_counts]  # +1 for start token
-        self.total_length = sum(self.scale_sequence_lengths)
-        
-        logger.info(f"🧬 Gene scale configuration: {gene_patch_nums}")
-        logger.info(f"📊 Cumulative gene counts: {self.cumulative_gene_counts}")
-        logger.info(f"📏 Scale sequence lengths: {self.scale_sequence_lengths}")
-        logger.info(f"🔢 Total sequence length: {self.total_length}")
+        # Log the new hierarchical configuration
+        logger.info(f"🧬 Hierarchical scale dimensions: {self.scale_dims}")
+        logger.info(f"🔢 Number of scales: {self.num_scales}")
         
         # Condition processor
         self.condition_processor = ConditionProcessor(
@@ -118,14 +116,14 @@ class MultiScaleGeneVAR(nn.Module):
         # Gene token embedding
         self.gene_embedding = nn.Embedding(vocab_size, embed_dim)
         
-        # Position embedding for each token position
-        self.pos_embedding = nn.Parameter(torch.randn(1, self.total_length, embed_dim) * 0.02)
+        # Unified position embedding for the maximum sequence length (200 genes + 1 start token)
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_genes + 1, embed_dim) * 0.02)
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
         
-        # Start token embeddings for each scale
-        self.start_token_embeds = nn.Parameter(torch.randn(self.num_scales, embed_dim) * 0.02)
+        # Single start token for initiating the generation process
+        self.start_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         
         # Transformer backbone with AdaLN
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
@@ -153,7 +151,7 @@ class MultiScaleGeneVAR(nn.Module):
         # Initialize weights
         self.init_weights()
         
-        logger.info(f"✅ Multi-Scale Gene VAR initialized successfully")
+        logger.info(f"✅ Hierarchical Gene VAR initialized successfully")
         logger.info(f"📈 Model parameters: ~{self._count_parameters()/1e6:.1f}M")
     
     def _count_parameters(self) -> int:
@@ -177,29 +175,147 @@ class MultiScaleGeneVAR(nn.Module):
         
         self.apply(_init_weights)
         logger.info("🎯 Model weights initialized")
-    
-    def create_multiscale_causal_mask(self, sequence_lengths: List[int]) -> torch.Tensor:
+
+    def _create_hierarchical_targets(self, target_genes: torch.Tensor) -> HierarchicalTargets:
         """
-        Create multi-scale causal mask
-        Each scale can only see its own and previous scales' information
+        Creates hierarchical ground truth targets using soft labels for intermediate scales.
+        
+        This method solves the information loss problem in the original implementation by:
+        1. Using soft labels (floor/ceil + weights) for intermediate scales instead of hard rounding
+        2. Preserving the complete information from floating-point pooled values
+        3. Only using hard labels for the final, full-resolution scale
+
+        Args:
+            target_genes (torch.Tensor): The ground truth gene expressions, shape [B, 200].
+
+        Returns:
+            HierarchicalTargets: A list containing either hard targets (torch.Tensor) for the final scale
+                               or soft targets (Dict[str, torch.Tensor]) for intermediate scales.
+                               Soft targets contain:
+                               - 'floor_targets': Lower bound token IDs
+                               - 'ceil_targets': Upper bound token IDs  
+                               - 'weights': Interpolation weights (0.0 to 1.0)
         """
-        total_len = sum(sequence_lengths)
-        mask = torch.full((total_len, total_len), float('-inf'))
-        
-        start_idx = 0
-        for scale_idx, seq_len in enumerate(sequence_lengths):
-            end_idx = start_idx + seq_len
+        B = target_genes.shape[0]
+        hierarchical_targets = []
+
+        # Ensure target_genes is float for pooling operations
+        target_genes_float = target_genes.float().unsqueeze(1) # -> [B, 1, 200]
+
+        for i, dim in enumerate(self.scale_dims):
+            if dim == self.num_genes:
+                # The final scale uses hard labels (original behavior)
+                hard_targets = target_genes.long()
+                hard_targets = torch.clamp(hard_targets, 0, self.vocab_size - 1)
+                hierarchical_targets.append(hard_targets)
+            else:
+                # Intermediate scales use soft labels to preserve information
+                pooled_targets = F.adaptive_avg_pool1d(target_genes_float, output_size=dim)
+                pooled_targets = pooled_targets.squeeze(1) # -> [B, dim]
+                
+                # Generate soft labels: floor + ceil + interpolation weight
+                floor_targets = torch.floor(pooled_targets).long()
+                ceil_targets = torch.ceil(pooled_targets).long()
+                weights = pooled_targets - floor_targets.float()  # Interpolation weights [0.0, 1.0]
+                
+                # Handle boundary conditions to ensure valid vocab indices
+                floor_targets = torch.clamp(floor_targets, 0, self.vocab_size - 1)
+                ceil_targets = torch.clamp(ceil_targets, 0, self.vocab_size - 1)
+                
+                # Special case: when ceil would exceed vocab boundary, merge weight into floor
+                boundary_mask = ceil_targets >= self.vocab_size
+                if boundary_mask.any():
+                    weights = torch.where(boundary_mask, torch.zeros_like(weights), weights)
+                    ceil_targets = torch.where(boundary_mask, floor_targets, ceil_targets)
+                
+                soft_target = {
+                    'floor_targets': floor_targets,
+                    'ceil_targets': ceil_targets,
+                    'weights': weights
+                }
+                
+                hierarchical_targets.append(soft_target)
             
-            # Current scale can see all previous scales and causal info within itself
-            mask[start_idx:end_idx, :end_idx] = torch.triu(
-                torch.zeros(seq_len, end_idx), 
-                diagonal=end_idx - seq_len + 1
-            )
-            
-            start_idx = end_idx
+        return hierarchical_targets
+
+    def _compute_soft_label_loss(self, logits: torch.Tensor, target: Union[torch.Tensor, SoftTarget]) -> torch.Tensor:
+        """
+        Compute loss for either hard labels (cross-entropy) or soft labels (KL divergence).
         
-        return mask
-    
+        This method enables information-preserving training by:
+        1. Using standard cross-entropy for hard labels (final scale)
+        2. Using KL divergence for soft labels (intermediate scales)
+        3. Constructing target probability distributions that preserve floating-point precision
+        
+        Args:
+            logits (torch.Tensor): Model predictions, shape [B, seq_len, vocab_size]
+            target (Union[torch.Tensor, SoftTarget]): Either hard targets or soft target dict
+            
+        Returns:
+            torch.Tensor: Computed loss value
+        """
+        # Handle hard labels (final scale)
+        if isinstance(target, torch.Tensor):
+            return F.cross_entropy(logits.reshape(-1, self.vocab_size), target.reshape(-1))
+        
+        # Handle soft labels (intermediate scales)
+        if not isinstance(target, dict) or 'floor_targets' not in target:
+            raise ValueError("Soft target must be a dict containing 'floor_targets', 'ceil_targets', 'weights'")
+        
+        floor_targets = target['floor_targets']  # [B, seq_len]
+        ceil_targets = target['ceil_targets']    # [B, seq_len]
+        weights = target['weights']              # [B, seq_len], interpolation weights
+        
+        B, seq_len, vocab_size = logits.shape
+        
+        # Compute log probabilities for KL divergence
+        log_probs = F.log_softmax(logits, dim=-1)  # [B, seq_len, vocab_size]
+        
+        # Construct target probability distribution
+        # P(floor) = 1 - weight, P(ceil) = weight, P(others) = 0
+        target_dist = torch.zeros_like(log_probs)  # [B, seq_len, vocab_size]
+        
+        # Create indices for scatter operations
+        batch_indices = torch.arange(B, device=logits.device).unsqueeze(1).expand(-1, seq_len)
+        seq_indices = torch.arange(seq_len, device=logits.device).unsqueeze(0).expand(B, -1)
+        
+        # Set probabilities for floor targets: P(floor) = 1 - weight
+        floor_probs = 1.0 - weights  # [B, seq_len]
+        target_dist[batch_indices, seq_indices, floor_targets] = floor_probs
+        
+        # Set probabilities for ceil targets: P(ceil) = weight
+        # Only when ceil != floor (avoid double-counting when pooled value is integer)
+        ceil_mask = (ceil_targets != floor_targets)
+        if ceil_mask.any():
+            ceil_probs = weights * ceil_mask.float()  # [B, seq_len]
+            target_dist[batch_indices, seq_indices, ceil_targets] = ceil_probs
+        
+        # Add small epsilon for numerical stability and ensure valid probability distribution
+        eps = 1e-8
+        target_dist = target_dist + eps
+        target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)  # Renormalize
+        
+        # Additional numerical stability checks
+        if torch.isnan(target_dist).any():
+            logger.warning("NaN detected in target distribution, falling back to hard labels")
+            # Fallback to hard cross-entropy with floor targets
+            return F.cross_entropy(logits.reshape(-1, self.vocab_size), floor_targets.reshape(-1))
+        
+        if torch.isinf(log_probs).any():
+            logger.warning("Inf detected in log probabilities, clipping values")
+            log_probs = torch.clamp(log_probs, min=-50.0, max=50.0)
+        
+        # Compute KL divergence: KL(target_dist || predicted_dist)
+        # Note: PyTorch's kl_div expects log_probs as first argument and target as second
+        kl_loss = F.kl_div(log_probs, target_dist, reduction='batchmean', log_target=False)
+        
+        # Final sanity check on loss value
+        if torch.isnan(kl_loss) or torch.isinf(kl_loss):
+            logger.warning("Invalid KL loss detected, falling back to cross-entropy")
+            return F.cross_entropy(logits.reshape(-1, self.vocab_size), floor_targets.reshape(-1))
+        
+        return kl_loss
+
     def forward(
         self,
         histology_features: torch.Tensor,   # [B, 1024]
@@ -236,166 +352,114 @@ class MultiScaleGeneVAR(nn.Module):
         target_genes: torch.Tensor          # [B, num_genes]
     ) -> Dict[str, torch.Tensor]:
         """
-        Training forward pass with inter-scale teacher forcing
+        Hierarchical training pass with teacher forcing using soft labels.
         
-        每个尺度使用前一个尺度的真实基因作为输入，并行预测当前尺度的所有累积基因：
-        - 尺度1: 输入[START] → 预测[g1] 
-        - 尺度2: 输入[START, 真实g1] → 预测[g1, g2, g3, g4]
-        - 尺度3: 输入[START, 真实g1, 真实g2, 真实g3, 真实g4] → 预测[g1, g2, ..., g16]
+        This method implements an information-preserving training strategy:
+        1. At each intermediate scale, soft labels preserve floating-point precision from pooling
+        2. Soft labels use KL divergence loss instead of hard cross-entropy
+        3. The final scale uses hard labels for discrete token prediction
+        4. Each scale receives ground truth from the previous scale (teacher forcing)
+        
+        The soft label mechanism solves the critical information loss problem where
+        pooling [100, 0] → 50.0 would previously be rounded to hard target 50,
+        but now preserves the distribution information via floor/ceil targets.
         """
         B = condition_embed.shape[0]
         device = condition_embed.device
         
-        # Condition dropout for classifier-free guidance
-        if self.training and self.cond_drop_rate > 0:
-            mask = torch.rand(B, device=device) < self.cond_drop_rate
-            condition_embed = condition_embed * (~mask).float().unsqueeze(1)
+        # 1. Create all hierarchical targets with soft labels for intermediate scales
+        # This preserves floating-point precision instead of lossy rounding
+        hierarchical_targets = self._create_hierarchical_targets(target_genes)
         
-        # Build multi-scale input sequences with inter-scale teacher forcing
-        input_sequences = []
-        target_sequences = []
-        scale_indicators = []
+        # Initialize lists to store outputs from each scale
+        all_logits = []
+        total_loss = 0.0
+        final_predictions = None
+        final_loss = torch.tensor(0.0, device=device) # Initialize final_loss
         
-        for scale_idx, gene_count in enumerate(self.cumulative_gene_counts):
-            # Current scale's target genes (cumulative)
-            scale_target = target_genes[:, :gene_count]  # [B, gene_count]
-            
-            start_token = torch.zeros(B, 1, dtype=torch.long, device=device)
-            
+        # 2. Iteratively train each scale
+        for scale_idx, (scale_dim, scale_target) in enumerate(zip(self.scale_dims, hierarchical_targets)):
+            # Determine the input for the current scale
             if scale_idx == 0:
-                # 第一个尺度：只用START token
-                # 输入: [START] → 预测: [g1]
-                scale_input = start_token  # [B, 1]
+                # For the first scale, input is just the start token
+                scale_input_tokens = None # Will be handled by start_token inside the loop
             else:
-                # 其他尺度：使用前一个尺度的真实基因值 (Teacher Forcing)
-                # 输入: [START, 真实g1, ..., 真实g_prev] → 预测: [g1, ..., g_curr]
-                prev_gene_count = self.cumulative_gene_counts[scale_idx - 1]
-                prev_genes = target_genes[:, :prev_gene_count]  # 前一个尺度的真实基因
-                scale_input = torch.cat([start_token, prev_genes], dim=1)  # [B, prev_gene_count + 1]
+                # For subsequent scales, input is the ground truth from the previous scale (Teacher Forcing)
+                prev_target = hierarchical_targets[scale_idx - 1]
+                
+                # Extract hard tokens for embedding from soft or hard targets
+                if isinstance(prev_target, dict):
+                    # Previous scale used soft labels - extract hard tokens for teacher forcing
+                    # Use weighted sampling between floor and ceil based on weights
+                    floor_targets = prev_target['floor_targets']
+                    ceil_targets = prev_target['ceil_targets']
+                    weights = prev_target['weights']
+                    
+                    # Sample based on weights: if weight > 0.5, use ceil, otherwise floor
+                    # This maintains the probabilistic nature while providing discrete tokens
+                    scale_input_tokens = torch.where(weights > 0.5, ceil_targets, floor_targets)
+                else:
+                    # Previous scale used hard labels
+                    scale_input_tokens = prev_target
             
-            input_sequences.append(scale_input)
-            target_sequences.append(scale_target)
-            
-            # Scale indicators for each token in input sequence
-            scale_indicators.extend([scale_idx] * scale_input.shape[1])
-        
-        # Concatenate all sequences
-        full_input = torch.cat(input_sequences, dim=1)  # [B, total_input_length]
-        full_target = torch.cat(target_sequences, dim=1)  # [B, total_target_length]
-        
-        # Token embeddings
-        input_embeds = self.gene_embedding(full_input)  # [B, total_input_length, embed_dim]
-        
-        # Add position embeddings
-        seq_len = full_input.shape[1]
-        pos_embeds = self.pos_embedding[:, :seq_len, :]
-        input_embeds = input_embeds + pos_embeds
-        
-        # Add scale embeddings
-        scale_ids = torch.tensor(scale_indicators, dtype=torch.long, device=device)
-        scale_embeds = self.scale_embedding(scale_ids).unsqueeze(0).expand(B, -1, -1)
-        input_embeds = input_embeds + scale_embeds
-        
-        # Create causal mask for multi-scale sequences
-        sequence_lengths = [seq.shape[1] for seq in input_sequences]
-        causal_mask = self.create_multiscale_causal_mask(sequence_lengths).to(device)
-        
-        # Transformer processing
-        hidden_states = input_embeds
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, condition_embed, causal_mask)
-        
-        # Output predictions - 需要为每个尺度生成对应数量的预测
-        hidden_states = self.head_norm(hidden_states, condition_embed)
-        
-        # 为每个尺度单独处理预测
-        loss_logits = []
-        loss_targets = []
-        all_predictions = []
-        
-        input_start_idx = 0
-        for scale_idx, (input_seq, target_seq) in enumerate(zip(input_sequences, target_sequences)):
-            input_len = input_seq.shape[1]   # 输入序列长度
-            target_len = target_seq.shape[1] # 目标序列长度
-            
-            # 获取当前尺度的hidden states
-            scale_hidden = hidden_states[:, input_start_idx:input_start_idx+input_len, :]  # [B, input_len, embed_dim]
-            
-            if scale_idx == 0:
-                # 第一个尺度：从START token预测1个基因
-                # 输入: [START] → 预测: [g1]
-                pred_hidden = scale_hidden[:, 0:1, :]  # [B, 1, embed_dim] - START token的hidden state
-                pred_logits = self.output_head(pred_hidden)  # [B, 1, vocab_size]
-                pred_targets = target_seq  # [B, 1]
+            # Embed the input tokens
+            if scale_input_tokens is not None:
+                # Input from previous scale: [B, prev_dim]
+                input_embed = self.gene_embedding(scale_input_tokens) # [B, prev_dim, D]
+                # Prepend start token
+                start_token_expanded = self.start_token.expand(B, -1, -1) # [B, 1, D]
+                x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + prev_dim, D]
             else:
-                # 其他尺度：从输入序列预测更多基因
-                # 需要扩展hidden states来预测target_len个基因
-                
-                # 方法：使用最后一个token的hidden state，通过位置编码扩展到target_len个预测
-                last_hidden = scale_hidden[:, -1:, :]  # [B, 1, embed_dim] - 最后一个输入token
-                
-                # 扩展到target_len个位置
-                expanded_hidden = last_hidden.expand(B, target_len, -1)  # [B, target_len, embed_dim]
-                
-                # 添加目标位置的位置编码
-                target_pos_embeds = self.pos_embedding[:, :target_len, :]
-                expanded_hidden = expanded_hidden + target_pos_embeds
-                
-                # 添加当前尺度的scale embedding
-                scale_embed = self.scale_embedding(torch.tensor(scale_idx, device=device))
-                scale_embeds = scale_embed.unsqueeze(0).unsqueeze(0).expand(B, target_len, -1)
-                expanded_hidden = expanded_hidden + scale_embeds
-                
-                # 预测所有目标基因
-                pred_logits = self.output_head(expanded_hidden)  # [B, target_len, vocab_size]
-                pred_targets = target_seq  # [B, target_len]
+                # First scale, just use start token
+                x = self.start_token.expand(B, -1, -1) # [B, 1, D]
+
+            # Add scale and position embeddings
+            current_seq_len = x.shape[1]
+            scale_embed = self.scale_embedding(torch.tensor([scale_idx], device=device)).view(1, 1, -1)
+            pos_embed = self.pos_embedding[:, :current_seq_len, :]
+            x = x + pos_embed + scale_embed
             
-            # 收集损失计算数据
-            loss_logits.append(pred_logits.reshape(-1, self.vocab_size))
-            loss_targets.append(pred_targets.reshape(-1))
+            # Create a causal mask for the current sequence length
+            causal_mask = torch.triu(torch.ones(current_seq_len, current_seq_len, device=device) * float('-inf'), diagonal=1)
+
+            # Pass through transformer blocks
+            for block in self.transformer_blocks:
+                x = block(x, condition_embed, causal_mask)
+
+            # --- FIX: Upsample hidden states to match target dimension ---
+            # Permute from [B, L, D] to [B, D, L] for interpolation
+            x = x.permute(0, 2, 1)
+            # Linearly interpolate the sequence length to the current scale's target dimension
+            x = F.interpolate(x, size=scale_dim, mode='linear', align_corners=False)
+            # Permute back to [B, L, D]
+            x = x.permute(0, 2, 1)
+            # --- END FIX ---
+
+            # Get logits for the current scale's prediction
+            x = self.head_norm(x, condition_embed)
+            logits = self.output_head(x) # Shape: [B, scale_dim, vocab_size]
+
+            # The logits now have the correct sequence length to match the target
+            logits_for_loss = logits
             
-            # 收集预测结果
-            scale_predictions = pred_logits.argmax(dim=-1)  # [B, target_len]
-            all_predictions.append(scale_predictions)
+            # Calculate loss for the current scale using soft label loss computation
+            loss = self._compute_soft_label_loss(logits_for_loss, scale_target)
+            total_loss += loss
             
-            input_start_idx += input_len
-        
-        # Calculate total loss
-        all_logits = torch.cat(loss_logits, dim=0)
-        all_targets = torch.cat(loss_targets, dim=0)
-        loss = self._compute_weighted_cross_entropy_loss(all_logits, all_targets)
-        
-        # Calculate accuracy
-        predictions = all_logits.argmax(dim=-1)
-        accuracy = (predictions == all_targets).float().mean()
-        
-        # Calculate perplexity
-        perplexity = torch.exp(loss)
-        
-        # Calculate top-5 accuracy
-        top5_predictions = all_logits.topk(5, dim=-1)[1]
-        top5_accuracy = (top5_predictions == all_targets.unsqueeze(-1)).any(dim=-1).float().mean()
-        
-        # 提取最终尺度的基因预测（最后一个尺度包含所有200个基因）
-        final_scale_predictions = all_predictions[-1]  # [B, 200]
-        
-        # 验证最后一个尺度确实包含200个基因
-        assert final_scale_predictions.shape[1] == self.num_genes, f"最后尺度基因数量({final_scale_predictions.shape[1]})必须等于目标基因数量({self.num_genes})"
-        
-        # 记录训练指标
-        logger.debug(f"加权交叉熵损失={loss:.4f}, 准确率={accuracy:.4f}, 困惑度={perplexity:.4f}")
+            # Store logits and loss for the final, full-resolution scale
+            if scale_dim == self.num_genes:
+                # From the final scale, we extract the predictions.
+                # The prediction for the Nth gene comes from the Nth token's output logit.
+                final_predictions = torch.argmax(logits_for_loss, dim=-1) # [B, 200]
+                final_loss = loss
         
         return {
-            'loss': loss,
-            'logits': all_logits.view(B, -1, self.vocab_size),  # 确保输出logits用于期望值损失 [B, total_predictions, vocab_size]
-            'predictions': final_scale_predictions,  # 最终200个基因预测 [B, 200]
-            'all_scale_predictions': all_predictions,  # 所有尺度的预测结果
-            'accuracy': accuracy,
-            'perplexity': perplexity,
-            'top5_accuracy': top5_accuracy,
-            'full_target': all_targets.view(B, -1)  # 确保target维度匹配 [B, total_predictions]
+            'loss': total_loss / self.num_scales,
+            'loss_final': final_loss,
+            'predictions': final_predictions.float(),
+            'targets': target_genes.float()
         }
-    
+
     def forward_inference(
         self,
         condition_embed: torch.Tensor,      # [B, condition_embed_dim]
@@ -405,218 +469,91 @@ class MultiScaleGeneVAR(nn.Module):
         seed: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Inference with inter-scale autoregressive generation
-        
-        每个尺度使用前一个尺度的预测基因作为输入，并行预测当前尺度的所有累积基因：
-        - 尺度1: 输入[START] → 预测[g1]
-        - 尺度2: 输入[START, 预测g1] → 预测[g1, g2, g3, g4]  
-        - 尺度3: 输入[START, 预测g1, 预测g2, 预测g3, 预测g4] → 预测[g1, g2, ..., g16]
+        Hierarchical inference pass.
+        Autoregressively generates tokens for each scale, where the output of a coarser
+        scale becomes the input for the next, finer scale.
         """
         B = condition_embed.shape[0]
         device = condition_embed.device
-        
-        # 设置随机种子
-        if seed is not None:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(seed)
-        
-        # 逐尺度生成，尺度间自回归
-        predicted_genes = None
-        
-        for scale_idx, gene_count in enumerate(self.cumulative_gene_counts):
-            # logger.info(f"🔄 推理尺度 {scale_idx + 1}/{self.num_scales}, 目标基因数: {gene_count}")
-            
-            start_token = torch.zeros(B, 1, dtype=torch.long, device=device)
-            
-            if scale_idx == 0:
-                # 第一个尺度：输入[START] → 预测[g1]
-                scale_input = start_token  # [B, 1]
-                # logger.info(f"📝 尺度{scale_idx + 1}: 输入形状 {scale_input.shape}")
+
+        generated_tokens = None # This will hold the output of the previous scale
+
+        for scale_idx, scale_dim in enumerate(self.scale_dims):
+            # Embed the input tokens for the current scale
+            if generated_tokens is not None:
+                # Input from previous scale's generation
+                input_embed = self.gene_embedding(generated_tokens) # [B, prev_dim, D]
+                start_token_expanded = self.start_token.expand(B, -1, -1)
+                x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + prev_dim, D]
             else:
-                # 其他尺度：使用前一个尺度的预测结果
-                # 输入: [START, 预测g1, ..., 预测g_prev] → 预测: [g1, ..., g_curr]
-                prev_gene_count = self.cumulative_gene_counts[scale_idx - 1]
-                
-                if predicted_genes is None:
-                    logger.error(f"❌ 尺度{scale_idx + 1}: predicted_genes为None!")
-                    raise RuntimeError(f"predicted_genes为None在尺度{scale_idx + 1}")
-                
-                # 使用前一个尺度的预测基因
-                prev_genes = predicted_genes[:, :prev_gene_count]  # [B, prev_gene_count]
-                scale_input = torch.cat([start_token, prev_genes], dim=1)  # [B, prev_gene_count + 1]
-                
-                # logger.info(f"📝 尺度{scale_idx + 1}: 输入形状 {scale_input.shape}, 使用前{prev_gene_count}个预测基因")
+                # First scale, just use start token
+                x = self.start_token.expand(B, -1, -1) # [B, 1, D]
             
-            # Token embeddings
-            input_embeds = self.gene_embedding(scale_input)  # [B, seq_len, embed_dim]
-            
-            # Add position embeddings
-            seq_len = scale_input.shape[1]
-            pos_embeds = self.pos_embedding[:, :seq_len, :]
-            input_embeds = input_embeds + pos_embeds
-            
-            # Add scale embeddings
-            scale_embed = self.scale_embedding(torch.tensor(scale_idx, device=device))
-            scale_embeds = scale_embed.unsqueeze(0).unsqueeze(0).expand(B, seq_len, -1)
-            input_embeds = input_embeds + scale_embeds
-            
-            # Transformer处理（推理时不使用复杂的多尺度掩码）
-            hidden_states = input_embeds
+            # Add scale and position embeddings
+            current_seq_len = x.shape[1]
+            scale_embed = self.scale_embedding(torch.tensor([scale_idx], device=device)).view(1, 1, -1)
+            pos_embed = self.pos_embedding[:, :current_seq_len, :]
+            x = x + pos_embed + scale_embed
+
+            # Create causal mask
+            causal_mask = torch.triu(torch.ones(current_seq_len, current_seq_len, device=device) * float('-inf'), diagonal=1)
+
+            # Pass through transformer blocks
             for block in self.transformer_blocks:
-                hidden_states = block(hidden_states, condition_embed, None)
+                x = block(x, condition_embed, causal_mask)
             
-            # 输出预测
-            hidden_states = self.head_norm(hidden_states, condition_embed)
+            # --- FIX: Upsample hidden states to match target dimension ---
+            x = x.permute(0, 2, 1)
+            x = F.interpolate(x, size=scale_dim, mode='linear', align_corners=False)
+            x = x.permute(0, 2, 1)
+            # --- END FIX ---
             
-            # 并行预测当前尺度的所有基因
-            if scale_idx == 0:
-                # 第一个尺度：从START token预测1个基因
-                pred_hidden = hidden_states[:, 0:1, :]  # [B, 1, embed_dim]
-                gene_logits = self.output_head(pred_hidden)  # [B, 1, vocab_size]
-                
-                if temperature != 1.0 or top_k is not None or top_p is not None:
-                    scale_predictions = self._sample_next_token(gene_logits.squeeze(1), temperature, top_k, top_p)
-                else:
-                    scale_predictions = gene_logits.argmax(dim=-1)  # [B, 1]
-            else:
-                # 其他尺度：从输入序列预测gene_count个基因
-                # 使用最后一个token的hidden state，扩展到gene_count个预测
-                
-                last_hidden = hidden_states[:, -1:, :]  # [B, 1, embed_dim] - 最后一个输入token
-                
-                # 扩展到gene_count个位置
-                expanded_hidden = last_hidden.expand(B, gene_count, -1)  # [B, gene_count, embed_dim]
-                
-                # 添加目标位置的位置编码
-                target_pos_embeds = self.pos_embedding[:, :gene_count, :]
-                expanded_hidden = expanded_hidden + target_pos_embeds
-                
-                # 添加当前尺度的scale embedding
-                scale_embeds = scale_embed.unsqueeze(0).unsqueeze(0).expand(B, gene_count, -1)
-                expanded_hidden = expanded_hidden + scale_embeds
-                
-                # 预测所有基因
-                gene_logits = self.output_head(expanded_hidden)  # [B, gene_count, vocab_size]
-                
-                if temperature != 1.0 or top_k is not None or top_p is not None:
-                    scale_predictions = self._sample_multiple_tokens(gene_logits, temperature, top_k, top_p)
-                else:
-                    scale_predictions = gene_logits.argmax(dim=-1)  # [B, gene_count]
+            # Get logits for the current scale
+            x = self.head_norm(x, condition_embed)
+            logits = self.output_head(x) # Shape: [B, scale_dim, vocab_size]
             
-            # 更新已预测的基因
-            predicted_genes = scale_predictions
-            
-            # logger.info(f"✅ 尺度 {scale_idx + 1} 完成: 预测了 {predicted_genes.shape[1]} 个基因")
-        
-        # 最终预测（最后一个尺度包含所有200个基因）
-        final_predictions = predicted_genes[:, :self.num_genes].float()
-        
-        # logger.info(f"🎯 最终预测形状: {final_predictions.shape}, 期望: [B, {self.num_genes}]")
-        
-        return {
-            'predictions': final_predictions,  # [B, num_genes] - 最终基因表达预测
-            'token_predictions': predicted_genes[:, :self.num_genes],  # [B, num_genes] - token IDs
-        }
-    
-    def _sample_next_token(
-        self,
-        logits: torch.Tensor,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None
-    ) -> torch.Tensor:
-        """Sample next token with temperature, top-k, and top-p"""
-        logits = logits / temperature
-        
-        # Top-k filtering
-        if top_k is not None:
-            top_k = min(top_k, logits.size(-1))
-            top_k_logits, _ = torch.topk(logits, top_k)
-            min_top_k = top_k_logits[:, -1:].expand_as(logits)
-            logits = torch.where(logits < min_top_k, torch.full_like(logits, float('-inf')), logits)
-        
-        # Top-p filtering
-        if top_p is not None:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = 0
-            
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits = logits.masked_fill(indices_to_remove, float('-inf'))
-        
-        # Sample
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        
-        return next_token
-    
-    def _sample_multiple_tokens(
-        self,
-        logits: torch.Tensor,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None
-    ) -> torch.Tensor:
-        """
-        Sample multiple tokens in parallel from logits
-        
-        Args:
-            logits: [B, seq_len, vocab_size] - logits for multiple positions
-            temperature: sampling temperature
-            top_k: top-k sampling parameter
-            top_p: top-p sampling parameter
-            
-        Returns:
-            tokens: [B, seq_len] - sampled tokens for each position
-        """
-        B, seq_len, vocab_size = logits.shape
-        
-        # Apply temperature
-        if temperature != 1.0:
+            # --- START: Top-k Sampling Logic ---
+            # Apply temperature scaling before filtering and sampling
             logits = logits / temperature
-        
-        # Top-k sampling
-        if top_k is not None and top_k > 0:
-            top_k = min(top_k, vocab_size)
-            # Get top-k values for each position
-            top_k_values, _ = torch.topk(logits, top_k, dim=-1)
-            # Mask out values below top-k threshold
-            indices_to_remove = logits < top_k_values[..., -1:] 
-            logits[indices_to_remove] = -float('inf')
-        
-        # Top-p sampling
-        if top_p is not None and top_p < 1.0:
-            # Sort logits in descending order
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            # Calculate cumulative probabilities
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             
-            # Create mask for tokens to remove (cumulative prob > top_p)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Keep at least the first token
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
+            # Top-k filtering
+            if top_k is not None and top_k > 0:
+                # Get the values of the top k logits for each position in the sequence
+                top_k_values, _ = torch.topk(logits, top_k, dim=-1)
+                
+                # The k-th value is the last one in the sorted top-k values
+                kth_value = top_k_values[:, :, -1].unsqueeze(-1)
+                
+                # Create a mask for all logits smaller than the k-th value
+                mask = logits < kth_value
+                
+                # Set the logits of tokens below the top-k threshold to -infinity
+                logits[mask] = float('-inf')
+
+            # Convert filtered logits to probabilities
+            probabilities = F.softmax(logits, dim=-1)
+
+            # Seed for reproducibility if provided
+            if seed is not None:
+                torch.manual_seed(seed)
             
-            # Convert back to original indices
-            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = -float('inf')
-        
-        # Sample tokens for all positions
-        probs = F.softmax(logits, dim=-1)  # [B, seq_len, vocab_size]
-        
-        # Reshape for multinomial sampling
-        probs_flat = probs.view(-1, vocab_size)  # [B * seq_len, vocab_size]
-        tokens_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)  # [B * seq_len]
-        
-        # Reshape back to original dimensions
-        tokens = tokens_flat.view(B, seq_len)  # [B, seq_len]
-        
-        return tokens
-    
+            # Sample from the filtered distribution using multinomial sampling
+            # Reshape for multinomial which expects a 2D tensor
+            probabilities_flat = probabilities.view(-1, self.vocab_size)
+            sampled_tokens = torch.multinomial(probabilities_flat, num_samples=1)
+            
+            # Reshape the sampled tokens back to the original sequence shape
+            current_scale_dim = logits.shape[1]
+            sampled_tokens = sampled_tokens.view(B, current_scale_dim)
+            # --- END: Top-k Sampling Logic ---
+            
+            # The output of this scale becomes the input for the next
+            generated_tokens = sampled_tokens
+
+        return {
+            'generated_sequence': generated_tokens.float()
+        }
+
     def inference(
         self,
         histology_features: torch.Tensor,
@@ -667,7 +604,7 @@ class MultiScaleGeneVAR(nn.Module):
         checkpoint = {
             'model_state_dict': self.state_dict(),
             'num_genes': self.num_genes,
-            'gene_patch_nums': self.gene_patch_nums,
+            'scale_dims': self.scale_dims,
             'vocab_size': self.vocab_size,
             'embed_dim': self.embed_dim,
             'num_heads': self.num_heads,
@@ -699,7 +636,7 @@ class MultiScaleGeneVAR(nn.Module):
         model = cls(
             vocab_size=checkpoint['vocab_size'],
             num_genes=checkpoint['num_genes'],
-            gene_patch_nums=checkpoint['gene_patch_nums'],
+            scale_dims=checkpoint['scale_dims'],
             embed_dim=checkpoint['embed_dim'],
             num_heads=checkpoint['num_heads'],
             num_layers=checkpoint['num_layers'],
@@ -737,14 +674,13 @@ class MultiScaleGeneVAR(nn.Module):
             'embedding_parameters': embedding_params,
             'output_parameters': output_params,
             'num_genes': self.num_genes,
-            'gene_patch_nums': self.gene_patch_nums,
-            'cumulative_gene_counts': self.cumulative_gene_counts,
+            'scale_dims': self.scale_dims,
             'num_scales': self.num_scales,
             'embed_dim': self.embed_dim,
             'num_heads': self.num_heads,
             'num_layers': self.num_layers,
             'vocab_size': self.vocab_size,
-            'total_sequence_length': self.total_length
+            'total_sequence_length': self.num_genes + 1
         }
 
     def enable_kv_cache(self):

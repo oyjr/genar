@@ -53,13 +53,15 @@ class ModelInterface(pl.LightningModule):
         self.test_step_outputs = []
         
         # 从配置中获取推理参数
-        self.inference_top_k = self.model_utils.get_config('INFERENCE.top_k', 50)
+        self.inference_top_k = self.model_utils.get_config('INFERENCE.top_k', 1)
 
-    def _common_step(self, batch, batch_idx, phase: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _common_step(self, batch, batch_idx, phase: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """通用的step处理逻辑"""
         original_batch = batch.copy() if isinstance(batch, dict) else batch
         processed_batch = self.model_utils.preprocess_inputs(batch)
         
+        loss_final = None
+
         # Validation and Test steps require special handling to avoid data leakage from teacher forcing
         if phase in ['val', 'test']:
             # Pass 1: Get realistic predictions without teacher forcing for metrics
@@ -78,6 +80,7 @@ class ModelInterface(pl.LightningModule):
             # This pass will use teacher forcing, but only for loss calculation
             loss_results = self.model(**processed_batch)
             loss = self._compute_loss(loss_results, original_batch)
+            loss_final = loss_results.get('loss_final', loss)
 
             # Extract predictions from the inference pass and targets from the original batch
             predictions, targets = self._extract_predictions_and_targets(inference_results, original_batch)
@@ -86,30 +89,41 @@ class ModelInterface(pl.LightningModule):
             # Single pass for training
             results_dict = self.model(**processed_batch)
             loss = self._compute_loss(results_dict, original_batch)
+            loss_final = results_dict.get('loss_final', loss)
             predictions, targets = self._extract_predictions_and_targets(results_dict, original_batch)
         
         # 记录模型特定指标
         # For val/test, this uses loss_results which contains more metrics than inference_results
-        final_results_for_logging = loss_results if phase in ['val', 'test'] else results_dict
-        self.model_metrics.log_model_specific_metrics(phase, final_results_for_logging)
+        # final_results_for_logging = loss_results if phase in ['val', 'test'] else results_dict
+        # self.model_metrics.log_model_specific_metrics(phase, final_results_for_logging) # ✅ FIX: 禁用辅助模块的自动日志，避免重复记录
         
-        return loss, predictions, targets
+        return loss, loss_final, predictions, targets
 
     def training_step(self, batch, batch_idx):
         """训练步骤"""
-        loss, _, _ = self._common_step(batch, batch_idx, 'train')
+        loss, loss_final, _, _ = self._common_step(batch, batch_idx, 'train')
+        self.log('train_loss_final', loss_final, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
         # 执行完整的验证步骤
-        loss, predictions, targets = self._common_step(batch, batch_idx, 'val')
+        loss, loss_final, predictions, targets = self._common_step(batch, batch_idx, 'val')
         
         # 获取实际的batch_size
         batch_size = targets.size(0) if hasattr(targets, 'size') else 1
         
-        # 记录验证损失
+        # 记录复合验证损失 (信息性)
         self.log('val_loss', loss, 
+                on_step=False, 
+                on_epoch=True, 
+                prog_bar=True,
+                batch_size=batch_size,
+                sync_dist=True,
+                reduce_fx='mean')
+        
+        # 记录最终尺度损失 (新的关键监控指标)
+        self.log('val_loss_final', loss_final,
                 on_step=False, 
                 on_epoch=True, 
                 prog_bar=True,
@@ -123,7 +137,7 @@ class ModelInterface(pl.LightningModule):
         # 收集验证输出用于详细PCC计算 - 但要避免sanity check阶段
         if not (hasattr(self.trainer, 'sanity_checking') and self.trainer.sanity_checking):
             output = {
-                'val_loss': loss,
+                'val_loss': loss_final,  # 使用最终尺度损失
                 'predictions': predictions.detach().cpu(),  # 移到CPU减少GPU内存
                 'targets': targets.detach().cpu()
             }
@@ -131,15 +145,16 @@ class ModelInterface(pl.LightningModule):
             # 添加到验证输出列表
             self.validation_step_outputs.append(output)
         
-        return {'val_loss': loss}
-
     def test_step(self, batch, batch_idx):
         """测试步骤"""
-        loss, predictions, targets = self._common_step(batch, batch_idx, 'test')
+        loss, loss_final, predictions, targets = self._common_step(batch, batch_idx, 'test')
         
+        # 记录最终尺度测试损失
+        self.log('test_loss_final', loss_final, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
         # 收集测试输出用于PCC计算
         output = {
-            'test_loss': loss,
+            'test_loss': loss_final, # 使用最终尺度损失
             'predictions': predictions.detach().cpu(),  # 移到CPU减少GPU内存
             'targets': targets.detach().cpu()
         }
@@ -186,7 +201,18 @@ class ModelInterface(pl.LightningModule):
                 self._logger.debug(f"使用模型内部损失={total_loss:.4f}")
                 
             else:
-                raise KeyError("模型输出中缺少损失值")
+                # Fallback for models that don't return 'loss' but 'logits'
+                # This part is now less likely to be used with the hierarchical model
+                logits = outputs.get('logits')
+                if logits is None:
+                    raise KeyError("模型输出中缺少'loss'或'logits'键")
+                
+                targets = batch.get('target_genes')
+                if targets is None:
+                    raise KeyError("批次数据中缺少'target_genes'键")
+
+                total_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+                self._logger.debug(f"手动计算损失={total_loss:.4f}")
             
             # 验证损失值
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -203,33 +229,28 @@ class ModelInterface(pl.LightningModule):
     def _extract_predictions_and_targets(self, results_dict: Dict[str, torch.Tensor], 
                                        batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """提取预测和目标"""
-        # 获取预测
+        # The hierarchical model returns 'predictions' for the final scale during training/validation,
+        # and 'generated_sequence' during pure inference.
         if 'predictions' in results_dict:
-            logits = results_dict['predictions']
+            predictions = results_dict['predictions']
+        elif 'generated_sequence' in results_dict:
+            predictions = results_dict['generated_sequence']
         else:
-            logits = results_dict.get('generated_sequence', None)
-            if logits is None:
-                raise ValueError("Multi-Scale Gene VAR模型应该有predictions或generated_sequence输出")
+            raise ValueError("模型输出中必须包含 'predictions' 或 'generated_sequence'")
         
         # 获取目标
         if 'target_genes' not in batch:
             raise ValueError("批次数据中找不到target_genes")
-        target_genes = batch['target_genes']
+        targets = batch['target_genes']
         
-        # 🔧 关键修复：VAR_ST模型应该直接返回200个基因的预测
-        # 如果形状不匹配，说明模型实现有问题，直接报错
-        num_genes = target_genes.shape[-1]  # 通常是200
-        
-        if logits.shape[-1] != num_genes:
+        # 验证最终预测的维度是否为200
+        num_genes = self.model.num_genes
+        if predictions.shape[-1] != num_genes:
             raise ValueError(
-                f"模型预测维度({logits.shape[-1]})与目标基因数量({num_genes})不匹配！"
-                f"这表明训练和推理的模型配置不一致。"
-                f"预测形状: {logits.shape}, 目标形状: {target_genes.shape}"
+                f"最终预测维度({predictions.shape[-1]})与目标基因数量({num_genes})不匹配！"
             )
         
-        # 训练时直接使用原始计数值，不进行log2变换
-        # 评估指标计算时会在需要的地方进行log2变换
-        return logits.float(), target_genes.float()
+        return predictions.float(), targets.float()
 
     def configure_optimizers(self):
         """配置优化器和学习率调度器"""

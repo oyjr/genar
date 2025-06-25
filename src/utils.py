@@ -156,14 +156,10 @@ def load_callbacks(cfg: Dict):
     
     Mycallbacks = []
     
-    # 设置默认监控指标
-    model_name = getattr(cfg.MODEL, 'model_name', '')
-    
-    # VAR_ST模型监控策略
-    default_monitor = 'val_loss'
-    default_mode = 'min'
-    checkpoint_filename = 'best-epoch={epoch:02d}-val_loss={val_loss:.4f}'
-    print(f"🔧 VAR-ST: 监控指标={default_monitor}, 模式={default_mode}")
+    # 从主训练配置中获取默认监控指标和模式
+    default_monitor = cfg.TRAINING.get('monitor', 'val_loss')
+    default_mode = cfg.TRAINING.get('mode', 'min')
+    print(f"🔧 默认监控指标: {default_monitor}, 模式: {default_mode}")
     
     # 处理early stopping配置
     if 'early_stopping' in cfg.CALLBACKS:
@@ -194,17 +190,20 @@ def load_callbacks(cfg: Dict):
     if 'model_checkpoint' in cfg.CALLBACKS:
         ckpt_cfg = cfg.CALLBACKS.model_checkpoint
         
+        # 动态构建默认文件名
+        default_filename = f"best-epoch={{epoch:02d}}-{default_monitor}={{{default_monitor}:.4f}}"
+        
         # 处理字典和Namespace两种类型
         if isinstance(ckpt_cfg, dict):
             monitor = ckpt_cfg.get('monitor', default_monitor)
             save_top_k = ckpt_cfg['save_top_k']
             mode = ckpt_cfg.get('mode', default_mode)
-            filename = ckpt_cfg.get('filename', checkpoint_filename)
+            filename = ckpt_cfg.get('filename', default_filename)
         else:
             monitor = getattr(ckpt_cfg, 'monitor', default_monitor)
             save_top_k = ckpt_cfg.save_top_k
             mode = getattr(ckpt_cfg, 'mode', default_mode)
-            filename = getattr(ckpt_cfg, 'filename', checkpoint_filename)
+            filename = getattr(ckpt_cfg, 'filename', default_filename)
             
         # 确保目录存在
         os.makedirs(cfg.GENERAL.log_path, exist_ok=True)
