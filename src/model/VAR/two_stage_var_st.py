@@ -95,7 +95,9 @@ class MultiScaleGeneVAR(nn.Module):
         norm_eps: float = 1e-6,
         shared_aln: bool = False,
         attn_l2_norm: bool = True,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        adaptive_sigma_alpha: float = 0.1,  # Proportional factor for adaptive sigma
+        adaptive_sigma_beta: float = 1.0    # Base value for adaptive sigma
     ):
         super().__init__()
         
@@ -107,6 +109,8 @@ class MultiScaleGeneVAR(nn.Module):
         self.num_layers = num_layers
         self.cond_drop_rate = cond_drop_rate
         self.device = device
+        self.adaptive_sigma_alpha = adaptive_sigma_alpha  # Store adaptive sigma parameters
+        self.adaptive_sigma_beta = adaptive_sigma_beta
         
         # Hierarchical scale configuration
         self.scale_dims = scale_dims
@@ -292,6 +296,69 @@ class MultiScaleGeneVAR(nn.Module):
             
         return hierarchical_targets
 
+    def _create_gaussian_target_distribution(self, target: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """
+        Create adaptive Gaussian target distribution for final scale loss computation.
+        
+        This method constructs a Gaussian probability distribution centered at the true gene 
+        expression values with adaptive sigma that scales with expression level.
+        High expression genes get larger sigma (more tolerance), low expression genes get 
+        smaller sigma (stricter requirements).
+        
+        Args:
+            target (torch.Tensor): Hard target labels, shape [B, seq_len]
+            device (torch.device): Device to create tensors on
+            
+        Returns:
+            torch.Tensor: Gaussian target distribution, shape [B, seq_len, vocab_size]
+        """
+        B, seq_len = target.shape
+        vocab_size = self.vocab_size
+        
+        # Create vocabulary indices tensor [vocab_size]
+        vocab_indices = torch.arange(vocab_size, device=device, dtype=torch.float32)
+        
+        # Expand target to [B, seq_len, 1] for broadcasting
+        mu = target.float().unsqueeze(-1)  # [B, seq_len, 1]
+        
+        # --- ADAPTIVE SIGMA COMPUTATION ---
+        # sigma = alpha * mu + beta
+        # This allows high expression genes to have larger tolerance
+        sigma = self.adaptive_sigma_alpha * mu + self.adaptive_sigma_beta
+        
+        # Ensure numerical stability by clamping sigma to reasonable bounds
+        sigma = torch.clamp(sigma, min=1e-6, max=100.0)  # Prevent extreme values
+        # --- END ADAPTIVE SIGMA ---
+        
+        # Expand vocab_indices to [1, 1, vocab_size] for broadcasting
+        x = vocab_indices.view(1, 1, -1)  # [1, 1, vocab_size]
+        
+        # Compute Gaussian probabilities: exp(-(x - mu)^2 / (2 * sigma^2))
+        # Broadcasting: [B, seq_len, 1] and [1, 1, vocab_size] -> [B, seq_len, vocab_size]
+        # Note: sigma now has shape [B, seq_len, 1], enabling per-gene adaptive scaling
+        squared_diff = (x - mu) ** 2
+        gaussian_unnormalized = torch.exp(-squared_diff / (2 * sigma ** 2))
+        
+        # Handle potential numerical issues
+        gaussian_unnormalized = torch.clamp(gaussian_unnormalized, min=1e-10, max=1.0)
+        
+        # Normalize to create valid probability distribution
+        # Sum over vocab dimension and ensure non-zero normalization
+        normalization_factor = gaussian_unnormalized.sum(dim=-1, keepdim=True)
+        normalization_factor = torch.clamp(normalization_factor, min=1e-10)
+        
+        target_dist = gaussian_unnormalized / normalization_factor
+        
+        # Final verification and fallback
+        if torch.isnan(target_dist).any() or torch.isinf(target_dist).any():
+            logger.warning("NaN or Inf detected in adaptive Gaussian target distribution, using uniform fallback")
+            # Fallback to uniform distribution around the target
+            target_dist = torch.zeros_like(gaussian_unnormalized)
+            target_indices = target.long().unsqueeze(-1)  # [B, seq_len, 1]
+            target_dist.scatter_(-1, target_indices, 1.0)
+        
+        return target_dist
+
     def _compute_soft_label_loss(self, logits: torch.Tensor, target: Union[torch.Tensor, SoftTarget]) -> torch.Tensor:
         """
         Compute loss for either hard labels (cross-entropy) or soft labels (KL divergence).
@@ -308,9 +375,28 @@ class MultiScaleGeneVAR(nn.Module):
         Returns:
             torch.Tensor: Computed loss value
         """
-        # Handle hard labels (final scale)
+        # Handle hard labels (final scale) - Use Gaussian KL divergence loss
         if isinstance(target, torch.Tensor):
-            return F.cross_entropy(logits.reshape(-1, self.vocab_size), target.reshape(-1))
+            # Create Gaussian target distribution centered at true values
+            target_dist = self._create_gaussian_target_distribution(target, logits.device)
+            
+            # Compute log probabilities for KL divergence
+            log_probs = F.log_softmax(logits, dim=-1)  # [B, seq_len, vocab_size]
+            
+            # Additional numerical stability checks
+            if torch.isinf(log_probs).any():
+                logger.warning("Inf detected in log probabilities for final scale, clipping values")
+                log_probs = torch.clamp(log_probs, min=-50.0, max=50.0)
+            
+            # Compute KL divergence: KL(target_dist || predicted_dist)
+            kl_loss = F.kl_div(log_probs, target_dist, reduction='batchmean', log_target=False)
+            
+            # Final sanity check and fallback
+            if torch.isnan(kl_loss) or torch.isinf(kl_loss):
+                logger.warning("Invalid KL loss detected for final scale, falling back to cross-entropy")
+                return F.cross_entropy(logits.reshape(-1, self.vocab_size), target.reshape(-1))
+            
+            return kl_loss
         
         # Handle soft labels (intermediate scales)
         if not isinstance(target, dict) or 'floor_targets' not in target:
@@ -666,6 +752,8 @@ class MultiScaleGeneVAR(nn.Module):
             'histology_feature_dim': self.histology_feature_dim,
             'spatial_coord_dim': self.spatial_coord_dim,
             'condition_embed_dim': self.condition_embed_dim,
+            'adaptive_sigma_alpha': self.adaptive_sigma_alpha,
+            'adaptive_sigma_beta': self.adaptive_sigma_beta,
             'epoch': epoch
         }
         
@@ -697,6 +785,8 @@ class MultiScaleGeneVAR(nn.Module):
             histology_feature_dim=checkpoint['histology_feature_dim'],
             spatial_coord_dim=checkpoint['spatial_coord_dim'],
             condition_embed_dim=checkpoint['condition_embed_dim'],
+            adaptive_sigma_alpha=checkpoint.get('adaptive_sigma_alpha', 0.1),  # Default for backward compatibility
+            adaptive_sigma_beta=checkpoint.get('adaptive_sigma_beta', 1.0),   # Default for backward compatibility
             device=device
         )
         

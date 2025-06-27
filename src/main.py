@@ -75,7 +75,11 @@ VAR_ST_CONFIG = {
         # 其他参数
         'norm_eps': 1e-6,
         'shared_aln': False,
-        'attn_l2_norm': True
+        'attn_l2_norm': True,
+        
+        # 自适应损失函数参数
+        'adaptive_sigma_alpha': 0.01,  # 自适应sigma比例因子，控制sigma随表达量增长的速度（调整为更保守的值）
+        'adaptive_sigma_beta': 1.0     # 自适应sigma基础值，确保低表达基因有最小容忍度
 }
 
 # 默认训练配置 
