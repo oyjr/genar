@@ -102,6 +102,9 @@ class ModelInterface(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """训练步骤"""
         loss, loss_final, _, _ = self._common_step(batch, batch_idx, 'train')
+        # 记录训练损失到进度条显示
+        self.log('train_loss', loss_final, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        # 保留原有的详细记录用于监控
         self.log('train_loss_final', loss_final, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 

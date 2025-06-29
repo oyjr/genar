@@ -157,7 +157,7 @@ def load_callbacks(cfg: Dict):
     Mycallbacks = []
     
     # 从主训练配置中获取默认监控指标和模式
-    default_monitor = cfg.TRAINING.get('monitor', 'val_loss')
+    default_monitor = cfg.TRAINING.get('monitor', 'train_loss_final')
     default_mode = cfg.TRAINING.get('mode', 'min')
     print(f"🔧 默认监控指标: {default_monitor}, 模式: {default_mode}")
     

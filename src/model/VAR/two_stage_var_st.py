@@ -10,6 +10,7 @@ Key Features:
 - AdaLN conditioning for deep feature fusion
 - Residual accumulation across scales
 - KV caching for efficient inference
+- FiLM-based dynamic gene identity modulation
 
 Author: Assistant
 Date: 2024
@@ -34,6 +35,7 @@ from .gene_var_transformer import (
     ConditionProcessor,
     DropPath
 )
+from .film_layer import FiLMLayer
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +134,18 @@ class MultiScaleGeneVAR(nn.Module):
             condition_embed_dim=condition_embed_dim
         )
         
-        # Gene token embedding
+        # Gene token embedding (for expression counts)
         self.gene_embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        # NEW: Unified gene identity embedding as modulation condition
+        self.gene_identity_embedding = nn.Embedding(num_genes, embed_dim)
+        
+        # NEW: FiLM layer for dynamic gene-specific modulation
+        self.film_layer = FiLMLayer(
+            condition_dim=embed_dim,
+            feature_dim=embed_dim,
+            hidden_dim=embed_dim // 2
+        )
         
         # Hierarchical position embedding - separate embedding for each scale
         # This solves the semantic mismatch where the same position index
@@ -181,8 +193,20 @@ class MultiScaleGeneVAR(nn.Module):
         # Initialize weights
         self.init_weights()
         
+        # Log detailed parameter information
+        total_params = self._count_parameters()
+        identity_params = self.gene_identity_embedding.num_embeddings * self.gene_identity_embedding.embedding_dim
+        film_params = sum(p.numel() for p in self.film_layer.parameters())
+        
         logger.info(f"✅ Hierarchical Gene VAR initialized successfully")
-        logger.info(f"📈 Model parameters: ~{self._count_parameters()/1e6:.1f}M")
+        logger.info(f"🎬 FiLM layer for dynamic gene identity modulation:")
+        logger.info(f"   - Gene identity embedding: [{num_genes}, {embed_dim}]")
+        logger.info(f"   - FiLM hidden dimension: {embed_dim // 2}")
+        logger.info(f"📊 Parameter breakdown:")
+        logger.info(f"   - Total parameters: ~{total_params/1e6:.1f}M")
+        logger.info(f"   - Gene identity embedding: {identity_params:,} ({identity_params/1e3:.1f}K)")
+        logger.info(f"   - FiLM layer: {film_params:,} ({film_params/1e3:.1f}K)")
+        logger.info(f"   - New parameters ratio: {(identity_params + film_params)/total_params*100:.2f}%")
     
     def _count_parameters(self) -> int:
         """Count the number of trainable parameters"""
@@ -577,6 +601,18 @@ class MultiScaleGeneVAR(nn.Module):
 
             # Get logits for the current scale's prediction
             x = self.head_norm(x, condition_embed)
+            
+            # NEW: Apply dynamic gene identity modulation for final scale only
+            if scale_dim == self.num_genes:
+                # Get gene identity embeddings as modulation conditions
+                # Shape: [num_genes, embed_dim] -> [1, num_genes, embed_dim] -> [B, num_genes, embed_dim]
+                identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                
+                # Apply FiLM modulation: each gene dynamically adjusts its contextual response
+                x = self.film_layer(x, identity_conditions)
+                
+                logger.debug(f"🎬 Applied FiLM modulation for {self.num_genes} genes (final scale)")
+            
             logits = self.output_head(x) # Shape: [B, scale_dim, vocab_size]
 
             # The logits now have the correct sequence length to match the target
@@ -650,6 +686,16 @@ class MultiScaleGeneVAR(nn.Module):
             
             # Get logits for the current scale
             x = self.head_norm(x, condition_embed)
+            
+            # NEW: Apply dynamic gene identity modulation for final scale only (same as training)
+            if scale_dim == self.num_genes:
+                # Get gene identity embeddings as modulation conditions
+                # Shape: [num_genes, embed_dim] -> [1, num_genes, embed_dim] -> [B, num_genes, embed_dim]
+                identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                
+                # Apply FiLM modulation: each gene dynamically adjusts its contextual response
+                x = self.film_layer(x, identity_conditions)
+            
             logits = self.output_head(x) # Shape: [B, scale_dim, vocab_size]
             
             # --- START: Top-k Sampling Logic ---

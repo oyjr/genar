@@ -36,8 +36,8 @@ ENCODER_FEATURE_DIMS = {
 DATASETS = {
     'PRAD': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
-        'val_slides': 'MEND139',
-        'test_slides': 'MEND140',
+        'val_slides': 'MEND145',
+        'test_slides': 'MEND145',
         'recommended_encoder': 'uni'
     },
     'her2st': {
@@ -118,7 +118,7 @@ DEFAULT_CONFIG = {
         'learning_rate': 1.0e-4,
         'weight_decay': 1.0e-4,
         'mode': 'min',
-        'monitor': 'val_loss_final',
+        'monitor': 'train_loss_final',
         'lr_scheduler': {
             'patience': 0,  # 默认禁用，只有命令行指定时才启用
             'factor': 0.5
@@ -127,16 +127,16 @@ DEFAULT_CONFIG = {
     },
     'CALLBACKS': {
         'early_stopping': {
-            'monitor': 'val_loss_final',
+            'monitor': 'train_loss_final',
             'patience': 10000,  # 默认设置很大值，实际禁用早停
             'mode': 'min',
             'min_delta': 0.0
         },
         'model_checkpoint': {
-            'monitor': 'val_loss_final',
+            'monitor': 'train_loss_final',
             'save_top_k': 1,
             'mode': 'min',
-            'filename': 'best-epoch={epoch:02d}-loss={val_loss_final:.4f}'
+            'filename': 'best-epoch={epoch:02d}-loss={train_loss_final:.4f}'
         },
         'learning_rate_monitor': {
             'logging_interval': 'epoch'
@@ -205,10 +205,14 @@ Examples:
                         help='启用同步BatchNorm (多GPU训练推荐)')
     
     # === 数据增强参数 ===
-    parser.add_argument('--use-augmented', action='store_true', default=True,
-                        help='使用数据增强 (默认: True)')
-    parser.add_argument('--expand-augmented', action='store_true', default=True,
-                        help='展开增强数据为7倍样本 (默认: True)')
+    parser.add_argument('--use-augmented', action='store_true', default=False,
+                        help='使用数据增强 (默认: False)')
+    parser.add_argument('--expand-augmented', action='store_true', default=False,
+                        help='展开增强数据为7倍样本 (默认: False)')
+    parser.add_argument('--no-use-augmented', dest='use_augmented', action='store_false',
+                        help='明确禁用数据增强')
+    parser.add_argument('--no-expand-augmented', dest='expand_augmented', action='store_false',
+                        help='明确禁用展开增强')
     
     # === 🆕 基因计数参数 ===
     parser.add_argument('--max-gene-count', type=int, default=500,
@@ -329,8 +333,8 @@ def build_config_from_args(args):
     config.slide_val = dataset_info['val_slides']
     config.slide_test = dataset_info['test_slides']
     config.encoder_name = encoder_name
-    config.use_augmented = getattr(args, 'use_augmented', True)
-    config.expand_augmented = getattr(args, 'expand_augmented', True)
+    config.use_augmented = getattr(args, 'use_augmented', False)
+    config.expand_augmented = getattr(args, 'expand_augmented', False)
     config.gene_count_mode = 'discrete_tokens'  # 固定为离散token模式
     config.max_gene_count = getattr(args, 'max_gene_count', 500)
     
@@ -356,20 +360,31 @@ def build_config_from_args(args):
     config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     config.MODEL.gene_count_mode = config.gene_count_mode
     config.MODEL.max_gene_count = config.max_gene_count
-    # 🔧 暂时使用val_loss作为监控指标，避免第一个epoch的EarlyStopping错误
-    # TODO: 后续可以改回val_pcc_50，但需要确保第一个epoch验证完成后才检查
-    config.TRAINING.monitor = 'val_loss'
+    # 🔧 使用train_loss_final作为监控指标
+    config.TRAINING.monitor = 'train_loss_final'
     config.TRAINING.mode = 'min'
-    config.CALLBACKS.early_stopping.monitor = 'val_loss'
+    config.CALLBACKS.early_stopping.monitor = 'train_loss_final'
     config.CALLBACKS.early_stopping.mode = 'min'
-    config.CALLBACKS.model_checkpoint.monitor = 'val_loss'
+    config.CALLBACKS.model_checkpoint.monitor = 'train_loss_final'
     config.CALLBACKS.model_checkpoint.mode = 'min'
-    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-loss={val_loss:.6f}'
-    print(f"   - VAR-ST监控指标: val_loss (最小化) - 临时使用，避免第一个epoch错误")
-    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-loss={{val_loss:.6f}}")
+    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-loss={train_loss_final:.6f}'
+    print(f"   - VAR-ST监控指标: train_loss_final (最小化) - 基于训练损失保存最佳模型")
+    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-loss={{train_loss_final:.6f}}")
     print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
     print(f"   - 最大基因计数: {config.max_gene_count}")
     print(f"   - 词汇表大小: {vocab_size} (动态计算: {max_gene_count} + 1)")
+    
+    # 数据增强状态
+    aug_status = []
+    if config.use_augmented:
+        aug_status.append("使用增强特征")
+        if config.expand_augmented:
+            aug_status.append("展开7倍样本")
+        else:
+            aug_status.append("不展开样本")
+    else:
+        aug_status.append("不使用增强")
+    aug_status_str = ", ".join(aug_status)
     
     print(f"✅ 配置构建完成:")
     print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
@@ -379,6 +394,7 @@ def build_config_from_args(args):
     print(f"   - 训练轮数: {config.TRAINING.num_epochs}")
     print(f"   - 批次大小: {config.DATA.train_dataloader.batch_size}")
     print(f"   - 学习率: {config.TRAINING.learning_rate}")
+    print(f"   - 数据增强: {aug_status_str}")
     print(f"   - Patience机制: {patience_status}")
     print(f"   - 基因计数范围: 0-{max_gene_count} (vocab_size: {vocab_size})")
     
@@ -439,8 +455,8 @@ def main(config):
     
     # 动态更新监控指标和文件名
     if config.MODEL.model_name == 'VAR_ST':
-        # ✅ FIX: 强制使用最终尺度损失进行监控，以确保保存最佳PCC性能的模型
-        monitor_metric = 'val_loss_final'
+        # ✅ FIX: 强制使用训练损失进行监控，以确保保存训练损失最小的模型
+        monitor_metric = 'train_loss_final'
         monitor_mode = 'min'
 
         config.TRAINING.monitor = monitor_metric
