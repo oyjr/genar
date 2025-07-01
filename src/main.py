@@ -38,12 +38,24 @@ DATASETS = {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
         'val_slides': 'MEND145',
         'test_slides': 'MEND145',
-        'recommended_encoder': 'uni'
+        'recommended_encoder': 'conch'
     },
     'her2st': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
         'val_slides': 'SPA148',
         'test_slides': 'SPA148', 
+        'recommended_encoder': 'conch'
+    },
+    'kidney': {
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/kidney/',
+        'val_slides': 'NCBI697',
+        'test_slides': 'NCBI697',
+        'recommended_encoder': 'conch'
+    },
+    'mouse_brain': {
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/mouse_brain/',
+        'val_slides': 'NCBI667',
+        'test_slides': 'NCBI667',
         'recommended_encoder': 'conch'
     }
 }
@@ -179,7 +191,7 @@ Examples:
     
     # === 核心参数 ===
     parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
-                        help='数据集名称 (PRAD, her2st)')
+                        help='数据集名称 (PRAD, her2st, kidney, mouse_brain)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
                         help='编码器类型 (uni, conch)，默认使用数据集推荐编码器')
     
