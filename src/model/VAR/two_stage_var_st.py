@@ -40,6 +40,127 @@ from .film_layer import FiLMLayer
 logger = logging.getLogger(__name__)
 
 
+class GeneGroupUpsampling(nn.Module):
+    """
+    基于基因分组关系的上采样模块
+    考虑到每个token代表的基因组的包含关系
+    """
+    
+    def __init__(self, embed_dim: int, scale_dims: Tuple[int, ...], num_genes: int = 200):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.scale_dims = scale_dims
+        self.num_genes = num_genes
+        
+        # 预计算每个尺度的基因分组映射
+        self.group_mappings = self._compute_group_mappings()
+        
+        # 为每个尺度转换创建学习式上采样层
+        self.upsample_transforms = nn.ModuleDict()
+        for i in range(len(scale_dims) - 1):
+            self.upsample_transforms[f'scale_{i}_to_{i+1}'] = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.GELU(),
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.Dropout(0.1)
+            )
+        
+        logger.info(f"🧬 Gene Group Upsampling initialized:")
+        logger.info(f"   Scale dims: {scale_dims}")
+        logger.info(f"   Number of upsampling transforms: {len(self.upsample_transforms)}")
+        for key in self.group_mappings:
+            logger.info(f"   {key}: {len(self.group_mappings[key])} mappings")
+    
+    def _compute_group_mappings(self):
+        """
+        计算每个尺度之间的基因分组映射关系
+        """
+        mappings = {}
+        
+        for i in range(len(self.scale_dims) - 1):
+            source_dim = self.scale_dims[i]
+            target_dim = self.scale_dims[i + 1]
+            
+            # 计算从source_dim到target_dim的映射
+            # 每个source token对应多少个target tokens
+            genes_per_source = self.num_genes // source_dim
+            genes_per_target = self.num_genes // target_dim
+            targets_per_source = genes_per_source // genes_per_target
+            
+            mapping = []
+            for source_idx in range(source_dim):
+                # source_idx对应的target indices
+                start_target = source_idx * targets_per_source
+                end_target = start_target + targets_per_source
+                target_indices = list(range(start_target, min(end_target, target_dim)))
+                mapping.append(target_indices)
+            
+            mappings[f'scale_{i}_to_{i+1}'] = mapping
+            
+        return mappings
+    
+    def forward(self, source_embeddings: torch.Tensor, source_scale_idx: int, target_scale_idx: int):
+        """
+        基于分组关系进行上采样
+        
+        Args:
+            source_embeddings: [B, source_dim, embed_dim]
+            source_scale_idx: 源尺度索引
+            target_scale_idx: 目标尺度索引
+            
+        Returns:
+            upsampled_embeddings: [B, target_dim, embed_dim]
+        """
+        if source_embeddings is None:
+            target_dim = self.scale_dims[target_scale_idx]
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            return torch.zeros(1, target_dim, self.embed_dim, device=device)
+        
+        B, source_dim, embed_dim = source_embeddings.shape
+        target_dim = self.scale_dims[target_scale_idx]
+        
+        # 获取映射关系
+        mapping_key = f'scale_{source_scale_idx}_to_{target_scale_idx}'
+        if mapping_key not in self.group_mappings:
+            # 跨尺度映射，使用插值
+            return self._interpolate_upsample(source_embeddings, target_dim)
+        
+        mapping = self.group_mappings[mapping_key]
+        
+        # 基于分组关系进行上采样
+        upsampled = torch.zeros(B, target_dim, embed_dim, device=source_embeddings.device)
+        
+        for source_idx, target_indices in enumerate(mapping):
+            if source_idx < source_dim:
+                source_emb = source_embeddings[:, source_idx, :]  # [B, embed_dim]
+                
+                # 学习式变换
+                if mapping_key in self.upsample_transforms:
+                    transformed_emb = self.upsample_transforms[mapping_key](source_emb)
+                else:
+                    transformed_emb = source_emb
+                
+                # 分配到对应的target positions
+                for target_idx in target_indices:
+                    if target_idx < target_dim:
+                        upsampled[:, target_idx, :] = transformed_emb
+        
+        return upsampled
+    
+    def _interpolate_upsample(self, source_embeddings, target_dim):
+        """插值上采样作为fallback"""
+        _, source_dim, _ = source_embeddings.shape
+        
+        if source_dim == 1:
+            return source_embeddings.expand(-1, target_dim, -1)
+        
+        # 使用线性插值
+        source_embeddings_t = source_embeddings.transpose(1, 2)  # [B, embed_dim, source_dim]
+        upsampled = F.interpolate(source_embeddings_t, size=target_dim, mode='linear', align_corners=False)
+        return upsampled.transpose(1, 2)  # [B, target_dim, embed_dim]
+
+
 class MultiScaleGeneVAR(nn.Module):
     """
     Hierarchical Gene VAR for Spatial Transcriptomics with Semantic-Aware Embeddings
@@ -147,6 +268,13 @@ class MultiScaleGeneVAR(nn.Module):
             hidden_dim=embed_dim // 2
         )
         
+        # NEW: Gene group upsampling module for intelligent target position initialization
+        self.gene_upsampling = GeneGroupUpsampling(
+            embed_dim=embed_dim,
+            scale_dims=scale_dims,
+            num_genes=num_genes
+        )
+        
         # Hierarchical position embedding - separate embedding for each scale
         # Updated to support cumulative input from all previous scales
         self.hierarchical_pos_embedding = nn.ModuleDict()
@@ -170,6 +298,11 @@ class MultiScaleGeneVAR(nn.Module):
             else:
                 max_length = 1 + sum(self.scale_dims[:i+1])
                 logger.info(f"   Scale {i} (dim={dim}): max {max_length} positions (cumulative)")
+        
+        logger.info(f"🚀 VAR-ST Improvements Applied:")
+        logger.info(f"   ✅ Gene Group Upsampling: Intelligent target position initialization")
+        logger.info(f"   ✅ Scale Embedding Storage: For progressive information transfer")
+        logger.info(f"   ✅ Weighted Identity Fusion: Final scale combines upsampling + gene identity")
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
@@ -288,13 +421,12 @@ class MultiScaleGeneVAR(nn.Module):
                                - 'ceil_targets': Upper bound token IDs  
                                - 'weights': Interpolation weights (0.0 to 1.0)
         """
-        B = target_genes.shape[0]
         hierarchical_targets = []
 
         # Ensure target_genes is float for pooling operations
         target_genes_float = target_genes.float().unsqueeze(1) # -> [B, 1, 200]
 
-        for i, dim in enumerate(self.scale_dims):
+        for _, dim in enumerate(self.scale_dims):
             if dim == self.num_genes:
                 # The final scale uses hard labels (original behavior)
                 hard_targets = target_genes.long()
@@ -346,7 +478,6 @@ class MultiScaleGeneVAR(nn.Module):
         Returns:
             torch.Tensor: Gaussian target distribution, shape [B, seq_len, vocab_size]
         """
-        B, seq_len = target.shape
         vocab_size = self.vocab_size
         
         # Create vocabulary indices tensor [vocab_size]
@@ -440,7 +571,7 @@ class MultiScaleGeneVAR(nn.Module):
         ceil_targets = target['ceil_targets']    # [B, seq_len]
         weights = target['weights']              # [B, seq_len], interpolation weights
         
-        B, seq_len, vocab_size = logits.shape
+        B, seq_len, _ = logits.shape
         target_seq_len = floor_targets.shape[1]  # Get the actual target sequence length
         
         # Ensure logits and targets have matching sequence dimensions
@@ -550,8 +681,8 @@ class MultiScaleGeneVAR(nn.Module):
         # This preserves floating-point precision instead of lossy rounding
         hierarchical_targets = self._create_hierarchical_targets(target_genes)
         
-        # Initialize lists to store outputs from each scale
-        all_logits = []
+        # Initialize storage for scale processing
+        scale_embeddings = []  # NEW: Store embeddings from each scale for upsampling
         total_loss = 0.0
         final_predictions = None
         final_loss = torch.tensor(0.0, device=device) # Initialize final_loss
@@ -597,13 +728,29 @@ class MultiScaleGeneVAR(nn.Module):
 
             # VAR-style sequence extension for all scales
             # Extend sequence with target positions for current scale
-            # This follows VAR's approach: cumulative_context + new_target_positions
-            if scale_dim == self.num_genes:
-                # For final scale: use gene identity embeddings
-                target_positions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)  # [B, 200, D]
-            else:
-                # For intermediate scales: use zeros as placeholder for new positions
+            # NEW: Use intelligent upsampling instead of zero placeholders
+            if scale_idx == 0:
+                # First scale: still use zeros as we have no previous information
                 target_positions = torch.zeros(B, scale_dim, self.embed_dim, device=device)
+            elif scale_dim == self.num_genes:
+                # Final scale: combine upsampled information with gene identity embeddings
+                prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
+                upsampled_positions = self.gene_upsampling(
+                    prev_embeddings, 
+                    source_scale_idx=scale_idx-1, 
+                    target_scale_idx=scale_idx
+                )
+                identity_embeddings = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                # Weighted combination: 70% upsampled + 30% identity
+                target_positions = 0.7 * upsampled_positions + 0.3 * identity_embeddings
+            else:
+                # Intermediate scales: use upsampling from previous scale
+                prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
+                target_positions = self.gene_upsampling(
+                    prev_embeddings,
+                    source_scale_idx=scale_idx-1,
+                    target_scale_idx=scale_idx
+                )
             
             x = torch.cat([x, target_positions], dim=1)  # [B, cumulative_length + scale_dim, D]
             
@@ -647,11 +794,17 @@ class MultiScaleGeneVAR(nn.Module):
             loss = self._compute_soft_label_loss(logits_for_loss, scale_target)
             total_loss += loss
             
+            # NEW: Store current scale embeddings for next scale's upsampling
+            # Use predicted tokens to get embeddings for consistency
+            predicted_tokens = torch.argmax(logits_for_loss, dim=-1)  # [B, scale_dim]
+            current_scale_embeddings = self.gene_embedding(predicted_tokens)  # [B, scale_dim, embed_dim]
+            scale_embeddings.append(current_scale_embeddings)
+            
             # Store logits and loss for the final, full-resolution scale
             if scale_dim == self.num_genes:
                 # From the final scale, we extract the predictions.
                 # The prediction for the Nth gene comes from the Nth token's output logit.
-                final_predictions = torch.argmax(logits_for_loss, dim=-1) # [B, 200]
+                final_predictions = predicted_tokens.float()  # Use the tokens we just computed
                 final_loss = loss
         
         return {
@@ -673,12 +826,15 @@ class MultiScaleGeneVAR(nn.Module):
         Hierarchical inference pass.
         Autoregressively generates tokens for each scale, where the output of a coarser
         scale becomes the input for the next, finer scale.
+        
+        Note: top_p sampling is not currently implemented but kept for future compatibility.
         """
         B = condition_embed.shape[0]
         device = condition_embed.device
 
         # 🔧 NEW: Store all generated tokens from previous scales for cumulative input
         all_generated_scale_tokens = []
+        scale_embeddings = []  # NEW: Store embeddings from each scale for upsampling
 
         for scale_idx, scale_dim in enumerate(self.scale_dims):
             # 🔧 NEW: Build cumulative input from all previously generated scales
@@ -697,15 +853,30 @@ class MultiScaleGeneVAR(nn.Module):
                 start_token_expanded = self.start_token.expand(B, -1, -1)
                 x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + cumulative_length, D]
             
-            # VAR-style sequence extension for all scales (same as training)
-            # Extend sequence with target positions for current scale
-            # This follows VAR's approach: cumulative_context + new_target_positions
-            if scale_dim == self.num_genes:
-                # For final scale: use gene identity embeddings
-                target_positions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)  # [B, 200, D]
-            else:
-                # For intermediate scales: use zeros as placeholder for new positions
+            # VAR-style sequence extension for all scales
+            # NEW: Use intelligent upsampling (same logic as training)
+            if scale_idx == 0:
+                # First scale: still use zeros as we have no previous information
                 target_positions = torch.zeros(B, scale_dim, self.embed_dim, device=device)
+            elif scale_dim == self.num_genes:
+                # Final scale: combine upsampled information with gene identity embeddings
+                prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
+                upsampled_positions = self.gene_upsampling(
+                    prev_embeddings, 
+                    source_scale_idx=scale_idx-1, 
+                    target_scale_idx=scale_idx
+                )
+                identity_embeddings = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                # Weighted combination: 70% upsampled + 30% identity
+                target_positions = 0.7 * upsampled_positions + 0.3 * identity_embeddings
+            else:
+                # Intermediate scales: use upsampling from previous scale
+                prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
+                target_positions = self.gene_upsampling(
+                    prev_embeddings,
+                    source_scale_idx=scale_idx-1,
+                    target_scale_idx=scale_idx
+                )
             
             x = torch.cat([x, target_positions], dim=1)  # [B, cumulative_length + scale_dim, D]
             
@@ -777,6 +948,10 @@ class MultiScaleGeneVAR(nn.Module):
             
             # 🔧 NEW: Store current scale tokens for future cumulative input
             all_generated_scale_tokens.append(sampled_tokens)
+            
+            # NEW: Store current scale embeddings for next scale's upsampling
+            current_scale_embeddings = self.gene_embedding(sampled_tokens)  # [B, scale_dim, embed_dim]
+            scale_embeddings.append(current_scale_embeddings)
             
             # Keep the last generated tokens for final output
             generated_tokens = sampled_tokens

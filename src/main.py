@@ -60,8 +60,8 @@ DATASETS = {
     },
     'ccRCC': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/ccRCC/',
-        'val_slides': 'INT5',
-        'test_slides': 'INT5',
+        'val_slides': 'INT6',
+        'test_slides': 'INT6',
         'recommended_encoder': 'uni'
     }
 }
