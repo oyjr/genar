@@ -50,7 +50,7 @@ class MultiScaleGeneVAR(nn.Module):
     Architecture:
     - Condition Processor: Encodes histology and spatial features
     - Hierarchical Position Embeddings: Scale-specific embeddings that preserve semantic meaning
-    - Hierarchical Generation: Sequentially refines predictions across scales (e.g., 1 → 4 → 16 → 64 → 200)
+    - Hierarchical Generation: Sequentially refines predictions across scales (e.g., 1 → 4 → 8 → 40 → 100 → 200)
     - AdaLN Transformer: Core computation block with deep conditioning
     - Teacher Forcing: Uses ground truth averages at each scale to guide the next
     
@@ -74,7 +74,7 @@ class MultiScaleGeneVAR(nn.Module):
         # Gene-related parameters
         vocab_size: int,
         num_genes: int = 200,
-        scale_dims: Tuple[int, ...] = (1, 4, 16, 64, 200),
+        scale_dims: Tuple[int, ...] = (1, 4, 8, 40, 100, 200),
         
         # Model architecture parameters
         embed_dim: int = 768,
@@ -148,18 +148,28 @@ class MultiScaleGeneVAR(nn.Module):
         )
         
         # Hierarchical position embedding - separate embedding for each scale
-        # This solves the semantic mismatch where the same position index
-        # represents different biological meanings at different scales
+        # Updated to support cumulative input from all previous scales
         self.hierarchical_pos_embedding = nn.ModuleDict()
         for i, dim in enumerate(self.scale_dims):
-            # Each scale needs dim+1 positions (+1 for start token)
-            # For example: scale with dim=4 needs positions [0, 1, 2, 3, 4]
-            # where 0=start_token, 1-4=four gene pools
-            self.hierarchical_pos_embedding[f'scale_{i}'] = nn.Embedding(dim + 1, embed_dim)
+            # Calculate maximum sequence length for this scale:
+            # start_token + all previous scales + current scale
+            if dim == self.num_genes:
+                # For the final scale, add extra positions for all target genes
+                # This follows VAR's approach: cumulative_context + new_target_positions
+                max_cumulative_length = 1 + sum(self.scale_dims[:i]) + self.num_genes
+            else:
+                # For intermediate scales, use normal cumulative length
+                max_cumulative_length = 1 + sum(self.scale_dims[:i+1])
+            self.hierarchical_pos_embedding[f'scale_{i}'] = nn.Embedding(max_cumulative_length, embed_dim)
         
-        logger.info(f"🔧 Created hierarchical position embeddings:")
+        logger.info(f"🔧 Created hierarchical position embeddings for VAR-style input:")
         for i, dim in enumerate(self.scale_dims):
-            logger.info(f"   Scale {i} (dim={dim}): {dim + 1} positions")
+            if dim == self.num_genes:
+                max_length = 1 + sum(self.scale_dims[:i]) + self.num_genes
+                logger.info(f"   Scale {i} (dim={dim}): max {max_length} positions (VAR-style: context + targets)")
+            else:
+                max_length = 1 + sum(self.scale_dims[:i+1])
+                logger.info(f"   Scale {i} (dim={dim}): max {max_length} positions (cumulative)")
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
@@ -431,6 +441,11 @@ class MultiScaleGeneVAR(nn.Module):
         weights = target['weights']              # [B, seq_len], interpolation weights
         
         B, seq_len, vocab_size = logits.shape
+        target_seq_len = floor_targets.shape[1]  # Get the actual target sequence length
+        
+        # Ensure logits and targets have matching sequence dimensions
+        if seq_len != target_seq_len:
+            raise ValueError(f"Logits seq_len ({seq_len}) doesn't match target seq_len ({target_seq_len})")
         
         # Compute log probabilities for KL divergence
         log_probs = F.log_softmax(logits, dim=-1)  # [B, seq_len, vocab_size]
@@ -439,19 +454,19 @@ class MultiScaleGeneVAR(nn.Module):
         # P(floor) = 1 - weight, P(ceil) = weight, P(others) = 0
         target_dist = torch.zeros_like(log_probs)  # [B, seq_len, vocab_size]
         
-        # Create indices for scatter operations
-        batch_indices = torch.arange(B, device=logits.device).unsqueeze(1).expand(-1, seq_len)
-        seq_indices = torch.arange(seq_len, device=logits.device).unsqueeze(0).expand(B, -1)
+        # Create indices for scatter operations using the actual target dimensions
+        batch_indices = torch.arange(B, device=logits.device).unsqueeze(1).expand(-1, target_seq_len)
+        seq_indices = torch.arange(target_seq_len, device=logits.device).unsqueeze(0).expand(B, -1)
         
         # Set probabilities for floor targets: P(floor) = 1 - weight
-        floor_probs = 1.0 - weights  # [B, seq_len]
+        floor_probs = 1.0 - weights  # [B, target_seq_len]
         target_dist[batch_indices, seq_indices, floor_targets] = floor_probs
         
         # Set probabilities for ceil targets: P(ceil) = weight
         # Only when ceil != floor (avoid double-counting when pooled value is integer)
         ceil_mask = (ceil_targets != floor_targets)
         if ceil_mask.any():
-            ceil_probs = weights * ceil_mask.float()  # [B, seq_len]
+            ceil_probs = weights * ceil_mask.float()  # [B, target_seq_len]
             target_dist[batch_indices, seq_indices, ceil_targets] = ceil_probs
         
         # Add small epsilon for numerical stability and ensure valid probability distribution
@@ -543,40 +558,55 @@ class MultiScaleGeneVAR(nn.Module):
         
         # 2. Iteratively train each scale
         for scale_idx, (scale_dim, scale_target) in enumerate(zip(self.scale_dims, hierarchical_targets)):
-            # Determine the input for the current scale
+            # 🔧 NEW: Build cumulative input from ALL previous scales (not just the last one)
             if scale_idx == 0:
                 # For the first scale, input is just the start token
-                scale_input_tokens = None # Will be handled by start_token inside the loop
+                x = self.start_token.expand(B, -1, -1) # [B, 1, D]
             else:
-                # For subsequent scales, input is the ground truth from the previous scale (Teacher Forcing)
-                prev_target = hierarchical_targets[scale_idx - 1]
+                # For subsequent scales, use ALL previous scale tokens (cumulative input)
+                cumulative_input_tokens = []
                 
-                # Extract hard tokens for embedding from soft or hard targets
-                if isinstance(prev_target, dict):
-                    # Previous scale used soft labels - extract hard tokens for teacher forcing
-                    # Use weighted sampling between floor and ceil based on weights
-                    floor_targets = prev_target['floor_targets']
-                    ceil_targets = prev_target['ceil_targets']
-                    weights = prev_target['weights']
+                # Collect tokens from all previous scales
+                for prev_idx in range(scale_idx):
+                    prev_target = hierarchical_targets[prev_idx]
                     
-                    # Sample based on weights: if weight > 0.5, use ceil, otherwise floor
-                    # This maintains the probabilistic nature while providing discrete tokens
-                    scale_input_tokens = torch.where(weights > 0.5, ceil_targets, floor_targets)
-                else:
-                    # Previous scale used hard labels
-                    scale_input_tokens = prev_target
-            
-            # Embed the input tokens
-            if scale_input_tokens is not None:
-                # Input from previous scale: [B, prev_dim]
-                input_embed = self.gene_embedding(scale_input_tokens) # [B, prev_dim, D]
+                    # Extract hard tokens for embedding from soft or hard targets
+                    if isinstance(prev_target, dict):
+                        # Previous scale used soft labels - extract hard tokens for teacher forcing
+                        floor_targets = prev_target['floor_targets']
+                        ceil_targets = prev_target['ceil_targets']
+                        weights = prev_target['weights']
+                        
+                        # Sample based on weights: if weight > 0.5, use ceil, otherwise floor
+                        prev_scale_tokens = torch.where(weights > 0.5, ceil_targets, floor_targets)
+                    else:
+                        # Previous scale used hard labels
+                        prev_scale_tokens = prev_target
+                    
+                    cumulative_input_tokens.append(prev_scale_tokens)
+                
+                # Concatenate all previous scale tokens
+                all_prev_tokens = torch.cat(cumulative_input_tokens, dim=1)  # [B, cumulative_length]
+                
+                # Embed all previous tokens
+                input_embed = self.gene_embedding(all_prev_tokens) # [B, cumulative_length, D]
+                
                 # Prepend start token
                 start_token_expanded = self.start_token.expand(B, -1, -1) # [B, 1, D]
-                x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + prev_dim, D]
-            else:
-                # First scale, just use start token
-                x = self.start_token.expand(B, -1, -1) # [B, 1, D]
+                x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + cumulative_length, D]
 
+            # VAR-style sequence extension for all scales
+            # Extend sequence with target positions for current scale
+            # This follows VAR's approach: cumulative_context + new_target_positions
+            if scale_dim == self.num_genes:
+                # For final scale: use gene identity embeddings
+                target_positions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)  # [B, 200, D]
+            else:
+                # For intermediate scales: use zeros as placeholder for new positions
+                target_positions = torch.zeros(B, scale_dim, self.embed_dim, device=device)
+            
+            x = torch.cat([x, target_positions], dim=1)  # [B, cumulative_length + scale_dim, D]
+            
             # Add scale and position embeddings
             current_seq_len = x.shape[1]
             scale_embed = self.scale_embedding(torch.tensor([scale_idx], device=device)).view(1, 1, -1)
@@ -590,17 +620,12 @@ class MultiScaleGeneVAR(nn.Module):
             for block in self.transformer_blocks:
                 x = block(x, condition_embed, causal_mask)
 
-            # --- FIX: Upsample hidden states to match target dimension ---
-            # Permute from [B, L, D] to [B, D, L] for interpolation
-            x = x.permute(0, 2, 1)
-            # Linearly interpolate the sequence length to the current scale's target dimension
-            x = F.interpolate(x, size=scale_dim, mode='linear', align_corners=False)
-            # Permute back to [B, L, D]
-            x = x.permute(0, 2, 1)
-            # --- END FIX ---
-
+            # Extract predictions from the appropriate positions
+            # For all scales: use the last scale_dim positions (VAR-style autoregressive prediction)
+            x_for_prediction = x[:, -scale_dim:, :]  # [B, scale_dim, D]
+            
             # Get logits for the current scale's prediction
-            x = self.head_norm(x, condition_embed)
+            x_for_prediction = self.head_norm(x_for_prediction, condition_embed)
             
             # NEW: Apply dynamic gene identity modulation for final scale only
             if scale_dim == self.num_genes:
@@ -609,11 +634,11 @@ class MultiScaleGeneVAR(nn.Module):
                 identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
                 
                 # Apply FiLM modulation: each gene dynamically adjusts its contextual response
-                x = self.film_layer(x, identity_conditions)
+                x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
                 
                 logger.debug(f"🎬 Applied FiLM modulation for {self.num_genes} genes (final scale)")
             
-            logits = self.output_head(x) # Shape: [B, scale_dim, vocab_size]
+            logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
 
             # The logits now have the correct sequence length to match the target
             logits_for_loss = logits
@@ -652,18 +677,37 @@ class MultiScaleGeneVAR(nn.Module):
         B = condition_embed.shape[0]
         device = condition_embed.device
 
-        generated_tokens = None # This will hold the output of the previous scale
+        # 🔧 NEW: Store all generated tokens from previous scales for cumulative input
+        all_generated_scale_tokens = []
 
         for scale_idx, scale_dim in enumerate(self.scale_dims):
-            # Embed the input tokens for the current scale
-            if generated_tokens is not None:
-                # Input from previous scale's generation
-                input_embed = self.gene_embedding(generated_tokens) # [B, prev_dim, D]
-                start_token_expanded = self.start_token.expand(B, -1, -1)
-                x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + prev_dim, D]
-            else:
+            # 🔧 NEW: Build cumulative input from all previously generated scales
+            if scale_idx == 0:
                 # First scale, just use start token
                 x = self.start_token.expand(B, -1, -1) # [B, 1, D]
+            else:
+                # For subsequent scales, use ALL previously generated tokens (cumulative input)
+                # Concatenate all previous scale tokens
+                all_prev_tokens = torch.cat(all_generated_scale_tokens, dim=1)  # [B, cumulative_length]
+                
+                # Embed all previous tokens
+                input_embed = self.gene_embedding(all_prev_tokens) # [B, cumulative_length, D]
+                
+                # Prepend start token
+                start_token_expanded = self.start_token.expand(B, -1, -1)
+                x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + cumulative_length, D]
+            
+            # VAR-style sequence extension for all scales (same as training)
+            # Extend sequence with target positions for current scale
+            # This follows VAR's approach: cumulative_context + new_target_positions
+            if scale_dim == self.num_genes:
+                # For final scale: use gene identity embeddings
+                target_positions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)  # [B, 200, D]
+            else:
+                # For intermediate scales: use zeros as placeholder for new positions
+                target_positions = torch.zeros(B, scale_dim, self.embed_dim, device=device)
+            
+            x = torch.cat([x, target_positions], dim=1)  # [B, cumulative_length + scale_dim, D]
             
             # Add scale and position embeddings
             current_seq_len = x.shape[1]
@@ -678,14 +722,12 @@ class MultiScaleGeneVAR(nn.Module):
             for block in self.transformer_blocks:
                 x = block(x, condition_embed, causal_mask)
             
-            # --- FIX: Upsample hidden states to match target dimension ---
-            x = x.permute(0, 2, 1)
-            x = F.interpolate(x, size=scale_dim, mode='linear', align_corners=False)
-            x = x.permute(0, 2, 1)
-            # --- END FIX ---
+            # Extract predictions from the appropriate positions (same as training)
+            # For all scales: use the last scale_dim positions (VAR-style autoregressive prediction)
+            x_for_prediction = x[:, -scale_dim:, :]  # [B, scale_dim, D]
             
             # Get logits for the current scale
-            x = self.head_norm(x, condition_embed)
+            x_for_prediction = self.head_norm(x_for_prediction, condition_embed)
             
             # NEW: Apply dynamic gene identity modulation for final scale only (same as training)
             if scale_dim == self.num_genes:
@@ -694,9 +736,9 @@ class MultiScaleGeneVAR(nn.Module):
                 identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
                 
                 # Apply FiLM modulation: each gene dynamically adjusts its contextual response
-                x = self.film_layer(x, identity_conditions)
+                x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
             
-            logits = self.output_head(x) # Shape: [B, scale_dim, vocab_size]
+            logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
             
             # --- START: Top-k Sampling Logic ---
             # Apply temperature scaling before filtering and sampling
@@ -733,7 +775,10 @@ class MultiScaleGeneVAR(nn.Module):
             sampled_tokens = sampled_tokens.view(B, current_scale_dim)
             # --- END: Top-k Sampling Logic ---
             
-            # The output of this scale becomes the input for the next
+            # 🔧 NEW: Store current scale tokens for future cumulative input
+            all_generated_scale_tokens.append(sampled_tokens)
+            
+            # Keep the last generated tokens for final output
             generated_tokens = sampled_tokens
 
         return {

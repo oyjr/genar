@@ -38,25 +38,31 @@ DATASETS = {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
         'val_slides': 'MEND145',
         'test_slides': 'MEND145',
-        'recommended_encoder': 'conch'
+        'recommended_encoder': 'uni'
     },
     'her2st': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
         'val_slides': 'SPA148',
         'test_slides': 'SPA148', 
-        'recommended_encoder': 'conch'
+        'recommended_encoder': 'uni'
     },
     'kidney': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/kidney/',
         'val_slides': 'NCBI697',
         'test_slides': 'NCBI697',
-        'recommended_encoder': 'conch'
+        'recommended_encoder': 'uni'
     },
     'mouse_brain': {
         'path': '/data/ouyangjiarui/stem/hest1k_datasets/mouse_brain/',
         'val_slides': 'NCBI667',
         'test_slides': 'NCBI667',
-        'recommended_encoder': 'conch'
+        'recommended_encoder': 'uni'
+    },
+    'ccRCC': {
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/ccRCC/',
+        'val_slides': 'INT5',
+        'test_slides': 'INT5',
+        'recommended_encoder': 'uni'
     }
 }
 
@@ -67,8 +73,8 @@ VAR_ST_CONFIG = {
         'histology_feature_dim': 1024,  # 依赖编码器
         'spatial_coord_dim': 2,
         
-        # Multi-Scale VAR 配置 (内存优化版本)
-        'gene_patch_nums': (1, 2, 4, 6, 8, 10, 15),  # 7个尺度，最后一个改为14减少序列长度
+        # Multi-Scale VAR 配置 (优化尺度设计)
+        'gene_patch_nums': (1, 4, 8, 40, 100, 200),  # 6个尺度，逐步细化到最终200个基因
         # vocab_size 将根据 max_gene_count 动态计算 (max_gene_count + 1)
         'embed_dim': 512,  # 减少嵌入维度 768->512
         'num_heads': 8,    # 减少注意力头数 12->8
