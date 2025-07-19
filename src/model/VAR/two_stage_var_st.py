@@ -36,6 +36,7 @@ from .gene_var_transformer import (
     DropPath
 )
 from .film_layer import FiLMLayer
+from .gene_identity_pooling import GeneIdentityPooling
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +269,14 @@ class MultiScaleGeneVAR(nn.Module):
             hidden_dim=embed_dim // 2
         )
         
+        # NEW: Gene identity pooling for multi-scale modulation (conservative approach)
+        self.gene_identity_pooling = GeneIdentityPooling(
+            num_genes=num_genes,
+            scale_dims=scale_dims,
+            embed_dim=embed_dim,
+            enable_pooling=True  # Can be set to False to disable and fallback to original behavior
+        )
+        
         # NEW: Gene group upsampling module for intelligent target position initialization
         self.gene_upsampling = GeneGroupUpsampling(
             embed_dim=embed_dim,
@@ -303,6 +312,8 @@ class MultiScaleGeneVAR(nn.Module):
         logger.info(f"   ✅ Gene Group Upsampling: Intelligent target position initialization")
         logger.info(f"   ✅ Scale Embedding Storage: For progressive information transfer")
         logger.info(f"   ✅ Weighted Identity Fusion: Final scale combines upsampling + gene identity")
+        logger.info(f"   ✅ Multi-Scale Gene Modulation: Gene identity pooling for all scales")
+        logger.info(f"   ✅ Conservative Design: Can be disabled to fallback to original behavior")
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
@@ -774,16 +785,29 @@ class MultiScaleGeneVAR(nn.Module):
             # Get logits for the current scale's prediction
             x_for_prediction = self.head_norm(x_for_prediction, condition_embed)
             
-            # NEW: Apply dynamic gene identity modulation for final scale only
-            if scale_dim == self.num_genes:
-                # Get gene identity embeddings as modulation conditions
-                # Shape: [num_genes, embed_dim] -> [1, num_genes, embed_dim] -> [B, num_genes, embed_dim]
-                identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+            # NEW: Apply dynamic gene identity modulation for ALL scales (conservative approach)
+            # Get scale-appropriate gene identity conditions
+            scale_conditions = self.gene_identity_pooling.get_scale_conditions(
+                scale_idx=scale_idx,
+                batch_size=B,
+                gene_identity_embedding=self.gene_identity_embedding,
+                device=device
+            )
+            
+            if scale_conditions is not None:
+                # Apply FiLM modulation
+                x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
                 
-                # Apply FiLM modulation: each gene dynamically adjusts its contextual response
-                x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
-                
-                logger.debug(f"🎬 Applied FiLM modulation for {self.num_genes} genes (final scale)")
+                if scale_dim == self.num_genes:
+                    logger.debug(f"🎬 Applied FiLM modulation for {self.num_genes} genes (final scale)")
+                else:
+                    logger.debug(f"🎬 Applied FiLM modulation for scale {scale_idx} (dim={scale_dim})")
+            else:
+                # Fallback: original behavior for final scale only
+                if scale_dim == self.num_genes:
+                    identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                    x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
+                    logger.debug(f"🎬 Applied FiLM modulation for {self.num_genes} genes (final scale - fallback)")
             
             logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
 
@@ -900,14 +924,23 @@ class MultiScaleGeneVAR(nn.Module):
             # Get logits for the current scale
             x_for_prediction = self.head_norm(x_for_prediction, condition_embed)
             
-            # NEW: Apply dynamic gene identity modulation for final scale only (same as training)
-            if scale_dim == self.num_genes:
-                # Get gene identity embeddings as modulation conditions
-                # Shape: [num_genes, embed_dim] -> [1, num_genes, embed_dim] -> [B, num_genes, embed_dim]
-                identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
-                
-                # Apply FiLM modulation: each gene dynamically adjusts its contextual response
-                x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
+            # NEW: Apply dynamic gene identity modulation for ALL scales (same as training)
+            # Get scale-appropriate gene identity conditions
+            scale_conditions = self.gene_identity_pooling.get_scale_conditions(
+                scale_idx=scale_idx,
+                batch_size=B,
+                gene_identity_embedding=self.gene_identity_embedding,
+                device=device
+            )
+            
+            if scale_conditions is not None:
+                # Apply FiLM modulation
+                x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
+            else:
+                # Fallback: original behavior for final scale only
+                if scale_dim == self.num_genes:
+                    identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                    x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
             
             logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
             
@@ -1102,6 +1135,16 @@ class MultiScaleGeneVAR(nn.Module):
         """Disable KV caching for all transformer blocks during training"""
         for block in self.transformer_blocks:
             block.enable_kv_cache(False)
+    
+    def enable_multi_scale_gene_modulation(self):
+        """Enable multi-scale gene identity modulation"""
+        self.gene_identity_pooling.enable()
+        logger.info("🔓 Multi-scale gene identity modulation ENABLED")
+    
+    def disable_multi_scale_gene_modulation(self):
+        """Disable multi-scale gene identity modulation (fallback to original behavior)"""
+        self.gene_identity_pooling.disable()
+        logger.info("🔒 Multi-scale gene identity modulation DISABLED - using original behavior")
 
     def _compute_weighted_cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
