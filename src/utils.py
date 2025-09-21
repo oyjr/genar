@@ -125,13 +125,6 @@ def load_loggers(cfg: Dict):
     
     print(f'---->Log dir: {os.path.join(log_path, version_path)}')
     
-    # Wandb logger
-    wandb_logger = pl_loggers.WandbLogger(
-        save_dir=log_path,
-        name=f'{model_name}-{current_time}-{cfg.expr_name}', 
-        project='ST_prediction'
-    )
-    
     # CSV logger
     csv_logger = pl_loggers.CSVLogger(
         save_dir=log_path,
@@ -139,7 +132,7 @@ def load_loggers(cfg: Dict):
         version=f'{current_time}/{cfg.expr_name}'
     )
     
-    loggers = [wandb_logger, csv_logger]
+    loggers = [csv_logger]
     
     return loggers
 

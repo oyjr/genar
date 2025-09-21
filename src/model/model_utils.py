@@ -16,6 +16,8 @@ import torch.nn.functional as F
 
 from addict import Dict as AddictDict
 
+from . import MODELS
+
 # 默认常量
 DEFAULT_NUM_GENES = 200
 DEFAULT_LEARNING_RATE = 1e-4
@@ -52,21 +54,38 @@ class ModelUtils:
             return default
 
     def load_model(self):
-        """加载Multi-Scale Gene VAR模型"""
-        try:
-            self._logger.info("加载Multi-Scale Gene VAR模型...")
-            Model = getattr(importlib.import_module(
-                'model.VAR.two_stage_var_st'), 'MultiScaleGeneVAR')
-            
-            # 实例化模型
-            model = self.instancialize(Model)
-            self._logger.info("Multi-Scale Gene VAR模型加载成功")
-            
-            return model
-            
-        except Exception as e:
-            self._logger.error(f"加载Multi-Scale Gene VAR模型时出错：{str(e)}")
-            raise ValueError(f'Multi-Scale Gene VAR模型加载失败: {str(e)}')
+        """加载指定的模型实现"""
+        model_name = self.get_config('MODEL.model_name', 'VAR_ST')
+
+        # 专门处理VAR-ST及其变体，保持原有动态导入逻辑
+        if model_name == 'VAR_ST':
+            try:
+                model_variant = self.get_config('MODEL.model_variant', 'original')
+
+                if model_variant == 'no_film':
+                    self._logger.info("加载Multi-Scale Gene VAR模型 (NoFiLM消融版本)...")
+                    Model = getattr(importlib.import_module(
+                        'model.VAR.two_stage_var_st_no_film'), 'MultiScaleGeneVARNoFiLM')
+                    self._logger.info("Multi-Scale Gene VAR (NoFiLM) 模型加载成功")
+                else:
+                    self._logger.info("加载Multi-Scale Gene VAR模型 (原始版本)...")
+                    Model = getattr(importlib.import_module(
+                        'model.VAR.two_stage_var_st'), 'MultiScaleGeneVAR')
+                    self._logger.info("Multi-Scale Gene VAR (原始版本) 模型加载成功")
+
+                return self.instancialize(Model)
+
+            except Exception as e:
+                self._logger.error(f"加载Multi-Scale Gene VAR模型时出错：{str(e)}")
+                raise ValueError(f'Multi-Scale Gene VAR模型加载失败: {str(e)}')
+
+        # 其他模型直接从注册表中获取
+        if model_name not in MODELS:
+            raise ValueError(f"未注册的模型名称: {model_name}")
+
+        self._logger.info(f"加载模型: {model_name}")
+        ModelClass = MODELS[model_name]
+        return self.instancialize(ModelClass)
 
     def instancialize(self, Model, **other_args):
         """实例化模型"""

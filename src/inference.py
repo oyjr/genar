@@ -52,7 +52,8 @@ DATASETS = {
 # 编码器特征维度映射
 ENCODER_FEATURE_DIMS = {
     'uni': 1024,
-    'conch': 512
+    'conch': 512,
+    'resnet18': 512,
 }
 
 
@@ -89,7 +90,7 @@ def parse_args():
     
     # 可选参数
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
-                        help='编码器类型，默认使用数据集推荐编码器')
+                        help='编码器类型 (uni, conch, resnet18)，默认使用数据集推荐编码器')
     parser.add_argument('--output_dir', type=str, default='./inference_results',
                         help='结果输出目录 (默认: ./inference_results)')
     parser.add_argument('--gpu_id', type=int, default=0,

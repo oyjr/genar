@@ -31,7 +31,7 @@ class STDataset(Dataset):
             expr_name: 数据集名称
             slide_val: 验证集slides (逗号分隔)
             slide_test: 测试集slides (逗号分隔)
-            encoder_name: 编码器类型 ('uni', 'conch')
+                 encoder_name: 编码器类型 ('uni', 'conch', 'resnet18')
             use_augmented: 是否使用增强数据
             expand_augmented: 是否展开增强数据为多个样本
             max_gene_count: 基因表达计数值上限
@@ -41,8 +41,11 @@ class STDataset(Dataset):
         # 验证输入参数
         if mode not in ['train', 'val', 'test']:
             raise ValueError(f"mode must be one of ['train', 'val', 'test'], got {mode}")
-        if encoder_name not in ['uni', 'conch']:
-            raise ValueError(f"encoder_name must be one of ['uni', 'conch'], got {encoder_name}")
+        if encoder_name not in ['uni', 'conch', 'resnet18']:
+            raise ValueError(
+                "encoder_name must be one of ['uni', 'conch', 'resnet18'], "
+                f"got {encoder_name}"
+            )
         
         # expand_augmented只在训练模式且使用增强时有效
         if expand_augmented and (not use_augmented or mode != 'train'):
@@ -382,4 +385,3 @@ class STDataset(Dataset):
         gene_tokens = torch.clamp(torch.from_numpy(gene_expr).long(), 0, self.max_gene_count)
         
         return gene_tokens
-

@@ -38,7 +38,16 @@ class ModelInterface(pl.LightningModule):
         
         # 保存配置
         self.config = config
-        self.save_hyperparameters()
+        # 只保存基本的可序列化超参数，避免OmegaConf序列化错误
+        hyperparams = {
+            'model_name': getattr(config.MODEL, 'model_name', 'VAR_ST'),
+            'num_genes': getattr(config.MODEL, 'num_genes', 200),
+            'learning_rate': getattr(config.TRAINING, 'learning_rate', 1e-4),
+            'batch_size': getattr(config.DATA.train_dataloader, 'batch_size', 256),
+            'max_epochs': getattr(config.TRAINING, 'num_epochs', 200),
+            'dataset': getattr(config, 'expr_name', 'unknown')
+        }
+        self.save_hyperparameters(hyperparams)
 
         # 初始化工具类
         self.model_utils = ModelUtils(config, self)
@@ -334,7 +343,7 @@ class ModelInterface(pl.LightningModule):
             # 计算PCC指标 - 数据是原始token计数值，需要应用log2变换
             pcc_metrics = self.model_metrics.calculate_comprehensive_pcc_metrics(predictions, targets, apply_log2=True)
             
-            # 记录PCC指标到wandb
+            # 记录PCC指标
             total_samples = predictions.shape[0]
             for metric_name, value in pcc_metrics.items():
                 self.log(f'{phase}_{metric_name}', value, 

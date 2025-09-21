@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import logging
+from copy import deepcopy
 from datetime import datetime
 
 # 确保导入项目目录下的模块
@@ -29,39 +30,40 @@ torch.set_float32_matmul_precision('high')
 # 编码器特征维度映射
 ENCODER_FEATURE_DIMS = {
     'uni': 1024,
-    'conch': 512
+    'conch': 512,
+    'resnet18': 512,
 }
 
 # 数据集配置 - 包含路径和slide划分信息
 DATASETS = {
     'PRAD': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
+        'path': '/data/250010227/oy/Stem/hest1k_datasets/PRAD/',
         'val_slides': 'MEND145',
         'test_slides': 'MEND145',
         'recommended_encoder': 'uni'
     },
     'her2st': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
+        'path': '/data/250010227/oy/Stem/hest1k_datasets/her2st/',
         'val_slides': 'SPA148',
-        'test_slides': 'SPA148', 
+        'test_slides': 'SPA148',
         'recommended_encoder': 'uni'
     },
     'kidney': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/kidney/',
+        'path': '/data/250010227/oy/Stem/hest1k_datasets/kidney/',
         'val_slides': 'NCBI697',
         'test_slides': 'NCBI697',
         'recommended_encoder': 'uni'
     },
     'mouse_brain': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/mouse_brain/',
+        'path': '/data/250010227/oy/Stem/hest1k_datasets/mouse_brain/',
         'val_slides': 'NCBI667',
         'test_slides': 'NCBI667',
         'recommended_encoder': 'uni'
     },
     'ccRCC': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/ccRCC/',
-        'val_slides': 'INT6',
-        'test_slides': 'INT6',
+        'path': '/data/250010227/oy/Stem/hest1k_datasets/ccRCC/',
+        'val_slides': 'INT2',
+        'test_slides': 'INT2',
         'recommended_encoder': 'uni'
     }
 }
@@ -98,6 +100,19 @@ VAR_ST_CONFIG = {
         # 自适应损失函数参数
         'adaptive_sigma_alpha': 0.01,  # 自适应sigma比例因子，控制sigma随表达量增长的速度（调整为更保守的值）
         'adaptive_sigma_beta': 1.0     # 自适应sigma基础值，确保低表达基因有最小容忍度
+}
+
+FOUNDATION_BASELINE_CONFIG = {
+    'model_name': 'FOUNDATION_BASELINE',
+    'num_genes': 200,
+    'hidden_dim': 256,
+    'num_hidden_layers': 1,
+    'dropout': 0.1,
+}
+
+MODEL_CONFIGS = {
+    'VAR_ST': VAR_ST_CONFIG,
+    'FOUNDATION_BASELINE': FOUNDATION_BASELINE_CONFIG,
 }
 
 # 默认训练配置 
@@ -198,8 +213,10 @@ Examples:
     # === 核心参数 ===
     parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
                         help='数据集名称 (PRAD, her2st, kidney, mouse_brain)')
+    parser.add_argument('--model', type=str, default='VAR_ST', choices=list(MODEL_CONFIGS.keys()),
+                        help='模型类型 (VAR_ST, FOUNDATION_BASELINE)，默认: VAR_ST')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
-                        help='编码器类型 (uni, conch)，默认使用数据集推荐编码器')
+                        help='编码器类型 (uni, conch, resnet18)，默认使用数据集推荐编码器')
     
     # === 训练参数 ===
     parser.add_argument('--gpus', type=int, default=1,
@@ -245,7 +262,12 @@ Examples:
     # === 🆕 测试模式参数 ===
     parser.add_argument('--ckpt_path', type=str,
                         help='测试模式时使用的checkpoint路径 (必须在--mode test时指定)')
-    
+
+    # === 🆕 多尺度消融实验参数 ===
+    parser.add_argument('--scale-config', type=str, default='default',
+                        choices=['default', 'flat', 'single'],
+                        help='多尺度配置: default=(1,4,8,40,100,200), flat=(1,20,200), single=(200)')
+
     # === 向后兼容参数 (保留最少必要的) ===
     parser.add_argument('--config', type=str,
                         help='[已弃用] 请使用 --dataset 参数替代')
@@ -284,17 +306,21 @@ def build_config_from_args(args):
     if args.ckpt_path and not os.path.exists(args.ckpt_path):
         raise ValueError(f"Checkpoint文件不存在: {args.ckpt_path}")
     
-    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型=VAR_ST, 模式={args.mode}")
-    
+    model_name = (args.model or 'VAR_ST').upper()
+    if model_name not in MODEL_CONFIGS:
+        raise ValueError(f"不支持的模型: {model_name}，可选项: {list(MODEL_CONFIGS.keys())}")
+
+    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型={model_name}, 模式={args.mode}")
+
     # 获取数据集信息
     dataset_info = DATASETS[args.dataset]
-    
+
     # 获取模型信息
-    model_info = VAR_ST_CONFIG
-    
+    model_info = deepcopy(MODEL_CONFIGS[model_name])
+
     # 确定编码器
     encoder_name = args.encoder or dataset_info['recommended_encoder']
-    
+
     # 确定GPU相关参数
     devices = args.gpus
     strategy = 'ddp' if devices > 1 and args.strategy == 'auto' else args.strategy
@@ -302,17 +328,43 @@ def build_config_from_args(args):
     
     # 构建完整配置
     config = Dict(DEFAULT_CONFIG)
-    
-    # 更新日志路径为数据集名称和模型名称
-    config.GENERAL.log_path = f'./logs/{args.dataset}/VAR_ST'
-    
+
+    if model_name == 'VAR_ST':
+        # 🆕 根据scale_config参数选择尺度配置
+        SCALE_CONFIGS = {
+            'default': (1, 4, 8, 40, 100, 200),  # 配置A：原始6尺度
+            'flat': (1, 20, 200),                 # 配置B：扁平3尺度
+            'single': (200,)                      # 配置C：单尺度
+        }
+
+        scale_config_name = getattr(args, 'scale_config', 'default').replace('-', '_')
+        selected_scales = SCALE_CONFIGS[scale_config_name]
+
+        # 更新日志路径为数据集名称和模型名称，包含尺度配置信息
+        if scale_config_name != 'default':
+            config.GENERAL.log_path = f'./logs/{args.dataset}/VAR_ST_scale_{scale_config_name}'
+        else:
+            config.GENERAL.log_path = f'./logs/{args.dataset}/VAR_ST'
+
+        print(f"📐 使用多尺度配置: {scale_config_name} = {selected_scales}")
+    else:
+        if getattr(args, 'scale_config', 'default') not in (None, 'default'):
+            print("⚠️ FOUNDATION_BASELINE 模型忽略 --scale-config 参数")
+        config.GENERAL.log_path = f'./logs/{args.dataset}/{model_name}'
+
     # 更新模型配置
     config.MODEL = Dict(model_info)
     config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
+
+    if model_name == 'VAR_ST':
+        # 🆕 更新scale_dims和gene_patch_nums（保持兼容性）
+        config.MODEL.scale_dims = selected_scales
+        config.MODEL.gene_patch_nums = selected_scales  # 保持向后兼容
+
     # 🔧 根据命令行参数更新基因数量
     max_gene_count = getattr(args, 'max_gene_count', 500)
     # num_genes保持200不变，不被max_gene_count影响
-    
+
     # 🆕 动态计算vocab_size = max_gene_count + 1 (对应0到max_gene_count的计数范围)
     vocab_size = max_gene_count + 1
     config.MODEL.vocab_size = vocab_size
@@ -378,15 +430,18 @@ def build_config_from_args(args):
     config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     config.MODEL.gene_count_mode = config.gene_count_mode
     config.MODEL.max_gene_count = config.max_gene_count
-    # 🔧 使用train_loss_final作为监控指标
-    config.TRAINING.monitor = 'train_loss_final'
+    monitor_metric = 'train_loss_final'
+    config.TRAINING.monitor = monitor_metric
     config.TRAINING.mode = 'min'
-    config.CALLBACKS.early_stopping.monitor = 'train_loss_final'
+    config.CALLBACKS.early_stopping.monitor = monitor_metric
     config.CALLBACKS.early_stopping.mode = 'min'
-    config.CALLBACKS.model_checkpoint.monitor = 'train_loss_final'
+    config.CALLBACKS.model_checkpoint.monitor = monitor_metric
     config.CALLBACKS.model_checkpoint.mode = 'min'
-    config.CALLBACKS.model_checkpoint.filename = 'best-epoch={epoch:02d}-loss={train_loss_final:.6f}'
-    print(f"   - VAR-ST监控指标: train_loss_final (最小化) - 基于训练损失保存最佳模型")
+    config.CALLBACKS.model_checkpoint.filename = f'best-epoch={{epoch:02d}}-{monitor_metric}={{{monitor_metric}:.6f}}'
+    if model_name == 'VAR_ST':
+        print(f"   - VAR-ST监控指标: {monitor_metric} (最小化) - 基于训练损失保存最佳模型")
+    else:
+        print(f"   - 监控指标: {monitor_metric} (最小化)")
     print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-loss={{train_loss_final:.6f}}")
     print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
     print(f"   - 最大基因计数: {config.max_gene_count}")
@@ -406,7 +461,7 @@ def build_config_from_args(args):
     
     print(f"✅ 配置构建完成:")
     print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
-    print(f"   - 模型: VAR_ST")
+    print(f"   - 模型: {model_name}")
     print(f"   - 编码器: {encoder_name} (特征维度: {ENCODER_FEATURE_DIMS[encoder_name]})")
     print(f"   - GPU: {devices}个 (策略: {strategy})")
     print(f"   - 训练轮数: {config.TRAINING.num_epochs}")
@@ -492,7 +547,13 @@ def main(config):
     train_loader, val_loader, test_loader = create_dataloaders(config)
     
     # 初始化组件
-    model = ModelInterface(config)
+    # 清理config中不兼容OmegaConf的元素，避免序列化错误
+    clean_config = type(config)(config)  # 复制config
+    # 移除不兼容的策略对象
+    if hasattr(clean_config, 'strategy') and not isinstance(clean_config.strategy, str):
+        clean_config.strategy = 'ddp'  # 转换为字符串
+    
+    model = ModelInterface(clean_config)
     logger = load_loggers(config)
     callbacks = load_callbacks(config)
 
