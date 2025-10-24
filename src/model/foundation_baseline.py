@@ -1,7 +1,7 @@
 """Foundation-only baseline model.
 
 This module defines a light-weight predictor that relies solely on
-precomputed histology embeddings (UNI / Conch / ResNet18).  It serves as a
+precomputed histology embeddings (UNI / Conch / ResNet18). It serves as a
 sanity-check baseline to demonstrate how much performance is contributed by
 the downstream architecture beyond the foundation encoder itself.
 """
@@ -20,7 +20,7 @@ class FoundationOnlyRegressor(nn.Module):
 
     The model is intentionally simple: a small MLP maps a single-spot
     embedding to ``num_genes`` categorical distributions over gene token
-    vocabularies.  It exposes the same interface as the main VAR-ST model so
+    vocabularies. It exposes the same interface as the main GenAR model so
     that it can be dropped into the existing Lightning training pipeline as a
     baseline.
     """
@@ -77,7 +77,7 @@ class FoundationOnlyRegressor(nn.Module):
             histology_features: Tensor of shape ``[batch, feature_dim]`` (or
                 ``[batch, seq, feature_dim]`` which will be flattened).
             target_genes: Optional tensor of integer tokens ``[batch, num_genes]``.
-            top_k: Unused argument kept for API compatibility with VAR-ST.
+            top_k: Unused argument kept for API compatibility with GenAR.
 
         Returns:
             Dictionary containing logits, predictions and optional losses.

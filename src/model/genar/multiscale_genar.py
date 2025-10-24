@@ -1,20 +1,16 @@
 """
-Multi-Scale Gene VAR for Spatial Transcriptomics - NO FiLM VERSION
-消融实验版本：去除FiLM层的基因身份调制功能
+GenAR: Multi-Scale Gene Autoregressive for Spatial Transcriptomics
 
-This module implements a multi-scale VAR model for spatial transcriptomics
-based on the original VAR architecture WITHOUT FiLM gene-specific modulation.
+This module implements a GenAR model for spatial transcriptomics
+based on the GenAR architecture. The model uses cumulative multi-scale
+generation to predict gene expressions from histology features and spatial coordinates.
 
-This version is created for ablation study to evaluate the impact of 
-gene-specific modulation on model performance.
-
-Key Differences from Original:
-- ❌ NO FiLM layer for gene-specific modulation
-- ❌ NO gene identity embeddings  
-- ❌ NO gene identity pooling
-- ✅ Same transformer architecture
-- ✅ Same multi-scale generation process
-- ✅ Same loss functions
+Key Features:
+- Multi-scale cumulative generation (like original GenAR)
+- AdaLN conditioning for deep feature fusion
+- Residual accumulation across scales
+- KV caching for efficient inference
+- FiLM-based dynamic gene identity modulation
 
 Author: Assistant
 Date: 2024
@@ -29,25 +25,24 @@ import logging
 from typing import Dict, List, Optional, Tuple, Union, Any
 from functools import partial
 
-# 软标签类型定义
-SoftTarget = Dict[str, torch.Tensor]  # 软标签字典类型
-HierarchicalTargets = List[Union[torch.Tensor, SoftTarget]]  # 层次化目标类型
+# Soft-target type annotations
+SoftTarget = Dict[str, torch.Tensor]
+HierarchicalTargets = List[Union[torch.Tensor, SoftTarget]]
 
-from .gene_var_transformer import (
+from .gene_genar_transformer import (
     GeneAdaLNSelfAttn, 
     GeneAdaLNBeforeHead, 
     ConditionProcessor,
     DropPath
 )
+from .film_layer import FiLMLayer
+from .gene_identity_pooling import GeneIdentityPooling
 
 logger = logging.getLogger(__name__)
 
 
 class GeneGroupUpsampling(nn.Module):
-    """
-    基于基因分组关系的上采样模块
-    考虑到每个token代表的基因组的包含关系
-    """
+    """Group-aware upsampling module respecting gene hierarchy."""
     
     def __init__(self, embed_dim: int, scale_dims: Tuple[int, ...], num_genes: int = 200):
         super().__init__()
@@ -55,10 +50,10 @@ class GeneGroupUpsampling(nn.Module):
         self.scale_dims = scale_dims
         self.num_genes = num_genes
         
-        # 预计算每个尺度的基因分组映射
+        # Pre-compute group mappings for each scale transition
         self.group_mappings = self._compute_group_mappings()
-        
-        # 为每个尺度转换创建学习式上采样层
+
+        # Learnable upsampling transforms between adjacent scales
         self.upsample_transforms = nn.ModuleDict()
         for i in range(len(scale_dims) - 1):
             self.upsample_transforms[f'scale_{i}_to_{i+1}'] = nn.Sequential(
@@ -69,31 +64,27 @@ class GeneGroupUpsampling(nn.Module):
                 nn.Dropout(0.1)
             )
         
-        logger.info(f"🧬 Gene Group Upsampling initialized (NO FiLM VERSION):")
+        logger.info("Gene Group Upsampling initialised")
         logger.info(f"   Scale dims: {scale_dims}")
         logger.info(f"   Number of upsampling transforms: {len(self.upsample_transforms)}")
         for key in self.group_mappings:
             logger.info(f"   {key}: {len(self.group_mappings[key])} mappings")
     
     def _compute_group_mappings(self):
-        """
-        计算每个尺度之间的基因分组映射关系
-        """
+        """Compute mapping tables between source and target scales."""
         mappings = {}
         
         for i in range(len(self.scale_dims) - 1):
             source_dim = self.scale_dims[i]
             target_dim = self.scale_dims[i + 1]
             
-            # 计算从source_dim到target_dim的映射
-            # 每个source token对应多少个target tokens
+            # Determine how many target tokens each source token maps to
             genes_per_source = self.num_genes // source_dim
             genes_per_target = self.num_genes // target_dim
             targets_per_source = genes_per_source // genes_per_target
             
             mapping = []
             for source_idx in range(source_dim):
-                # source_idx对应的target indices
                 start_target = source_idx * targets_per_source
                 end_target = start_target + targets_per_source
                 target_indices = list(range(start_target, min(end_target, target_dim)))
@@ -104,17 +95,7 @@ class GeneGroupUpsampling(nn.Module):
         return mappings
     
     def forward(self, source_embeddings: torch.Tensor, source_scale_idx: int, target_scale_idx: int):
-        """
-        基于分组关系进行上采样
-        
-        Args:
-            source_embeddings: [B, source_dim, embed_dim]
-            source_scale_idx: 源尺度索引
-            target_scale_idx: 目标尺度索引
-            
-        Returns:
-            upsampled_embeddings: [B, target_dim, embed_dim]
-        """
+        """Group-aware upsampling between scales."""
         if source_embeddings is None:
             target_dim = self.scale_dims[target_scale_idx]
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -123,65 +104,74 @@ class GeneGroupUpsampling(nn.Module):
         B, source_dim, embed_dim = source_embeddings.shape
         target_dim = self.scale_dims[target_scale_idx]
         
-        # 获取映射关系
+        # Lookup the precomputed mapping
         mapping_key = f'scale_{source_scale_idx}_to_{target_scale_idx}'
         if mapping_key not in self.group_mappings:
-            # 跨尺度映射，使用插值
+            # Fallback to interpolation for non-adjacent scales
             return self._interpolate_upsample(source_embeddings, target_dim)
         
         mapping = self.group_mappings[mapping_key]
         
-        # 基于分组关系进行上采样
+        # Group-aware upsampling
         upsampled = torch.zeros(B, target_dim, embed_dim, device=source_embeddings.device)
         
         for source_idx, target_indices in enumerate(mapping):
             if source_idx < source_dim:
-                source_emb = source_embeddings[:, source_idx, :]  # [B, embed_dim]
-                
-                # 学习式变换
+                source_emb = source_embeddings[:, source_idx, :]
+
+                # Optional learned transform
                 if mapping_key in self.upsample_transforms:
                     transformed_emb = self.upsample_transforms[mapping_key](source_emb)
                 else:
                     transformed_emb = source_emb
-                
-                # 分配到对应的target positions
+
+                # Copy into target indices
                 for target_idx in target_indices:
                     if target_idx < target_dim:
                         upsampled[:, target_idx, :] = transformed_emb
-        
+
         return upsampled
     
     def _interpolate_upsample(self, source_embeddings, target_dim):
-        """插值上采样作为fallback"""
+        """Interpolation-based fallback upsampling."""
         _, source_dim, _ = source_embeddings.shape
         
         if source_dim == 1:
             return source_embeddings.expand(-1, target_dim, -1)
         
-        # 使用线性插值
+        # Linear interpolation across the sequence dimension
         source_embeddings_t = source_embeddings.transpose(1, 2)  # [B, embed_dim, source_dim]
         upsampled = F.interpolate(source_embeddings_t, size=target_dim, mode='linear', align_corners=False)
         return upsampled.transpose(1, 2)  # [B, target_dim, embed_dim]
 
 
-class MultiScaleGeneVARNoFiLM(nn.Module):
+class MultiScaleGenAR(nn.Module):
     """
-    Hierarchical Gene VAR for Spatial Transcriptomics WITHOUT FiLM Modulation
+    Hierarchical GenAR for Spatial Transcriptomics with Semantic-Aware Embeddings
     
-    This is an ablation study version that removes gene-specific modulation
-    to evaluate the impact of FiLM layers on model performance.
+    This model implements a hierarchical generation process with improved position embeddings
+    that address semantic mismatches between different scales. Key improvements include:
     
-    Removed Components:
-    - FiLM layer for gene-specific modulation
-    - Gene identity embeddings
-    - Gene identity pooling
+    Architecture:
+    - Condition Processor: Encodes histology and spatial features
+    - Hierarchical Position Embeddings: Scale-specific embeddings that preserve semantic meaning
+    - Hierarchical Generation: Sequentially refines predictions across scales (e.g., 1 → 4 → 8 → 40 → 100 → 200)
+    - AdaLN Transformer: Core computation block with deep conditioning
+    - Teacher Forcing: Uses ground truth averages at each scale to guide the next
     
-    Maintained Components:
-    - Multi-scale cumulative generation
-    - AdaLN conditioning for histology/spatial features
-    - Hierarchical position embeddings
-    - Soft label training
-    - Gene group upsampling
+    Key Features:
+    - Multi-scale cumulative generation (like original GenAR)
+    - Semantic-aware position embeddings for each scale
+    - AdaLN conditioning for deep feature fusion
+    - Residual accumulation across scales
+    - KV caching for efficient inference
+    - Soft label training for information preservation
+    
+    Embedding Innovation:
+    - Each scale has dedicated position embeddings with appropriate semantic meaning
+    - Intermediate scales use pool position embeddings (representing gene groups)
+    - Final scale uses gene identity embeddings (representing individual genes)
+    - This eliminates semantic confusion where same position represents different biology
     """
     
     def __init__(
@@ -238,12 +228,9 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         self.spatial_coord_dim = spatial_coord_dim
         self.condition_embed_dim = condition_embed_dim
         
-        # Log the configuration for NO FiLM version
-        logger.info(f"🧬 Hierarchical Gene VAR (NO FiLM) - scale dimensions: {self.scale_dims}")
-        logger.info(f"🔢 Number of scales: {self.num_scales}")
-        logger.info(f"❌ FiLM layer: DISABLED for ablation study")
-        logger.info(f"❌ Gene identity embeddings: DISABLED")
-        logger.info(f"❌ Gene identity pooling: DISABLED")
+        # Log the new hierarchical configuration
+        logger.info(f"Hierarchical scale dimensions: {self.scale_dims}")
+        logger.info(f"Number of scales: {self.num_scales}")
         
         # Condition processor
         self.condition_processor = ConditionProcessor(
@@ -255,10 +242,25 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         # Gene token embedding (for expression counts)
         self.gene_embedding = nn.Embedding(vocab_size, embed_dim)
         
-        # ❌ REMOVED: Gene identity embedding and FiLM layer
-        # ❌ REMOVED: Gene identity pooling
+        # NEW: Unified gene identity embedding as modulation condition
+        self.gene_identity_embedding = nn.Embedding(num_genes, embed_dim)
         
-        # Gene group upsampling module for intelligent target position initialization
+        # NEW: FiLM layer for dynamic gene-specific modulation
+        self.film_layer = FiLMLayer(
+            condition_dim=embed_dim,
+            feature_dim=embed_dim,
+            hidden_dim=embed_dim // 2
+        )
+        
+        # NEW: Gene identity pooling for multi-scale modulation (conservative approach)
+        self.gene_identity_pooling = GeneIdentityPooling(
+            num_genes=num_genes,
+            scale_dims=scale_dims,
+            embed_dim=embed_dim,
+            enable_pooling=True  # Can be set to False to disable and fallback to original behavior
+        )
+        
+        # NEW: Gene group upsampling module for intelligent target position initialization
         self.gene_upsampling = GeneGroupUpsampling(
             embed_dim=embed_dim,
             scale_dims=scale_dims,
@@ -266,26 +268,35 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         )
         
         # Hierarchical position embedding - separate embedding for each scale
+        # Updated to support cumulative input from all previous scales
         self.hierarchical_pos_embedding = nn.ModuleDict()
         for i, dim in enumerate(self.scale_dims):
             # Calculate maximum sequence length for this scale:
             # start_token + all previous scales + current scale
             if dim == self.num_genes:
                 # For the final scale, add extra positions for all target genes
+                # This follows GenAR's approach: cumulative_context + new_target_positions
                 max_cumulative_length = 1 + sum(self.scale_dims[:i]) + self.num_genes
             else:
                 # For intermediate scales, use normal cumulative length
                 max_cumulative_length = 1 + sum(self.scale_dims[:i+1])
             self.hierarchical_pos_embedding[f'scale_{i}'] = nn.Embedding(max_cumulative_length, embed_dim)
         
-        logger.info(f"🔧 Created hierarchical position embeddings (NO FiLM version):")
+        logger.info("Created hierarchical position embeddings for GenAR-style input:")
         for i, dim in enumerate(self.scale_dims):
             if dim == self.num_genes:
                 max_length = 1 + sum(self.scale_dims[:i]) + self.num_genes
-                logger.info(f"   Scale {i} (dim={dim}): max {max_length} positions (VAR-style: context + targets)")
+                logger.info(f"   Scale {i} (dim={dim}): max {max_length} positions (GenAR-style: context + targets)")
             else:
                 max_length = 1 + sum(self.scale_dims[:i+1])
                 logger.info(f"   Scale {i} (dim={dim}): max {max_length} positions (cumulative)")
+        
+        logger.info("GenAR improvements applied:")
+        logger.info("   - Gene Group Upsampling: intelligent target position initialisation")
+        logger.info("   - Scale Embedding Storage: progressive information transfer")
+        logger.info("   - Weighted Identity Fusion: final scale mixes upsampling + identities")
+        logger.info("   - Multi-Scale Gene Modulation: pooling enabled across scales")
+        logger.info("   - Conservative Design: feature flags allow fallback to baseline")
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
@@ -319,42 +330,41 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         # Initialize weights
         self.init_weights()
         
-        # Log parameter information
+        # Log detailed parameter information
         total_params = self._count_parameters()
-        logger.info(f"✅ Hierarchical Gene VAR (NO FiLM) initialized successfully")
-        logger.info(f"📊 Total parameters: ~{total_params/1e6:.1f}M")
-        logger.info(f"🔬 Ablation Study: Removed gene-specific modulation components")
+        identity_params = self.gene_identity_embedding.num_embeddings * self.gene_identity_embedding.embedding_dim
+        film_params = sum(p.numel() for p in self.film_layer.parameters())
+        
+        logger.info("Hierarchical GenAR initialised successfully")
+        logger.info("FiLM layer for dynamic gene identity modulation:")
+        logger.info(f"   - Gene identity embedding: [{num_genes}, {embed_dim}]")
+        logger.info(f"   - FiLM hidden dimension: {embed_dim // 2}")
+        logger.info("Parameter breakdown:")
+        logger.info(f"   - Total parameters: ~{total_params/1e6:.1f}M")
+        logger.info(f"   - Gene identity embedding: {identity_params:,} ({identity_params/1e3:.1f}K)")
+        logger.info(f"   - FiLM layer: {film_params:,} ({film_params/1e3:.1f}K)")
+        logger.info(f"   - New parameters ratio: {(identity_params + film_params)/total_params*100:.2f}%")
     
     def _count_parameters(self) -> int:
         """Count the number of trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def _get_hierarchical_position_embedding(self, scale_idx: int, seq_len: int, device: torch.device) -> torch.Tensor:
-        """
-        获取指定尺度的位置嵌入
-        
-        Args:
-            scale_idx: 当前尺度索引 (0 to num_scales-1)
-            seq_len: 序列长度，包含start token
-            device: 张量设备
-            
-        Returns:
-            位置嵌入张量 [1, seq_len, embed_dim]
-        """
-        # 选择当前尺度的专用位置嵌入层
+        """Return semantic position embeddings for a given scale."""
+        # Select the scale-specific embedding table
         embedding_layer = self.hierarchical_pos_embedding[f'scale_{scale_idx}']
-        
-        # 生成位置索引：[0, 1, 2, ..., seq_len-1]
+
+        # Generate indices [0, 1, ..., seq_len-1]
         pos_indices = torch.arange(seq_len, device=device)
-        
-        # 获取位置嵌入 [seq_len, embed_dim]
+
+        # Lookup position embeddings
         pos_embed = embedding_layer(pos_indices)
-        
-        # 扩展批次维度 [1, seq_len, embed_dim]
+
+        # Add batch dimension
         return pos_embed.unsqueeze(0)
     
     def init_weights(self, init_std: float = 0.02):
-        """Initialize model weights following VAR initialization"""
+        """Initialize model weights following GenAR initialization"""
         def _init_weights(module):
             if isinstance(module, nn.Linear):
                 nn.init.trunc_normal_(module.weight, std=init_std)
@@ -369,11 +379,27 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
                     nn.init.ones_(module.weight)
         
         self.apply(_init_weights)
-        logger.info("🎯 Model weights initialized (NO FiLM version)")
+        logger.info("Model weights initialised with hierarchical position embeddings")
 
     def _create_hierarchical_targets(self, target_genes: torch.Tensor) -> HierarchicalTargets:
         """
         Creates hierarchical ground truth targets using soft labels for intermediate scales.
+        
+        This method solves the information loss problem in the original implementation by:
+        1. Using soft labels (floor/ceil + weights) for intermediate scales instead of hard rounding
+        2. Preserving the complete information from floating-point pooled values
+        3. Only using hard labels for the final, full-resolution scale
+
+        Args:
+            target_genes (torch.Tensor): The ground truth gene expressions, shape [B, 200].
+
+        Returns:
+            HierarchicalTargets: A list containing either hard targets (torch.Tensor) for the final scale
+                               or soft targets (Dict[str, torch.Tensor]) for intermediate scales.
+                               Soft targets contain:
+                               - 'floor_targets': Lower bound token IDs
+                               - 'ceil_targets': Upper bound token IDs  
+                               - 'weights': Interpolation weights (0.0 to 1.0)
         """
         hierarchical_targets = []
 
@@ -419,6 +445,18 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
     def _create_gaussian_target_distribution(self, target: torch.Tensor, device: torch.device) -> torch.Tensor:
         """
         Create adaptive Gaussian target distribution for final scale loss computation.
+        
+        This method constructs a Gaussian probability distribution centered at the true gene 
+        expression values with adaptive sigma that scales with expression level.
+        High expression genes get larger sigma (more tolerance), low expression genes get 
+        smaller sigma (stricter requirements).
+        
+        Args:
+            target (torch.Tensor): Hard target labels, shape [B, seq_len]
+            device (torch.device): Device to create tensors on
+            
+        Returns:
+            torch.Tensor: Gaussian target distribution, shape [B, seq_len, vocab_size]
         """
         vocab_size = self.vocab_size
         
@@ -441,6 +479,8 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         x = vocab_indices.view(1, 1, -1)  # [1, 1, vocab_size]
         
         # Compute Gaussian probabilities: exp(-(x - mu)^2 / (2 * sigma^2))
+        # Broadcasting: [B, seq_len, 1] and [1, 1, vocab_size] -> [B, seq_len, vocab_size]
+        # Note: sigma now has shape [B, seq_len, 1], enabling per-gene adaptive scaling
         squared_diff = (x - mu) ** 2
         gaussian_unnormalized = torch.exp(-squared_diff / (2 * sigma ** 2))
         
@@ -448,6 +488,7 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         gaussian_unnormalized = torch.clamp(gaussian_unnormalized, min=1e-10, max=1.0)
         
         # Normalize to create valid probability distribution
+        # Sum over vocab dimension and ensure non-zero normalization
         normalization_factor = gaussian_unnormalized.sum(dim=-1, keepdim=True)
         normalization_factor = torch.clamp(normalization_factor, min=1e-10)
         
@@ -466,6 +507,18 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
     def _compute_soft_label_loss(self, logits: torch.Tensor, target: Union[torch.Tensor, SoftTarget]) -> torch.Tensor:
         """
         Compute loss for either hard labels (cross-entropy) or soft labels (KL divergence).
+        
+        This method enables information-preserving training by:
+        1. Using standard cross-entropy for hard labels (final scale)
+        2. Using KL divergence for soft labels (intermediate scales)
+        3. Constructing target probability distributions that preserve floating-point precision
+        
+        Args:
+            logits (torch.Tensor): Model predictions, shape [B, seq_len, vocab_size]
+            target (Union[torch.Tensor, SoftTarget]): Either hard targets or soft target dict
+            
+        Returns:
+            torch.Tensor: Computed loss value
         """
         # Handle hard labels (final scale) - Use Gaussian KL divergence loss
         if isinstance(target, torch.Tensor):
@@ -543,6 +596,7 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             log_probs = torch.clamp(log_probs, min=-50.0, max=50.0)
         
         # Compute KL divergence: KL(target_dist || predicted_dist)
+        # Note: PyTorch's kl_div expects log_probs as first argument and target as second
         kl_loss = F.kl_div(log_probs, target_dist, reduction='batchmean', log_target=False)
         
         # Final sanity check on loss value
@@ -590,12 +644,21 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         """
         Hierarchical training pass with teacher forcing using soft labels.
         
-        ❌ NO FiLM MODULATION VERSION
+        This method implements an information-preserving training strategy:
+        1. At each intermediate scale, soft labels preserve floating-point precision from pooling
+        2. Soft labels use KL divergence loss instead of hard cross-entropy
+        3. The final scale uses hard labels for discrete token prediction
+        4. Each scale receives ground truth from the previous scale (teacher forcing)
+        
+        The soft label mechanism solves the critical information loss problem where
+        pooling [100, 0] → 50.0 would previously be rounded to hard target 50,
+        but now preserves the distribution information via floor/ceil targets.
         """
         B = condition_embed.shape[0]
         device = condition_embed.device
         
         # 1. Create all hierarchical targets with soft labels for intermediate scales
+        # This preserves floating-point precision instead of lossy rounding
         hierarchical_targets = self._create_hierarchical_targets(target_genes)
         
         # Initialize storage for scale processing
@@ -606,7 +669,7 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         
         # 2. Iteratively train each scale
         for scale_idx, (scale_dim, scale_target) in enumerate(zip(self.scale_dims, hierarchical_targets)):
-            # Build cumulative input from ALL previous scales
+            # Build cumulative input from all previous scales (not just the last)
             if scale_idx == 0:
                 # For the first scale, input is just the start token
                 x = self.start_token.expand(B, -1, -1) # [B, 1, D]
@@ -643,14 +706,25 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
                 start_token_expanded = self.start_token.expand(B, -1, -1) # [B, 1, D]
                 x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + cumulative_length, D]
 
-            # VAR-style sequence extension for all scales
+            # GenAR-style sequence extension for all scales
             # Extend sequence with target positions for current scale
+            # Use intelligent upsampling instead of zero placeholders when possible
             if scale_idx == 0:
-                # First scale: use zeros as we have no previous information
+                # First scale: still use zeros as we have no previous information
                 target_positions = torch.zeros(B, scale_dim, self.embed_dim, device=device)
+            elif scale_dim == self.num_genes:
+                # Final scale: combine upsampled information with gene identity embeddings
+                prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
+                upsampled_positions = self.gene_upsampling(
+                    prev_embeddings, 
+                    source_scale_idx=scale_idx-1, 
+                    target_scale_idx=scale_idx
+                )
+                identity_embeddings = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                # Weighted combination: 70% upsampled + 30% identity
+                target_positions = 0.7 * upsampled_positions + 0.3 * identity_embeddings
             else:
-                # Other scales: use upsampling from previous scale
-                # ❌ NO GENE IDENTITY COMBINATION - just use upsampling
+                # Intermediate scales: use upsampling from previous scale
                 prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
                 target_positions = self.gene_upsampling(
                     prev_embeddings,
@@ -674,13 +748,36 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
                 x = block(x, condition_embed, causal_mask)
 
             # Extract predictions from the appropriate positions
-            # For all scales: use the last scale_dim positions (VAR-style autoregressive prediction)
+            # For all scales: use the last scale_dim positions (GenAR-style autoregressive prediction)
             x_for_prediction = x[:, -scale_dim:, :]  # [B, scale_dim, D]
             
             # Get logits for the current scale's prediction
             x_for_prediction = self.head_norm(x_for_prediction, condition_embed)
             
-            # ❌ NO FiLM MODULATION - directly output logits
+            # Apply dynamic gene identity modulation for all scales (conservative approach)
+            # Get scale-appropriate gene identity conditions
+            scale_conditions = self.gene_identity_pooling.get_scale_conditions(
+                scale_idx=scale_idx,
+                batch_size=B,
+                gene_identity_embedding=self.gene_identity_embedding,
+                device=device
+            )
+            
+            if scale_conditions is not None:
+                # Apply FiLM modulation
+                x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
+                
+                if scale_dim == self.num_genes:
+                    logger.debug(f"Applied FiLM modulation for {self.num_genes} genes (final scale)")
+                else:
+                    logger.debug(f"Applied FiLM modulation for scale {scale_idx} (dim={scale_dim})")
+            else:
+                # Fallback: original behavior for final scale only
+                if scale_dim == self.num_genes:
+                    identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                    x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
+                    logger.debug(f"Applied FiLM modulation for {self.num_genes} genes (final scale - fallback)")
+            
             logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
 
             # The logits now have the correct sequence length to match the target
@@ -690,7 +787,7 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             loss = self._compute_soft_label_loss(logits_for_loss, scale_target)
             total_loss += loss
             
-            # Store current scale embeddings for next scale's upsampling
+            # NEW: Store current scale embeddings for next scale's upsampling
             # Use predicted tokens to get embeddings for consistency
             predicted_tokens = torch.argmax(logits_for_loss, dim=-1)  # [B, scale_dim]
             current_scale_embeddings = self.gene_embedding(predicted_tokens)  # [B, scale_dim, embed_dim]
@@ -699,6 +796,7 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             # Store logits and loss for the final, full-resolution scale
             if scale_dim == self.num_genes:
                 # From the final scale, we extract the predictions.
+                # The prediction for the Nth gene comes from the Nth token's output logit.
                 final_predictions = predicted_tokens.float()  # Use the tokens we just computed
                 final_loss = loss
         
@@ -719,13 +817,15 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Hierarchical inference pass.
+        Autoregressively generates tokens for each scale, where the output of a coarser
+        scale becomes the input for the next, finer scale.
         
-        ❌ NO FiLM MODULATION VERSION
+        Note: top_p sampling is not currently implemented but kept for future compatibility.
         """
         B = condition_embed.shape[0]
         device = condition_embed.device
 
-        # Store all generated tokens from previous scales for cumulative input
+        # Store generated tokens from previous scales for cumulative input
         all_generated_scale_tokens = []
         scale_embeddings = []  # Store embeddings from each scale for upsampling
 
@@ -746,13 +846,23 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
                 start_token_expanded = self.start_token.expand(B, -1, -1)
                 x = torch.cat([start_token_expanded, input_embed], dim=1) # [B, 1 + cumulative_length, D]
             
-            # VAR-style sequence extension for all scales
+            # GenAR-style sequence extension for all scales (mirrors training logic)
             if scale_idx == 0:
-                # First scale: use zeros as we have no previous information
+                # First scale: still use zeros as we have no previous information
                 target_positions = torch.zeros(B, scale_dim, self.embed_dim, device=device)
+            elif scale_dim == self.num_genes:
+                # Final scale: combine upsampled information with gene identity embeddings
+                prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
+                upsampled_positions = self.gene_upsampling(
+                    prev_embeddings, 
+                    source_scale_idx=scale_idx-1, 
+                    target_scale_idx=scale_idx
+                )
+                identity_embeddings = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                # Weighted combination: 70% upsampled + 30% identity
+                target_positions = 0.7 * upsampled_positions + 0.3 * identity_embeddings
             else:
-                # Other scales: use upsampling from previous scale
-                # ❌ NO GENE IDENTITY COMBINATION - just use upsampling
+                # Intermediate scales: use upsampling from previous scale
                 prev_embeddings = scale_embeddings[-1]  # Get most recent scale embeddings
                 target_positions = self.gene_upsampling(
                     prev_embeddings,
@@ -775,15 +885,34 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             for block in self.transformer_blocks:
                 x = block(x, condition_embed, causal_mask)
             
-            # Extract predictions from the appropriate positions
+            # Extract predictions from the appropriate positions (same as training)
+            # For all scales: use the last scale_dim positions (GenAR-style autoregressive prediction)
             x_for_prediction = x[:, -scale_dim:, :]  # [B, scale_dim, D]
             
             # Get logits for the current scale
             x_for_prediction = self.head_norm(x_for_prediction, condition_embed)
             
-            # ❌ NO FiLM MODULATION - directly output logits
+            # NEW: Apply dynamic gene identity modulation for ALL scales (same as training)
+            # Get scale-appropriate gene identity conditions
+            scale_conditions = self.gene_identity_pooling.get_scale_conditions(
+                scale_idx=scale_idx,
+                batch_size=B,
+                gene_identity_embedding=self.gene_identity_embedding,
+                device=device
+            )
+            
+            if scale_conditions is not None:
+                # Apply FiLM modulation
+                x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
+            else:
+                # Fallback: original behavior for final scale only
+                if scale_dim == self.num_genes:
+                    identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
+                    x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
+            
             logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
             
+            # --- START: Top-k Sampling Logic ---
             # Apply temperature scaling before filtering and sampling
             logits = logits / temperature
             
@@ -816,11 +945,12 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             # Reshape the sampled tokens back to the original sequence shape
             current_scale_dim = logits.shape[1]
             sampled_tokens = sampled_tokens.view(B, current_scale_dim)
+            # --- END: Top-k Sampling Logic ---
             
             # Store current scale tokens for future cumulative input
             all_generated_scale_tokens.append(sampled_tokens)
             
-            # Store current scale embeddings for next scale's upsampling
+            # NEW: Store current scale embeddings for next scale's upsampling
             current_scale_embeddings = self.gene_embedding(sampled_tokens)  # [B, scale_dim, embed_dim]
             scale_embeddings.append(current_scale_embeddings)
             
@@ -842,6 +972,16 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Inference mode for gene expression prediction
+        
+        Args:
+            histology_features: Histology features [B, 1024]
+            spatial_coords: Spatial coordinates [B, 2]
+            temperature: Sampling temperature
+            top_k: Top-k sampling
+            top_p: Top-p sampling
+            
+        Returns:
+            Dictionary containing predicted gene expressions
         """
         
         self.eval()
@@ -861,6 +1001,10 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
     def save_checkpoint(self, save_path: str, epoch: Optional[int] = None):
         """
         Save model checkpoint
+        
+        Args:
+            save_path: Path to save checkpoint
+            epoch: Current epoch (optional)
         """
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
@@ -877,17 +1021,23 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             'condition_embed_dim': self.condition_embed_dim,
             'adaptive_sigma_alpha': self.adaptive_sigma_alpha,
             'adaptive_sigma_beta': self.adaptive_sigma_beta,
-            'epoch': epoch,
-            'ablation_version': 'no_film'  # Mark as ablation version
+            'epoch': epoch
         }
         
         torch.save(checkpoint, save_path)
-        logger.info(f"💾 NO FiLM Checkpoint saved to: {save_path}")
+        logger.info(f"Checkpoint saved to: {save_path}")
     
     @classmethod
-    def load_checkpoint(cls, ckpt_path: str, device: str = 'cuda') -> 'MultiScaleGeneVARNoFiLM':
+    def load_checkpoint(cls, ckpt_path: str, device: str = 'cuda') -> 'MultiScaleGenAR':
         """
         Load model from checkpoint
+        
+        Args:
+            ckpt_path: Path to checkpoint
+            device: Device to load model on
+            
+        Returns:
+            Loaded MultiScaleGenAR model
         """
         checkpoint = torch.load(ckpt_path, map_location=device)
         
@@ -911,9 +1061,9 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
         
-        logger.info(f"📂 NO FiLM Model loaded from: {ckpt_path}")
+        logger.info(f"Model loaded from: {ckpt_path}")
         if 'epoch' in checkpoint:
-            logger.info(f"📊 Loaded model from epoch: {checkpoint['epoch']}")
+            logger.info(f"Loaded model from epoch: {checkpoint['epoch']}")
         
         return model
     
@@ -941,8 +1091,7 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
             'num_heads': self.num_heads,
             'num_layers': self.num_layers,
             'vocab_size': self.vocab_size,
-            'total_sequence_length': self.num_genes + 1,
-            'ablation_version': 'no_film'
+            'total_sequence_length': self.num_genes + 1
         }
 
     def enable_kv_cache(self):
@@ -954,7 +1103,46 @@ class MultiScaleGeneVARNoFiLM(nn.Module):
         """Disable KV caching for all transformer blocks during training"""
         for block in self.transformer_blocks:
             block.enable_kv_cache(False)
+    
+    def enable_multi_scale_gene_modulation(self):
+        """Enable multi-scale gene identity modulation"""
+        self.gene_identity_pooling.enable()
+        logger.info("Multi-scale gene identity modulation enabled")
+
+    def disable_multi_scale_gene_modulation(self):
+        """Disable multi-scale gene identity modulation (fallback to original behavior)"""
+        self.gene_identity_pooling.disable()
+        logger.info("Multi-scale gene identity modulation disabled; using original behaviour")
+
+    def _compute_weighted_cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Distance-aware cross-entropy where nearer tokens incur smaller penalties."""
+        vocab_size = logits.shape[-1]
+        
+        # Distance weights
+        token_ids = torch.arange(vocab_size, device=logits.device, dtype=torch.float32)  # [vocab_size]
+        target_values = targets.float().unsqueeze(1)  # [total_predictions, 1]
+
+        # Absolute distance between predicted token ids and targets
+        distances = torch.abs(token_ids.unsqueeze(0) - target_values)  # [total_predictions, vocab_size]
+
+        # Gaussian weights favouring nearby tokens
+        sigma = vocab_size * 0.1
+        weights = torch.exp(-distances ** 2 / (2 * sigma ** 2))
+
+        # Weighted log probabilities
+        log_probs = F.log_softmax(logits, dim=-1)  # [total_predictions, vocab_size]
+
+        # Apply weights elementwise
+        weighted_log_probs = log_probs * weights  # [total_predictions, vocab_size]
+
+        # Gather weighted log-probabilities for targets
+        target_log_probs = weighted_log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # [total_predictions]
+
+        # Mean loss
+        loss = -target_log_probs.mean()
+        
+        return loss
 
 
 # Backward compatibility alias
-VARSTNoFiLM = MultiScaleGeneVARNoFiLM
+GenARModel = MultiScaleGenAR

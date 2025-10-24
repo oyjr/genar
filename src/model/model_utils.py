@@ -1,15 +1,10 @@
-"""
-模型工具函数模块
-包含配置管理、模型加载、数据处理等工具函数
-"""
+"""Utility helpers for model configuration, loading, and preprocessing."""
 
-import os
 import inspect
 import importlib
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,26 +13,22 @@ from addict import Dict as AddictDict
 
 from . import MODELS
 
-# 默认常量
-DEFAULT_NUM_GENES = 200
+# Default constants
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_WEIGHT_DECAY = 0.0
 DEFAULT_GRADIENT_CLIP = 1.0
 
 
 class ModelUtils:
-    """模型工具函数类"""
+    """Utility collection used by ModelInterface."""
     
     def __init__(self, config, lightning_module):
         self.config = config
         self.lightning_module = lightning_module
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        
-        # 获取标准化设置
-        self.normalize = self.get_config('DATA.normalize', True)
 
     def get_config(self, path: str, default=None):
-        """安全地获取配置值"""
+        """Safely extract nested configuration values."""
         parts = path.split('.')
         value = self.config
         
@@ -54,46 +45,46 @@ class ModelUtils:
             return default
 
     def load_model(self):
-        """加载指定的模型实现"""
-        model_name = self.get_config('MODEL.model_name', 'VAR_ST')
+        """Load the configured model implementation."""
+        model_name = self.get_config('MODEL.model_name', 'GENAR')
 
-        # 专门处理VAR-ST及其变体，保持原有动态导入逻辑
-        if model_name == 'VAR_ST':
+        # Special-case GenAR variants while preserving dynamic import
+        if model_name == 'GENAR':
             try:
                 model_variant = self.get_config('MODEL.model_variant', 'original')
 
                 if model_variant == 'no_film':
-                    self._logger.info("加载Multi-Scale Gene VAR模型 (NoFiLM消融版本)...")
+                    self._logger.info("Loading GenAR (NoFiLM ablation) ...")
                     Model = getattr(importlib.import_module(
-                        'model.VAR.two_stage_var_st_no_film'), 'MultiScaleGeneVARNoFiLM')
-                    self._logger.info("Multi-Scale Gene VAR (NoFiLM) 模型加载成功")
+                        'model.genar.multiscale_genar_no_film'), 'MultiScaleGenARNoFiLM')
+                    self._logger.info("GenAR (NoFiLM) loaded")
                 else:
-                    self._logger.info("加载Multi-Scale Gene VAR模型 (原始版本)...")
+                    self._logger.info("Loading GenAR (original variant) ...")
                     Model = getattr(importlib.import_module(
-                        'model.VAR.two_stage_var_st'), 'MultiScaleGeneVAR')
-                    self._logger.info("Multi-Scale Gene VAR (原始版本) 模型加载成功")
+                        'model.genar.multiscale_genar'), 'MultiScaleGenAR')
+                    self._logger.info("GenAR (original) loaded")
 
                 return self.instancialize(Model)
 
             except Exception as e:
-                self._logger.error(f"加载Multi-Scale Gene VAR模型时出错：{str(e)}")
-                raise ValueError(f'Multi-Scale Gene VAR模型加载失败: {str(e)}')
+                self._logger.error(f"Failed to load GenAR model: {str(e)}")
+                raise ValueError(f"GenAR model load failed: {str(e)}")
 
-        # 其他模型直接从注册表中获取
+        # Remaining models come from the registry
         if model_name not in MODELS:
-            raise ValueError(f"未注册的模型名称: {model_name}")
+            raise ValueError(f"Model '{model_name}' is not registered")
 
-        self._logger.info(f"加载模型: {model_name}")
+        self._logger.info(f"Loading model: {model_name}")
         ModelClass = MODELS[model_name]
         return self.instancialize(ModelClass)
 
     def instancialize(self, Model, **other_args):
-        """实例化模型"""
+        """Instantiate the model with config-driven arguments."""
         try:
-            # 获取模型初始化参数
+            # Inspect constructor arguments
             class_args = inspect.getfullargspec(Model.__init__).args[1:]
             
-            # 处理不同类型的配置对象
+            # Normalise config to a dict
             model_config = self.config.MODEL
             if isinstance(model_config, AddictDict):
                 model_config_dict = dict(model_config)
@@ -104,7 +95,7 @@ class ModelUtils:
             
             args = {}
             
-            # 从配置中获取参数
+            # Populate constructor kwargs
             for arg in class_args:
                 if arg in model_config_dict:
                     args[arg] = model_config_dict[arg]
@@ -113,34 +104,34 @@ class ModelUtils:
                 elif arg == 'histology_feature_dim' and 'feature_dim' in model_config_dict:
                     args[arg] = model_config_dict['feature_dim']
                     
-            # 添加其他参数
+            # Merge explicit overrides
             args.update(other_args)
             
             return Model(**args)
             
         except Exception as e:
-            self._logger.error(f"模型实例化失败：{str(e)}")
+            self._logger.error(f"Model instantiation failed: {str(e)}")
             raise
 
     def preprocess_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """预处理输入数据"""
-        # 验证输入
+        """Prepare batch inputs for the underlying model."""
+        # Validate incoming data
         self.validate_inputs(inputs)
         
-        # 创建处理后的输入副本
+        # Copy relevant tensors
         processed_inputs = {}
         
-        # 组织学特征处理
+        # Histology features
         if 'img' in inputs:
             processed_inputs['histology_features'] = inputs['img']
-        # 空间坐标处理
+        # Spatial coordinates
         if 'positions' in inputs:
             processed_inputs['spatial_coords'] = inputs['positions']
-        # 基因表达数据处理 - 保留原始逻辑，让_common_step处理推理逻辑
+        # Gene expression (loss computation happens later)
         if 'target_genes' in inputs:
             processed_inputs['target_genes'] = inputs['target_genes']
         
-        # 确保张量在正确的设备上
+        # Move tensors to the current device
         for key, value in processed_inputs.items():
             if torch.is_tensor(value):
                 processed_inputs[key] = value.to(self.lightning_module.device)
@@ -148,67 +139,47 @@ class ModelUtils:
         return processed_inputs
 
     def validate_inputs(self, inputs: Dict[str, torch.Tensor]):
-        """验证输入数据的有效性"""
+        """Basic validation for required keys and shapes."""
         required_keys = ['img']
         
-        # 检查必需的键
+        # Check mandatory keys
         for key in required_keys:
             if key not in inputs:
-                raise ValueError(f"缺少必需的输入键: {key}")
+                raise ValueError(f"Missing required input key: {key}")
                 
-        # 定义不同字段的期望维度
+        # Expected tensor dimensions per field
         expected_dims = {
-            'img': [2, 3],           # 图像特征: (batch, features) 或 (batch, seq, features)
-            'target_genes': [2, 3],   # 基因表达: (batch, genes) 或 (batch, seq, genes)
-            'positions': [2, 3],      # 空间坐标: (batch, coords) 或 (batch, seq, coords)
-            'spot_idx': [1, 2],       # spot索引: (batch,) 或 (batch, seq)
-            'slide_id': [1],          # slide标识: (batch,)
-            'gene_ids': [1, 2],       # 基因ID: (batch,) 或 (batch, genes)
+            'img': [2, 3],
+            'target_genes': [2, 3],
+            'positions': [2, 3],
+            'spot_idx': [1, 2],
+            'slide_id': [1],
+            'gene_ids': [1, 2],
         }
         
-        # 验证张量形状
+        # Shape checks
         for key, tensor in inputs.items():
             if isinstance(tensor, torch.Tensor):
-                # 获取该字段的期望维度，如果未定义则允许1-3维
+                # Use defaults when not explicitly defined
                 allowed_dims = expected_dims.get(key, [1, 2, 3])
                 
                 if tensor.dim() not in allowed_dims:
-                    raise ValueError(f"{key}维度错误: {tensor.shape}，期望维度: {allowed_dims}")
+                    raise ValueError(f"Unexpected tensor rank for {key}: {tensor.shape}; allowed={allowed_dims}")
         
-        # 验证数值范围
+        # Numeric sanity checks
         if 'target_genes' in inputs:
             targets = inputs['target_genes']
             if (targets < 0).any():
-                raise ValueError("目标基因表达值包含负数")
-
-    def apply_log2_normalization_for_evaluation(self, predictions: torch.Tensor, 
-                                                targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """应用log2(x+1)标准化用于评估"""
-        try:
-            # 应用log2(x+1)变换
-            pred_log2 = torch.log2(predictions + 1.0)
-            target_log2 = torch.log2(targets + 1.0)
-            
-            # 检查NaN值
-            if torch.isnan(pred_log2).any() or torch.isnan(target_log2).any():
-                self._logger.warning("Log2变换后发现NaN值，使用原始值")
-                return predictions, targets
-                
-            return pred_log2, target_log2
-            
-        except Exception as e:
-            self._logger.warning(f"Log2标准化失败: {e}，使用原始值")
-            return predictions, targets
-
+                raise ValueError("Target gene expression contains negative values")
 
 
     def scale_learning_rate(self, base_lr: float) -> float:
-        """根据批次大小和GPU数量缩放学习率"""
+        """Scale learning rate according to batch size and device count."""
         try:
-            # 获取有效批次大小
+            # Base batch size
             batch_size = self.get_config('DATA.batch_size', 32)
             
-            # 获取GPU数量
+            # Number of devices
             num_gpus = 1
             if hasattr(self.lightning_module.trainer, 'num_devices'):
                 num_gpus = self.lightning_module.trainer.num_devices
@@ -218,24 +189,24 @@ class ModelUtils:
                 elif isinstance(self.lightning_module.trainer.gpus, (list, tuple)):
                     num_gpus = len(self.lightning_module.trainer.gpus)
             
-            # 计算有效批次大小
+            # Effective batch size
             effective_batch_size = batch_size * num_gpus
             
-            # 线性缩放规则：lr = base_lr * (effective_batch_size / base_batch_size)
-            base_batch_size = 32  # 基准批次大小
+            # Linear scaling rule: lr = base_lr * (effective / base)
+            base_batch_size = 32
             scaled_lr = base_lr * (effective_batch_size / base_batch_size)
             
-            self._logger.info(f"学习率缩放: {base_lr:.6f} -> {scaled_lr:.6f} "
-                            f"(batch_size={batch_size}, num_gpus={num_gpus})")
+            self._logger.info(f"Learning rate scaled: {base_lr:.6f} -> {scaled_lr:.6f} "
+                            f"(batch_size={batch_size}, num_devices={num_gpus})")
             
             return scaled_lr
             
         except Exception as e:
-            self._logger.warning(f"学习率缩放失败: {e}，使用原始学习率")
+            self._logger.warning(f"LR scaling failed: {e}; using base LR")
             return base_lr
 
     def get_scheduler_config(self, optimizer):
-        """获取学习率调度器配置"""
+        """Return the LR scheduler configuration dictionary."""
         scheduler_config = self.get_config('OPTIMIZER.scheduler', {})
         
         if not scheduler_config:
@@ -270,7 +241,7 @@ class ModelUtils:
                     'frequency': 1
                 }
             else:
-                self._logger.warning(f"不支持的调度器: {scheduler_name}")
+                self._logger.warning(f"Unsupported scheduler: {scheduler_name}")
                 return None
                 
             return {
@@ -280,5 +251,5 @@ class ModelUtils:
             }
             
         except Exception as e:
-            self._logger.error(f"创建学习率调度器失败: {e}")
+            self._logger.error(f"Failed to create LR scheduler: {e}")
             return None 

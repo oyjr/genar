@@ -2,7 +2,7 @@
 Preprocessing module for gene clustering and reordering
 
 Simple and focused gene clustering based on expression similarity
-for better biological coherence in multi-scale VAR models.
+for better biological coherence in multi-scale GenAR models.
 
 Author: Assistant
 Date: 2024

@@ -48,7 +48,7 @@ class GeneIdentityPooling(nn.Module):
         self.enable_pooling = enable_pooling
         
         if not enable_pooling:
-            logger.info("🔒 Gene Identity Pooling is DISABLED - using original behavior")
+            logger.info("Gene Identity Pooling disabled; falling back to original behaviour")
             return
         
         # Create pooling layers for intermediate scales only
@@ -76,7 +76,7 @@ class GeneIdentityPooling(nn.Module):
         # Initialize pooling layers with small weights for stability
         self._init_pooling_weights()
         
-        logger.info(f"🧬 Gene Identity Pooling initialized:")
+        logger.info("Gene Identity Pooling initialised")
         logger.info(f"   - Enable pooling: {enable_pooling}")
         logger.info(f"   - Number of pooling layers: {len(self.scale_poolers)}")
         for i, dim in enumerate(scale_dims[:-1]):
@@ -189,9 +189,9 @@ class GeneIdentityPooling(nn.Module):
     def enable(self):
         """Enable gene identity pooling"""
         self.enable_pooling = True
-        logger.info("🔓 Gene Identity Pooling ENABLED")
+        logger.info("Gene Identity Pooling enabled")
     
     def disable(self):
         """Disable gene identity pooling (fallback to original behavior)"""
         self.enable_pooling = False
-        logger.info("🔒 Gene Identity Pooling DISABLED")
+        logger.info("Gene Identity Pooling disabled")

@@ -1,10 +1,10 @@
 """
-Gene VAR Transformer Components
+GenAR Transformer Components
 
-This module implements the core components for the multi-scale gene VAR model,
-including AdaLN Self-Attention blocks, condition processors, and utility functions.
+This module implements the core components for the multi-scale GenAR model,
+including AdaLN self-attention blocks, condition processors, and utility functions.
 
-Based on the original VAR architecture with adaptations for gene expression prediction.
+Based on the GenAR architecture with adaptations for gene expression prediction.
 
 Key Components:
 1. GeneAdaLNSelfAttn: Self-attention block with adaptive layer normalization
@@ -27,7 +27,7 @@ class DropPath(nn.Module):
     """
     Drop paths (Stochastic Depth) per sample
     
-    Implementation from timm library, used in original VAR
+    Implementation from timm library, used in the original GenAR design
     """
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -51,7 +51,7 @@ class SelfAttention(nn.Module):
     """
     Self-Attention module with optional L2 normalization
     
-    Based on original VAR's SelfAttention implementation
+    Based on the GenAR attention implementation
     """
     def __init__(
         self,
@@ -70,7 +70,7 @@ class SelfAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         self.attn_l2_norm = attn_l2_norm
         
-        # L2 normalization setup (like original VAR)
+        # L2 normalization setup (like original GenAR)
         if self.attn_l2_norm:
             self.scale = 1.0
             self.scale_mul_1H11 = nn.Parameter(
@@ -152,7 +152,7 @@ class FFN(nn.Module):
     """
     Feed-Forward Network with GELU activation
     
-    Based on original VAR's FFN implementation
+    Based on the GenAR feed-forward implementation
     """
     def __init__(
         self, 
@@ -183,7 +183,7 @@ class GeneAdaLNSelfAttn(nn.Module):
     """
     Gene-specific AdaLN Self-Attention Block
     
-    Based on original VAR's AdaLNSelfAttn with adaptations for gene expression prediction.
+    Based on the GenAR AdaLNSelfAttn with adaptations for gene expression prediction.
     Uses Adaptive Layer Normalization to condition on histology and spatial features.
     """
     def __init__(
@@ -298,7 +298,7 @@ class GeneAdaLNBeforeHead(nn.Module):
     """
     Adaptive LayerNorm before output head
     
-    Based on original VAR's AdaLNBeforeHead
+    Based on the GenAR AdaLNBeforeHead
     """
     def __init__(self, embed_dim: int, condition_dim: int, norm_eps: float = 1e-6):
         super().__init__()
@@ -459,15 +459,15 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(0), :]
 
 
-class GeneVARTransformer(nn.Module):
+class GeneGenARTransformer(nn.Module):
     """
-    Legacy Gene VAR Transformer (kept for backward compatibility)
+    Legacy GenAR Transformer (kept for backward compatibility)
     
-    Note: This is the old implementation. New code should use MultiScaleGeneVAR instead.
+    Note: This is the old implementation. New code should use MultiScaleGenAR instead.
     """
     def __init__(self, **kwargs):
         super().__init__()
         # This is kept for backward compatibility but should not be used
         raise NotImplementedError(
-            "GeneVARTransformer is deprecated. Use MultiScaleGeneVAR instead."
+            "GeneGenARTransformer is deprecated. Use MultiScaleGenAR instead."
         )

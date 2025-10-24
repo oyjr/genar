@@ -1,6 +1,6 @@
 """
-VAR-ST模型的PyTorch Lightning接口
-重构版本：核心Lightning接口，委托具体功能给专门的工具类
+PyTorch Lightning interface for the GenAR model.
+Core Lightning plumbing lives here; specialized helpers handle the details.
 """
 
 import logging
@@ -13,14 +13,14 @@ import pytorch_lightning as pl
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 
-# 导入工具类
+# Helper utilities
 from .model_metrics import ModelMetrics
 from .model_utils import ModelUtils
 
-# 设置日志记录器
+# Logger setup
 logging.basicConfig(level=logging.INFO)
 
-# 默认超参数
+# Default hyperparameters
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_WEIGHT_DECAY = 0.05
 DEFAULT_GRADIENT_CLIP = 1.0
@@ -28,19 +28,19 @@ DEFAULT_GRADIENT_CLIP = 1.0
 
 
 class ModelInterface(pl.LightningModule):
-    """VAR-ST模型的PyTorch Lightning接口"""
+    """LightningModule wrapper around the GenAR architecture."""
 
     def __init__(self, config):
         super().__init__()
         
-        # 创建专用logger
+        # Dedicated logger for this interface
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         
-        # 保存配置
+        # Store config reference
         self.config = config
-        # 只保存基本的可序列化超参数，避免OmegaConf序列化错误
+        # Persist only serializable hyperparameters to avoid OmegaConf issues
         hyperparams = {
-            'model_name': getattr(config.MODEL, 'model_name', 'VAR_ST'),
+            'model_name': getattr(config.MODEL, 'model_name', 'GENAR'),
             'num_genes': getattr(config.MODEL, 'num_genes', 200),
             'learning_rate': getattr(config.TRAINING, 'learning_rate', 1e-4),
             'batch_size': getattr(config.DATA.train_dataloader, 'batch_size', 256),
@@ -49,23 +49,23 @@ class ModelInterface(pl.LightningModule):
         }
         self.save_hyperparameters(hyperparams)
 
-        # 初始化工具类
+        # Helper utilities
         self.model_utils = ModelUtils(config, self)
         self.model_metrics = ModelMetrics(config, self)
         
-        # 加载模型
-        self._logger.info("初始化VAR-ST模型接口")
+        # Load the underlying model
+        self._logger.info("Initialising GenAR model interface")
         self.model = self.model_utils.load_model()
         
-        # 初始化验证和测试输出缓存
+        # Buffers for validation/test outputs
         self.validation_step_outputs = []
         self.test_step_outputs = []
         
-        # 从配置中获取推理参数
+        # Inference parameters
         self.inference_top_k = self.model_utils.get_config('INFERENCE.top_k', 1)
 
     def _common_step(self, batch, batch_idx, phase: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """通用的step处理逻辑"""
+        """Shared logic for train/val/test steps."""
         original_batch = batch.copy() if isinstance(batch, dict) else batch
         processed_batch = self.model_utils.preprocess_inputs(batch)
         
@@ -101,31 +101,33 @@ class ModelInterface(pl.LightningModule):
             loss_final = results_dict.get('loss_final', loss)
             predictions, targets = self._extract_predictions_and_targets(results_dict, original_batch)
         
-        # 记录模型特定指标
-        # For val/test, this uses loss_results which contains more metrics than inference_results
-        # final_results_for_logging = loss_results if phase in ['val', 'test'] else results_dict
-        # self.model_metrics.log_model_specific_metrics(phase, final_results_for_logging) # ✅ FIX: 禁用辅助模块的自动日志，避免重复记录
-        
+        # Metric logging handled separately to avoid duplicate entries
+
+        if predictions is not None:
+            self.model_metrics.log_model_specific_metrics(
+                phase,
+                {'predictions': predictions.detach()}
+            )
+
         return loss, loss_final, predictions, targets
 
     def training_step(self, batch, batch_idx):
-        """训练步骤"""
+        """Lightning training step."""
         loss, loss_final, _, _ = self._common_step(batch, batch_idx, 'train')
-        # 记录训练损失到进度条显示
+        # Show loss on the progress bar
         self.log('train_loss', loss_final, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        # 保留原有的详细记录用于监控
+        # Log detailed loss for monitoring
         self.log('train_loss_final', loss_final, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """验证步骤"""
-        # 执行完整的验证步骤
+        """Lightning validation step."""
         loss, loss_final, predictions, targets = self._common_step(batch, batch_idx, 'val')
         
-        # 获取实际的batch_size
+        # Determine the effective batch size
         batch_size = targets.size(0) if hasattr(targets, 'size') else 1
         
-        # 记录复合验证损失 (信息性)
+        # Log composite validation loss (informational)
         self.log('val_loss', loss, 
                 on_step=False, 
                 on_epoch=True, 
@@ -134,7 +136,7 @@ class ModelInterface(pl.LightningModule):
                 sync_dist=True,
                 reduce_fx='mean')
         
-        # 记录最终尺度损失 (新的关键监控指标)
+        # Log final-scale loss (current primary monitor)
         self.log('val_loss_final', loss_final,
                 on_step=False, 
                 on_epoch=True, 
@@ -143,35 +145,32 @@ class ModelInterface(pl.LightningModule):
                 sync_dist=True,
                 reduce_fx='mean')
         
-        # 暂时移除即时PCC计算，因为现在使用val_loss作为监控指标
-        # TODO: 如果后续需要使用val_pcc_50作为监控指标，可以重新启用这部分代码
-        
-        # 收集验证输出用于详细PCC计算 - 但要避免sanity check阶段
+        # Collect outputs for detailed PCC calculation (skip sanity checks)
         if not (hasattr(self.trainer, 'sanity_checking') and self.trainer.sanity_checking):
             output = {
-                'val_loss': loss_final,  # 使用最终尺度损失
-                'predictions': predictions.detach().cpu(),  # 移到CPU减少GPU内存
+                'val_loss': loss_final,
+                'predictions': predictions.detach().cpu(),
                 'targets': targets.detach().cpu()
             }
             
-            # 添加到验证输出列表
+            # Store for epoch-end aggregation
             self.validation_step_outputs.append(output)
-        
+
     def test_step(self, batch, batch_idx):
-        """测试步骤"""
+        """Lightning test step."""
         loss, loss_final, predictions, targets = self._common_step(batch, batch_idx, 'test')
         
-        # 记录最终尺度测试损失
+        # Log final-scale test loss
         self.log('test_loss_final', loss_final, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-        # 收集测试输出用于PCC计算
+        # Collect outputs for PCC computation
         output = {
-            'test_loss': loss_final, # 使用最终尺度损失
-            'predictions': predictions.detach().cpu(),  # 移到CPU减少GPU内存
+            'test_loss': loss_final,
+            'predictions': predictions.detach().cpu(),
             'targets': targets.detach().cpu()
         }
         
-        # 添加到测试输出列表
+        # Append to buffer
         if not hasattr(self, 'test_step_outputs'):
             self.test_step_outputs = []
         self.test_step_outputs.append(output)
@@ -179,13 +178,13 @@ class ModelInterface(pl.LightningModule):
         return output
 
     def _compute_loss(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """计算损失函数"""
+        """Compute the training loss with optional fallbacks."""
         try:
-            # 直接使用模型返回的损失，不再重复计算
+            # Prefer the model-provided loss
             if 'loss' in outputs:
                 total_loss = outputs['loss']
                 
-                # 记录额外指标（仅在训练时）
+                # Extra training-only diagnostics
                 if self.training and 'logits' in outputs:
                     with torch.no_grad():
                         logits = outputs['logits']
@@ -197,7 +196,7 @@ class ModelInterface(pl.LightningModule):
                             targets = None
                         
                         if targets is not None:
-                            # 计算token准确率
+                            # Token-level accuracy
                             if logits.dim() == 3:
                                 pred_tokens = logits.argmax(dim=-1)
                                 targets_flat = targets.view(-1)
@@ -210,37 +209,37 @@ class ModelInterface(pl.LightningModule):
                             token_acc = (pred_flat == targets_flat).float().mean()
                             self.log('train_token_accuracy', token_acc, prog_bar=False, sync_dist=False)
                 
-                self._logger.debug(f"使用模型内部损失={total_loss:.4f}")
+                self._logger.debug(f"Using model-provided loss={total_loss:.4f}")
                 
             else:
                 # Fallback for models that don't return 'loss' but 'logits'
                 # This part is now less likely to be used with the hierarchical model
                 logits = outputs.get('logits')
                 if logits is None:
-                    raise KeyError("模型输出中缺少'loss'或'logits'键")
+                    raise KeyError("Model outputs must include 'loss' or 'logits'")
                 
                 targets = batch.get('target_genes')
                 if targets is None:
-                    raise KeyError("批次数据中缺少'target_genes'键")
+                    raise KeyError("Batch is missing 'target_genes'")
 
                 total_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-                self._logger.debug(f"手动计算损失={total_loss:.4f}")
+                self._logger.debug(f"Computed fallback loss={total_loss:.4f}")
             
-            # 验证损失值
+            # Validate numerical stability
             if torch.isnan(total_loss) or torch.isinf(total_loss):
-                self._logger.error(f"损失值异常: {total_loss.item()}")
-                raise ValueError("损失值为NaN或Inf")
+                self._logger.error(f"Invalid loss value: {total_loss.item()}")
+                raise ValueError("Loss is NaN or Inf")
                 
             return total_loss
             
         except Exception as e:
-            self._logger.error(f"计算损失时出错: {str(e)}")
-            self._logger.error(f"输出键: {list(outputs.keys())}")
+            self._logger.error(f"Failed to compute loss: {str(e)}")
+            self._logger.error(f"Output keys: {list(outputs.keys())}")
             raise
 
     def _extract_predictions_and_targets(self, results_dict: Dict[str, torch.Tensor], 
                                        batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """提取预测和目标"""
+        """Extract predictions and target tensors from a forward pass."""
         # The hierarchical model returns 'predictions' for the final scale during training/validation,
         # and 'generated_sequence' during pure inference.
         if 'predictions' in results_dict:
@@ -248,41 +247,41 @@ class ModelInterface(pl.LightningModule):
         elif 'generated_sequence' in results_dict:
             predictions = results_dict['generated_sequence']
         else:
-            raise ValueError("模型输出中必须包含 'predictions' 或 'generated_sequence'")
+            raise ValueError("Model outputs must include 'predictions' or 'generated_sequence'")
         
-        # 获取目标
+        # Targets
         if 'target_genes' not in batch:
-            raise ValueError("批次数据中找不到target_genes")
+            raise ValueError("Batch is missing 'target_genes'")
         targets = batch['target_genes']
         
-        # 验证最终预测的维度是否为200
+        # Sanity-check prediction dimensionality
         num_genes = self.model.num_genes
         if predictions.shape[-1] != num_genes:
             raise ValueError(
-                f"最终预测维度({predictions.shape[-1]})与目标基因数量({num_genes})不匹配！"
+                f"Prediction dimensionality ({predictions.shape[-1]}) does not match num_genes ({num_genes})"
             )
         
         return predictions.float(), targets.float()
 
     def configure_optimizers(self):
-        """配置优化器和学习率调度器"""
+        """Set up optimizer and optional LR scheduler."""
         weight_decay = float(self.model_utils.get_config('TRAINING.weight_decay', DEFAULT_WEIGHT_DECAY))
         learning_rate = float(self.model_utils.get_config('TRAINING.learning_rate', DEFAULT_LEARNING_RATE))
         
-        # 多GPU学习率缩放
+        # Scale LR for the effective device count
         learning_rate = self.model_utils.scale_learning_rate(learning_rate)
-        
-        # 创建优化器
+
+        # Optimizer
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=learning_rate,
             weight_decay=weight_decay
         )
         
-        # 设置梯度裁剪
+        # Gradient clipping configuration
         self.trainer.gradient_clip_val = self.model_utils.get_config('TRAINING.gradient_clip_val', DEFAULT_GRADIENT_CLIP)
-        
-        # 配置学习率调度器
+
+        # Scheduler
         scheduler_config = self.model_utils.get_scheduler_config(optimizer)
         
         if scheduler_config:
@@ -291,42 +290,42 @@ class ModelInterface(pl.LightningModule):
             return {'optimizer': optimizer}
 
     def on_train_epoch_end(self):
-        """训练epoch结束时的回调"""
-        pass  # 训练数据不再累积
+        """No-op hook; training data is not accumulated."""
+        pass
     
     def on_validation_epoch_end(self):
-        """验证epoch结束时的回调"""
+        """Aggregate validation outputs at epoch end."""
         self._compute_and_log_pcc_metrics('val')
     
     def on_test_epoch_end(self):
-        """测试epoch结束时的回调"""
+        """Aggregate test outputs at epoch end."""
         self._compute_and_log_pcc_metrics('test')
-    
+
     def _compute_and_log_pcc_metrics(self, phase: str):
-        """统一的PCC指标计算和记录方法"""
-        # 修复属性名映射
+        """Compute PCC metrics for a phase and log them."""
+        # Map phase to attribute name
         if phase == 'val':
             outputs_attr = 'validation_step_outputs'
         elif phase == 'test':
             outputs_attr = 'test_step_outputs'
         else:
             if self.trainer.is_global_zero:
-                print(f"⚠️ 不支持的阶段: {phase}")
+                self._logger.warning("Unsupported phase '%s'", phase)
             return
         
         if not hasattr(self, outputs_attr):
             if self.trainer.is_global_zero:
-                print(f"⚠️ 没有{phase}阶段的输出数据属性: {outputs_attr}")
+                self._logger.warning("No output buffer for phase '%s' (%s)", phase, outputs_attr)
             return
             
         outputs = getattr(self, outputs_attr)
         if not outputs:
             if self.trainer.is_global_zero:
-                print(f"⚠️ {phase}阶段输出列表为空 (可能是sanity check阶段)")
+                self._logger.warning("Phase '%s' outputs are empty (likely sanity check)", phase)
             return
         
         try:
-            # 收集所有数据
+            # Gather tensors
             all_predictions = []
             all_targets = []
             
@@ -334,16 +333,16 @@ class ModelInterface(pl.LightningModule):
                 all_predictions.append(output['predictions'])
                 all_targets.append(output['targets'])
             
-            # 合并数据
+            # Concatenate along the batch dimension
             predictions = torch.cat(all_predictions, dim=0)  # [N, genes]
             targets = torch.cat(all_targets, dim=0)  # [N, genes]
             
-            self._logger.info(f"{phase}阶段收集到 {predictions.shape[0]} 个样本，{predictions.shape[1]} 个基因")
+            self._logger.info(f"Phase {phase}: collected {predictions.shape[0]} samples, {predictions.shape[1]} genes")
             
-            # 计算PCC指标 - 数据是原始token计数值，需要应用log2变换
+            # Compute PCC metrics (raw token counts -> log2)
             pcc_metrics = self.model_metrics.calculate_comprehensive_pcc_metrics(predictions, targets, apply_log2=True)
             
-            # 记录PCC指标
+            # Log metrics
             total_samples = predictions.shape[0]
             for metric_name, value in pcc_metrics.items():
                 self.log(f'{phase}_{metric_name}', value, 
@@ -352,42 +351,67 @@ class ModelInterface(pl.LightningModule):
                         batch_size=total_samples,
                         sync_dist=True)
             
-            # 在主进程打印详细结果
+            # Print detailed results on rank zero
             if self.trainer.is_global_zero:
-                phase_loss = self.trainer.callback_metrics.get(f'{phase}_loss', 0.0)
-                
-                print(f"\n🎯 Epoch {self.current_epoch} {phase.upper()}结果:")
-                print(f"   Loss: {phase_loss:.6f}")
-                print(f"   PCC-10:  {pcc_metrics['pcc_10']:.4f}")
-                print(f"   PCC-50:  {pcc_metrics['pcc_50']:.4f}")
-                print(f"   PCC-200: {pcc_metrics['pcc_200']:.4f}")
-                print(f"   MSE:     {pcc_metrics['mse']:.6f}")
-                print(f"   MAE:     {pcc_metrics['mae']:.6f}")
-                print(f"   RVD:     {pcc_metrics['rvd']:.6f}")
-                print()
-            
-            # 清理输出数据
+                phase_loss = float(self.trainer.callback_metrics.get(f'{phase}_loss', 0.0))
+                self._logger.info(
+                    "Epoch %s %s summary: loss=%.6f pcc10=%.4f pcc50=%.4f pcc200=%.4f mse=%.6f mae=%.6f rvd=%.6f",
+                    self.current_epoch,
+                    phase.upper(),
+                    phase_loss,
+                    pcc_metrics['pcc_10'],
+                    pcc_metrics['pcc_50'],
+                    pcc_metrics['pcc_200'],
+                    pcc_metrics['mse'],
+                    pcc_metrics['mae'],
+                    pcc_metrics['rvd'],
+                )
+
+            # Clear buffer
             outputs.clear()
             
         except Exception as e:
-            self._logger.error(f"计算{phase}阶段PCC指标时出错: {e}")
+            self._logger.error(f"Failed to compute PCC metrics for phase '{phase}': {e}")
             import traceback
             traceback.print_exc()
-    
+
+    def manual_inference_step(self, batch: Dict[str, torch.Tensor], phase: str = 'test') -> Dict[str, torch.Tensor]:
+        """Run inference outside of the Lightning trainer while reusing internal logic."""
+        model_training_mode = self.model.training
+        module_training_mode = self.training
+
+        self.eval()
+        self.model.eval()
+
+        with torch.no_grad():
+            loss, loss_final, predictions, targets = self._common_step(batch, batch_idx=0, phase=phase)
+
+        if model_training_mode:
+            self.model.train()
+        if module_training_mode:
+            self.train()
+
+        return {
+            'loss': loss.detach(),
+            'loss_final': loss_final.detach(),
+            'predictions': predictions.detach(),
+            'targets': targets.detach()
+        }
+
     def on_fit_end(self):
-        """训练完成时的回调"""
+        """Called when training finishes."""
         if not self.trainer.is_global_zero:
-            self._logger.info(f"GPU进程 {self.trainer.global_rank}: 训练完成")
+            self._logger.info(f"GPU rank {self.trainer.global_rank}: training finished")
             return
         
-        self._logger.info("训练完成！")
+        self._logger.info("Training finished")
 
 
 
 
 
     def on_before_optimizer_step(self, optimizer):
-        """优化器步骤前的回调"""
+        """Hook executed before each optimizer step."""
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.parameters(), 
             self.trainer.gradient_clip_val

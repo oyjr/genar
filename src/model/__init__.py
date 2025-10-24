@@ -1,11 +1,11 @@
-from .VAR.two_stage_var_st import MultiScaleGeneVAR, VARST
+from .genar.multiscale_genar import MultiScaleGenAR, GenARModel
 from .foundation_baseline import FoundationOnlyRegressor
 
 MODELS = {
-    'VAR_ST': MultiScaleGeneVAR,  # 使用新的多尺度模型
+    'GENAR': MultiScaleGenAR,
     'FOUNDATION_BASELINE': FoundationOnlyRegressor,
 }
 
 from .model_interface import ModelInterface
 
-__all__ = ['MultiScaleGeneVAR', 'VARST', 'FoundationOnlyRegressor', 'MODELS', 'ModelInterface']
+__all__ = ['MultiScaleGenAR', 'GenARModel', 'FoundationOnlyRegressor', 'MODELS', 'ModelInterface']

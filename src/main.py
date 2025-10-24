@@ -2,16 +2,17 @@ import os
 import sys
 import argparse
 import logging
+import warnings
 from copy import deepcopy
 from datetime import datetime
 
-# 确保导入项目目录下的模块
+# Ensure project modules are importable when the script runs as a module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import pytorch_lightning as pl
 
-# 导入项目模块
+# Project modules
 from dataset.hest_dataset import STDataset
 from model import ModelInterface
 from utils import (
@@ -21,85 +22,88 @@ from utils import (
 )
 from torch.utils.data import DataLoader
 
-# 设置日志记录器
+# Configure logger
 logger = logging.getLogger(__name__)
+logging.getLogger('model.genar').setLevel(logging.WARNING)
+logging.getLogger('model.model_utils').setLevel(logging.INFO)
 
 torch.set_float32_matmul_precision('high')
+warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*")
 
 
-# 编码器特征维度映射
+# Encoder feature dimensions per backbone
 ENCODER_FEATURE_DIMS = {
     'uni': 1024,
     'conch': 512,
     'resnet18': 512,
 }
 
-# 数据集配置 - 包含路径和slide划分信息
+# Dataset configuration including recommended validation/test slides
 DATASETS = {
     'PRAD': {
-        'path': '/data/250010227/oy/Stem/hest1k_datasets/PRAD/',
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
         'val_slides': 'MEND145',
         'test_slides': 'MEND145',
         'recommended_encoder': 'uni'
     },
     'her2st': {
-        'path': '/data/250010227/oy/Stem/hest1k_datasets/her2st/',
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
         'val_slides': 'SPA148',
         'test_slides': 'SPA148',
         'recommended_encoder': 'uni'
     },
     'kidney': {
-        'path': '/data/250010227/oy/Stem/hest1k_datasets/kidney/',
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/kidney/',
         'val_slides': 'NCBI697',
         'test_slides': 'NCBI697',
         'recommended_encoder': 'uni'
     },
     'mouse_brain': {
-        'path': '/data/250010227/oy/Stem/hest1k_datasets/mouse_brain/',
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/mouse_brain/',
         'val_slides': 'NCBI667',
         'test_slides': 'NCBI667',
         'recommended_encoder': 'uni'
     },
     'ccRCC': {
-        'path': '/data/250010227/oy/Stem/hest1k_datasets/ccRCC/',
+        'path': '/data/ouyangjiarui/stem/hest1k_datasets/ccRCC/',
         'val_slides': 'INT2',
         'test_slides': 'INT2',
         'recommended_encoder': 'uni'
     }
 }
 
-# Multi-Scale Gene VAR 模型配置
-VAR_ST_CONFIG = {
-        'model_name': 'VAR_ST',
+# GenAR model configuration
+GENAR_CONFIG = {
+        'model_name': 'GENAR',
         'num_genes': 200,
-        'histology_feature_dim': 1024,  # 依赖编码器
+        'histology_feature_dim': 1024,  # Depends on encoder choice
         'spatial_coord_dim': 2,
         
-        # Multi-Scale VAR 配置 (优化尺度设计)
-        'gene_patch_nums': (1, 4, 8, 40, 100, 200),  # 6个尺度，逐步细化到最终200个基因
-        # vocab_size 将根据 max_gene_count 动态计算 (max_gene_count + 1)
-        'embed_dim': 512,  # 减少嵌入维度 768->512
-        'num_heads': 8,    # 减少注意力头数 12->8
-        'num_layers': 8,   # 减少层数 12->8
-        'mlp_ratio': 3.0,  # 减少MLP倍数 4.0->3.0
-        
-        # Dropout 参数
+        # Multi-scale configuration (progressively refines to 200 genes)
+        'gene_patch_nums': (1, 4, 8, 40, 100, 200),
+        # vocab_size is derived from max_gene_count (max_gene_count + 1)
+        'embed_dim': 512,  # Reduced from 768
+        'num_heads': 8,    # Reduced from 12
+        'num_layers': 8,   # Reduced from 12
+        'mlp_ratio': 3.0,  # Reduced from 4.0
+
+        # Dropout configuration
         'drop_rate': 0.0,
         'attn_drop_rate': 0.0,
         'drop_path_rate': 0.1,
-        
-        # 条件相关参数
-        'condition_embed_dim': 512,  # 匹配embed_dim
+
+        # Conditioning configuration
+        'condition_embed_dim': 512,  # Matches embed_dim
         'cond_drop_rate': 0.1,
-        
-        # 其他参数
+
+        # Misc parameters
         'norm_eps': 1e-6,
         'shared_aln': False,
         'attn_l2_norm': True,
-        
-        # 自适应损失函数参数
-        'adaptive_sigma_alpha': 0.01,  # 自适应sigma比例因子，控制sigma随表达量增长的速度（调整为更保守的值）
-        'adaptive_sigma_beta': 1.0     # 自适应sigma基础值，确保低表达基因有最小容忍度
+
+        # Adaptive loss hyperparameters
+        'adaptive_sigma_alpha': 0.01,
+        'adaptive_sigma_beta': 1.0
 }
 
 FOUNDATION_BASELINE_CONFIG = {
@@ -111,11 +115,11 @@ FOUNDATION_BASELINE_CONFIG = {
 }
 
 MODEL_CONFIGS = {
-    'VAR_ST': VAR_ST_CONFIG,
+    'GENAR': GENAR_CONFIG,
     'FOUNDATION_BASELINE': FOUNDATION_BASELINE_CONFIG,
 }
 
-# 默认训练配置 
+# Default training configuration
 DEFAULT_CONFIG = {
     'GENERAL': {
         'seed': 2021,
@@ -123,7 +127,6 @@ DEFAULT_CONFIG = {
         'debug': False
     },
     'DATA': {
-        'normalize': True,  # 保留参数兼容性，实际使用原始基因计数
         'train_dataloader': {
             'batch_size': 256,
             'num_workers': 4,
@@ -132,14 +135,14 @@ DEFAULT_CONFIG = {
             'persistent_workers': True
         },
         'val_dataloader': {
-            'batch_size': 64,  # 🔧 进一步增加验证批次大小到64，显著加速验证
+            'batch_size': 64,  # Larger validation batch size to speed up evaluation
             'num_workers': 4,
             'pin_memory': True,
             'shuffle': False,
             'persistent_workers': True
         },
         'test_dataloader': {
-            'batch_size': 64,  # 🔧 同步增加测试批次大小到64
+            'batch_size': 64,  # Match validation batch size for testing
             'num_workers': 4,
             'pin_memory': True,
             'shuffle': False,
@@ -153,7 +156,7 @@ DEFAULT_CONFIG = {
         'mode': 'min',
         'monitor': 'train_loss_final',
         'lr_scheduler': {
-            'patience': 0,  # 默认禁用，只有命令行指定时才启用
+            'patience': 0,  # Disabled by default; opt-in via CLI
             'factor': 0.5
         },
         'gradient_clip_val': 1.0
@@ -161,7 +164,7 @@ DEFAULT_CONFIG = {
     'CALLBACKS': {
         'early_stopping': {
             'monitor': 'train_loss_final',
-            'patience': 10000,  # 默认设置很大值，实际禁用早停
+            'patience': 10000,  # Large value effectively disables early stopping
             'mode': 'min',
             'min_delta': 0.0
         },
@@ -176,7 +179,7 @@ DEFAULT_CONFIG = {
         }
     },
     'MULTI_GPU': {
-        'find_unused_parameters': False,  # ✅ 优化：新架构无未使用参数，关闭以提升性能
+        'find_unused_parameters': False,  # No unused params in the new design
         'accumulate_grad_batches': 1
     }
 }
@@ -184,7 +187,7 @@ DEFAULT_CONFIG = {
 
 def get_parse():
     """
-    Parse command line arguments for VAR_ST training.
+    Parse command line arguments for GenAR training.
     
     Returns:
         argparse.ArgumentParser: Configured argument parser with simplified parameters
@@ -206,171 +209,161 @@ Examples:
   
   # Test mode with checkpoint
   python src/main.py --dataset her2st --mode test --gpus 1 \\
-      --ckpt_path logs/her2st/VAR_ST/best-epoch=epoch=02-pcc50=val_pcc_50=0.7688.ckpt
+      --ckpt_path logs/her2st/GENAR/best-epoch=epoch=02-pcc50=val_pcc_50=0.7688.ckpt
         """
     )
     
-    # === 核心参数 ===
+    # Core arguments
     parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
-                        help='数据集名称 (PRAD, her2st, kidney, mouse_brain)')
-    parser.add_argument('--model', type=str, default='VAR_ST', choices=list(MODEL_CONFIGS.keys()),
-                        help='模型类型 (VAR_ST, FOUNDATION_BASELINE)，默认: VAR_ST')
+                        help='Dataset name (PRAD, her2st, kidney, mouse_brain, ccRCC)')
+    parser.add_argument('--model', type=str, default='GENAR', choices=list(MODEL_CONFIGS.keys()),
+                        help='Model type (GENAR or FOUNDATION_BASELINE, default: GENAR)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
-                        help='编码器类型 (uni, conch, resnet18)，默认使用数据集推荐编码器')
-    
-    # === 训练参数 ===
+                        help='Encoder type (uni, conch, resnet18); defaults to the dataset recommendation')
+
+    # Training arguments
     parser.add_argument('--gpus', type=int, default=1,
-                        help='GPU数量 (默认: 1)')
+                        help='Number of GPUs to use (default: 1)')
     parser.add_argument('--epochs', type=int,
-                        help='训练轮数 (默认: 200)')
+                        help='Number of training epochs (default: 200)')
     parser.add_argument('--batch_size', type=int,
-                        help='批次大小 (默认: 256)')
+                        help='Training batch size (default: 256)')
     parser.add_argument('--lr', type=float,
-                        help='学习率 (默认: 1e-4)')
+                        help='Learning rate (default: 1e-4)')
     parser.add_argument('--weight-decay', type=float,
-                        help='权重衰减 (默认: 1e-4)')
+                        help='Weight decay (default: 1e-4)')
     parser.add_argument('--patience', type=int,
-                        help='学习率调度器耐心值 (默认: 禁用, 只有指定时才启用patience机制)')
-    
-    # === 多GPU参数 ===
+                        help='LR scheduler patience; enables the scheduler only when provided')
+
+    # Multi-GPU arguments
     parser.add_argument('--strategy', type=str, default='auto',
                         choices=['auto', 'ddp', 'ddp_spawn', 'dp'],
-                        help='多GPU策略 (默认: auto，多GPU时使用ddp)')
+                        help='Distributed strategy (default: auto, DDP when applicable)')
     parser.add_argument('--sync-batchnorm', action='store_true',
-                        help='启用同步BatchNorm (多GPU训练推荐)')
-    
-    # === 数据增强参数 ===
-    parser.add_argument('--use-augmented', action='store_true', default=False,
-                        help='使用数据增强 (默认: False)')
-    parser.add_argument('--expand-augmented', action='store_true', default=False,
-                        help='展开增强数据为7倍样本 (默认: False)')
-    parser.add_argument('--no-use-augmented', dest='use_augmented', action='store_false',
-                        help='明确禁用数据增强')
-    parser.add_argument('--no-expand-augmented', dest='expand_augmented', action='store_false',
-                        help='明确禁用展开增强')
-    
-    # === 🆕 基因计数参数 ===
-    parser.add_argument('--max-gene-count', type=int, default=500,
-                        help='最大基因计数值 (默认: 500)')
-    
-    # === 其他参数 ===
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
-                        help='运行模式 (默认: train)')
-    parser.add_argument('--seed', type=int,
-                        help='随机种子 (默认: 2021)')
-    
-    # === 🆕 测试模式参数 ===
-    parser.add_argument('--ckpt_path', type=str,
-                        help='测试模式时使用的checkpoint路径 (必须在--mode test时指定)')
+                        help='Enable synchronized BatchNorm (recommended for multi-GPU)')
 
-    # === 🆕 多尺度消融实验参数 ===
+    # Data augmentation flags
+    parser.add_argument('--use-augmented', action='store_true', default=False,
+                        help='Use augmented features (default: disabled)')
+    parser.add_argument('--expand-augmented', action='store_true', default=False,
+                        help='Expand augmented data into seven virtual samples per spot')
+    parser.add_argument('--no-use-augmented', dest='use_augmented', action='store_false',
+                        help='Explicitly disable augmented features')
+    parser.add_argument('--no-expand-augmented', dest='expand_augmented', action='store_false',
+                        help='Explicitly disable augmented data expansion')
+
+    # Gene-count arguments
+    parser.add_argument('--max-gene-count', type=int, default=500,
+                        help='Upper bound for gene counts (default: 500)')
+
+    # Miscellaneous options
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
+                        help='Execution mode: train or test (default: train)')
+    parser.add_argument('--seed', type=int,
+                        help='Random seed (default: 2021)')
+
+    # Testing arguments
+    parser.add_argument('--ckpt_path', type=str,
+                        help='Checkpoint path required when --mode test is used')
+
+    # Multi-scale ablation options
     parser.add_argument('--scale-config', type=str, default='default',
                         choices=['default', 'flat', 'single'],
-                        help='多尺度配置: default=(1,4,8,40,100,200), flat=(1,20,200), single=(200)')
+                        help='Multi-scale layout: default=(1,4,8,40,100,200), flat=(1,20,200), single=(200)')
 
-    # === 向后兼容参数 (保留最少必要的) ===
+    # Backward-compatibility flag (legacy)
     parser.add_argument('--config', type=str,
-                        help='[已弃用] 请使用 --dataset 参数替代')
+                        help='[Deprecated] Use --dataset instead')
     
     return parser
 
 
 def build_config_from_args(args):
-    """
-    从简化的命令行参数构建完整配置
-    
-    Args:
-        args: 解析后的命令行参数
-        
-    Returns:
-        完整的配置对象
-    """
+    """Build the runtime configuration from parsed arguments."""
     from addict import Dict
-    
-    # 如果使用了原有的config参数，则使用原有逻辑
+
+    # Fall back to the legacy config flow when a YAML config is provided
     if args.config:
-        print("🔄 使用原有配置文件模式")
-        return None  # 返回None表示使用原有逻辑
-    
-    # 检查必需参数
+        logger.warning("Switching to legacy config-file mode")
+        return None
+
+    # Required parameters
     if not args.dataset:
-        raise ValueError("必须指定 --dataset 参数")
-    
+        raise ValueError("`--dataset` must be specified")
+
     if args.dataset not in DATASETS:
-        raise ValueError(f"不支持的数据集: {args.dataset}，支持的数据集: {list(DATASETS.keys())}")
-    
-    # 🆕 检查测试模式参数
+        raise ValueError(f"Unsupported dataset: {args.dataset}; valid options: {list(DATASETS.keys())}")
+
     if args.mode == 'test' and not args.ckpt_path:
-        raise ValueError("测试模式必须指定 --ckpt_path 参数")
-    
+        raise ValueError("`--ckpt_path` is required when running in test mode")
+
     if args.ckpt_path and not os.path.exists(args.ckpt_path):
-        raise ValueError(f"Checkpoint文件不存在: {args.ckpt_path}")
-    
-    model_name = (args.model or 'VAR_ST').upper()
+        raise ValueError(f"Checkpoint not found: {args.ckpt_path}")
+
+    model_name = (args.model or 'GENAR').upper()
     if model_name not in MODEL_CONFIGS:
-        raise ValueError(f"不支持的模型: {model_name}，可选项: {list(MODEL_CONFIGS.keys())}")
+        raise ValueError(f"Unsupported model: {model_name}; choices: {list(MODEL_CONFIGS.keys())}")
 
-    print(f"🚀 使用简化配置模式: 数据集={args.dataset}, 模型={model_name}, 模式={args.mode}")
+    logger.info("Configuration: dataset=%s model=%s mode=%s", args.dataset, model_name, args.mode)
 
-    # 获取数据集信息
+    # Dataset and model metadata
     dataset_info = DATASETS[args.dataset]
 
-    # 获取模型信息
     model_info = deepcopy(MODEL_CONFIGS[model_name])
 
-    # 确定编码器
+    # Determine encoder
     encoder_name = args.encoder or dataset_info['recommended_encoder']
 
-    # 确定GPU相关参数
+    # Resolve GPU-related arguments
     devices = args.gpus
     strategy = 'ddp' if devices > 1 and args.strategy == 'auto' else args.strategy
     sync_batchnorm = getattr(args, 'sync_batchnorm', False) or (devices > 1)
-    
-    # 构建完整配置
+
+    # Build configuration object
     config = Dict(DEFAULT_CONFIG)
 
-    if model_name == 'VAR_ST':
-        # 🆕 根据scale_config参数选择尺度配置
+    if model_name == 'GENAR':
+        # Configure multi-scale settings based on the CLI flag
         SCALE_CONFIGS = {
-            'default': (1, 4, 8, 40, 100, 200),  # 配置A：原始6尺度
-            'flat': (1, 20, 200),                 # 配置B：扁平3尺度
-            'single': (200,)                      # 配置C：单尺度
+            'default': (1, 4, 8, 40, 100, 200),
+            'flat': (1, 20, 200),
+            'single': (200,)
         }
 
         scale_config_name = getattr(args, 'scale_config', 'default').replace('-', '_')
         selected_scales = SCALE_CONFIGS[scale_config_name]
 
-        # 更新日志路径为数据集名称和模型名称，包含尺度配置信息
+        # Update log path to include the dataset, model, and scale configuration
         if scale_config_name != 'default':
-            config.GENERAL.log_path = f'./logs/{args.dataset}/VAR_ST_scale_{scale_config_name}'
+            config.GENERAL.log_path = f'./logs/{args.dataset}/GENAR_scale_{scale_config_name}'
         else:
-            config.GENERAL.log_path = f'./logs/{args.dataset}/VAR_ST'
+            config.GENERAL.log_path = f'./logs/{args.dataset}/GENAR'
 
-        print(f"📐 使用多尺度配置: {scale_config_name} = {selected_scales}")
+        logger.debug("Selected multi-scale layout: %s = %s", scale_config_name, selected_scales)
     else:
         if getattr(args, 'scale_config', 'default') not in (None, 'default'):
-            print("⚠️ FOUNDATION_BASELINE 模型忽略 --scale-config 参数")
+            logger.debug("FOUNDATION_BASELINE ignores --scale-config; proceeding with defaults")
         config.GENERAL.log_path = f'./logs/{args.dataset}/{model_name}'
 
-    # 更新模型配置
+    # Update model configuration
     config.MODEL = Dict(model_info)
     config.MODEL.feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
 
-    if model_name == 'VAR_ST':
-        # 🆕 更新scale_dims和gene_patch_nums（保持兼容性）
+    if model_name == 'GENAR':
+        # Keep scale information when running GenAR
         config.MODEL.scale_dims = selected_scales
-        config.MODEL.gene_patch_nums = selected_scales  # 保持向后兼容
+        config.MODEL.gene_patch_nums = selected_scales
 
-    # 🔧 根据命令行参数更新基因数量
+    # Adjust gene-count related settings
     max_gene_count = getattr(args, 'max_gene_count', 500)
-    # num_genes保持200不变，不被max_gene_count影响
+    # num_genes remains fixed at 200
 
-    # 🆕 动态计算vocab_size = max_gene_count + 1 (对应0到max_gene_count的计数范围)
+    # vocab_size mirrors the range 0..max_gene_count
     vocab_size = max_gene_count + 1
     config.MODEL.vocab_size = vocab_size
     config.MODEL.max_gene_count = max_gene_count
     
-    # 更新训练参数
+    # Override training hyperparameters from CLI overrides
     if args.epochs:
         config.TRAINING.num_epochs = args.epochs
     if args.lr:
@@ -381,22 +374,22 @@ def build_config_from_args(args):
     if batch_size:
         config.DATA.train_dataloader.batch_size = batch_size
     if args.patience is not None:
-        # 只有明确指定patience时才启用patience机制
+        # Enable LR scheduler only when patience is explicitly set
         config.TRAINING.lr_scheduler.patience = args.patience
-        # 设置早停的patience（通常设为lr_scheduler patience的2倍）
+        # Mirror the patience value into the early stopping callback
         if args.patience == 0:
-            # 如果明确设为0，禁用早停
+            # Setting zero keeps early stopping disabled
             config.CALLBACKS.early_stopping.patience = 10000
         else:
-            # 启用早停，设为patience的2倍
+            # Otherwise use twice the LR scheduler patience
             config.CALLBACKS.early_stopping.patience = max(10, args.patience * 2)
-    # 如果没有指定patience，保持默认的禁用状态（patience=0和early_stopping=10000）
-    
-    # 更新种子
+    # Without a CLI override, early stopping stays effectively disabled
+
+    # Optional seed override
     if args.seed:
         config.GENERAL.seed = args.seed
     
-    # 设置数据集相关参数
+    # Dataset-related settings
     config.mode = args.mode
     config.expr_name = args.dataset
     config.data_path = dataset_info['path']
@@ -405,28 +398,28 @@ def build_config_from_args(args):
     config.encoder_name = encoder_name
     config.use_augmented = getattr(args, 'use_augmented', False)
     config.expand_augmented = getattr(args, 'expand_augmented', False)
-    config.gene_count_mode = 'discrete_tokens'  # 固定为离散token模式
+    config.gene_count_mode = 'discrete_tokens'
     config.max_gene_count = getattr(args, 'max_gene_count', 500)
     
-    # 🆕 设置checkpoint路径
+    # Optional checkpoint path
     if args.ckpt_path:
         config.ckpt_path = args.ckpt_path
     
-    # 设置多GPU参数
+    # Multi-GPU configuration
     config.devices = devices
     config.strategy = strategy
     config.sync_batchnorm = sync_batchnorm
     
-    # 设置时间戳和配置路径
+    # Runtime metadata
     config.GENERAL.current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    config.config = 'built-in'  # 标记为内置配置
+    config.config = 'built-in'
     
-    # 检查patience状态
+    # Report patience configuration
     lr_patience = config.TRAINING.lr_scheduler.patience
     early_patience = config.CALLBACKS.early_stopping.patience
-    patience_status = "禁用" if lr_patience == 0 else f"启用 (LR调度器: {lr_patience}, 早停: {early_patience})"
+    patience_status = "disabled" if lr_patience == 0 else f"enabled (LR scheduler: {lr_patience}, early stopping: {early_patience})"
     
-    # VAR-ST模型配置
+    # Align GenAR configuration
     config.MODEL.histology_feature_dim = ENCODER_FEATURE_DIMS[encoder_name]
     config.MODEL.gene_count_mode = config.gene_count_mode
     config.MODEL.max_gene_count = config.max_gene_count
@@ -438,45 +431,27 @@ def build_config_from_args(args):
     config.CALLBACKS.model_checkpoint.monitor = monitor_metric
     config.CALLBACKS.model_checkpoint.mode = 'min'
     config.CALLBACKS.model_checkpoint.filename = f'best-epoch={{epoch:02d}}-{monitor_metric}={{{monitor_metric}:.6f}}'
-    if model_name == 'VAR_ST':
-        print(f"   - VAR-ST监控指标: {monitor_metric} (最小化) - 基于训练损失保存最佳模型")
-    else:
-        print(f"   - 监控指标: {monitor_metric} (最小化)")
-    print(f"   - Checkpoint文件名模板: best-epoch={{epoch:02d}}-loss={{train_loss_final:.6f}}")
-    print(f"   - 基因计数模式: discrete_tokens (保持原始计数)")
-    print(f"   - 最大基因计数: {config.max_gene_count}")
-    print(f"   - 词汇表大小: {vocab_size} (动态计算: {max_gene_count} + 1)")
-    
-    # 数据增强状态
-    aug_status = []
-    if config.use_augmented:
-        aug_status.append("使用增强特征")
-        if config.expand_augmented:
-            aug_status.append("展开7倍样本")
-        else:
-            aug_status.append("不展开样本")
-    else:
-        aug_status.append("不使用增强")
-    aug_status_str = ", ".join(aug_status)
-    
-    print(f"✅ 配置构建完成:")
-    print(f"   - 数据集: {args.dataset} ({dataset_info['path']})")
-    print(f"   - 模型: {model_name}")
-    print(f"   - 编码器: {encoder_name} (特征维度: {ENCODER_FEATURE_DIMS[encoder_name]})")
-    print(f"   - GPU: {devices}个 (策略: {strategy})")
-    print(f"   - 训练轮数: {config.TRAINING.num_epochs}")
-    print(f"   - 批次大小: {config.DATA.train_dataloader.batch_size}")
-    print(f"   - 学习率: {config.TRAINING.learning_rate}")
-    print(f"   - 数据增强: {aug_status_str}")
-    print(f"   - Patience机制: {patience_status}")
-    print(f"   - 基因计数范围: 0-{max_gene_count} (vocab_size: {vocab_size})")
-    
+    if model_name == 'GENAR':
+        logger.debug("GenAR monitor: %s (minimization)", monitor_metric)
+
+    logger.info(
+        "Training setup: dataset=%s model=%s encoder=%s gpus=%s epochs=%s batch_size=%s lr=%s gene_vocab=%s",
+        args.dataset,
+        model_name,
+        encoder_name,
+        devices,
+        config.TRAINING.num_epochs,
+        config.DATA.train_dataloader.batch_size,
+        config.TRAINING.learning_rate,
+        vocab_size,
+    )
+
     return config
 
 
 def create_dataloaders(config):
-    """创建数据加载器"""
-    # 基础参数
+    """Instantiate train/val/test dataloaders."""
+    # Shared dataset parameters
     base_params = {
         'data_path': config.data_path,
         'expr_name': config.expr_name,
@@ -487,12 +462,12 @@ def create_dataloaders(config):
         'max_gene_count': getattr(config, 'max_gene_count', 500),
     }
     
-    # 创建数据集
+    # Build datasets
     train_dataset = STDataset(mode='train', expand_augmented=config.expand_augmented, **base_params)
     val_dataset = STDataset(mode='val', expand_augmented=False, **base_params)
     test_dataset = STDataset(mode='test', expand_augmented=False, **base_params)
     
-    # 创建DataLoader
+    # DataLoaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.DATA.train_dataloader.batch_size,
@@ -521,14 +496,10 @@ def create_dataloaders(config):
 
 
 def main(config):
-    """主训练函数"""
+    """Entry point for training or evaluation."""
 
-    # 1. 初始化和设置
-    # ...
-    
-    # 动态更新监控指标和文件名
-    if config.MODEL.model_name == 'VAR_ST':
-        # ✅ FIX: 强制使用训练损失进行监控，以确保保存训练损失最小的模型
+    # Dynamically keep checkpoint settings consistent with the training metric
+    if config.MODEL.model_name == 'GENAR':
         monitor_metric = 'train_loss_final'
         monitor_mode = 'min'
 
@@ -538,26 +509,22 @@ def main(config):
         config.CALLBACKS.early_stopping.mode = monitor_mode
         config.CALLBACKS.model_checkpoint.monitor = monitor_metric
         config.CALLBACKS.model_checkpoint.mode = monitor_mode
-        # 使用与监控指标完全一致的动态文件名
         config.CALLBACKS.model_checkpoint.filename = f'best-epoch={{epoch:02d}}-{monitor_metric}={{{monitor_metric}:.4f}}'
-        print(f"✅ VAR-ST: 监控指标强制更新为 {monitor_metric} (模式: {monitor_mode})")
+        logger.debug("GenAR monitor forced to %s (mode: %s)", monitor_metric, monitor_mode)
 
-    # 2. 加载数据加载器
-    # ...
     train_loader, val_loader, test_loader = create_dataloaders(config)
-    
-    # 初始化组件
-    # 清理config中不兼容OmegaConf的元素，避免序列化错误
-    clean_config = type(config)(config)  # 复制config
-    # 移除不兼容的策略对象
+
+    # Prepare a copy that is safe to serialize in checkpoints
+    clean_config = type(config)(config)
+    # Ensure strategy is serializable
     if hasattr(clean_config, 'strategy') and not isinstance(clean_config.strategy, str):
-        clean_config.strategy = 'ddp'  # 转换为字符串
+        clean_config.strategy = 'ddp'
     
     model = ModelInterface(clean_config)
-    logger = load_loggers(config)
+    trainer_loggers = load_loggers(config)
     callbacks = load_callbacks(config)
 
-    # 配置多GPU策略
+    # Configure training strategy
     strategy_config = config.strategy
     if config.devices > 1 and config.strategy == 'ddp':
         from pytorch_lightning.strategies import DDPStrategy
@@ -567,15 +534,15 @@ def main(config):
             static_graph=False
         )
     
-    # 配置梯度累积
+    # Gradient accumulation
     accumulate_grad_batches = getattr(config.MULTI_GPU, 'accumulate_grad_batches', 1)
     
-    # 初始化训练器
+    # Trainer configuration
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=config.devices,
         max_epochs=config.TRAINING.num_epochs,
-        logger=logger,
+        logger=trainer_loggers,
         callbacks=callbacks,
         precision=32,
         strategy=strategy_config,
@@ -585,15 +552,16 @@ def main(config):
         log_every_n_steps=50,
         gradient_clip_val=config.TRAINING.gradient_clip_val,
         deterministic=False,
+        enable_model_summary=False,
     )
 
-    # 根据模式执行不同的操作
+    # Execute according to the selected mode
     if config.mode == 'train':
         trainer.fit(model, train_loader, val_loader)
     elif config.mode == 'test':
-        print(f"📂 从checkpoint加载模型: {config.ckpt_path}")
+        logger.info("Loading checkpoint: %s", config.ckpt_path)
         trainer.test(model, test_loader, ckpt_path=config.ckpt_path)
-        print("✅ 测试完成！")
+        logger.info("Test run finished")
 
     return model
 
@@ -601,7 +569,7 @@ if __name__ == '__main__':
     parser = get_parse()
     args = parser.parse_args()
     
-    # 构建配置并运行训练
+    # Build configuration and run
     config = build_config_from_args(args)
 
     main(config)
