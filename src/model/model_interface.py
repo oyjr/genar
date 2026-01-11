@@ -3,12 +3,12 @@ PyTorch Lightning interface for the GenAR model.
 Core Lightning plumbing lives here; specialized helpers handle the details.
 """
 
+import io
 import logging
 from typing import Dict, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
@@ -38,8 +38,11 @@ class ModelInterface(pl.LightningModule):
         
         # Store config reference
         self.config = config
-        # Persist only serializable hyperparameters to avoid OmegaConf issues
+        self._assert_config_serializable(config)
+
+        # Persist only serializable hyperparameters
         hyperparams = {
+            'config': config,
             'model_name': getattr(config.MODEL, 'model_name', 'GENAR'),
             'num_genes': getattr(config.MODEL, 'num_genes', 200),
             'learning_rate': getattr(config.TRAINING, 'learning_rate', 1e-4),
@@ -62,7 +65,15 @@ class ModelInterface(pl.LightningModule):
         self.test_step_outputs = []
         
         # Inference parameters
-        self.inference_top_k = self.model_utils.get_config('INFERENCE.top_k', 1)
+        self.inference_top_k = config.INFERENCE.top_k
+
+    @staticmethod
+    def _assert_config_serializable(config) -> None:
+        buffer = io.BytesIO()
+        try:
+            torch.save(config, buffer)
+        except Exception as exc:
+            raise ValueError("Config must be serializable for checkpointing") from exc
 
     def _common_step(self, batch, batch_idx, phase: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Shared logic for train/val/test steps."""
@@ -178,7 +189,7 @@ class ModelInterface(pl.LightningModule):
         return output
 
     def _compute_loss(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Compute the training loss with optional fallbacks."""
+        """Compute the training loss."""
         try:
             # Prefer the model-provided loss
             if 'loss' in outputs:
@@ -209,21 +220,10 @@ class ModelInterface(pl.LightningModule):
                             token_acc = (pred_flat == targets_flat).float().mean()
                             self.log('train_token_accuracy', token_acc, prog_bar=False, sync_dist=False)
                 
-                self._logger.debug(f"Using model-provided loss={total_loss:.4f}")
+                self._logger.debug("Using model-provided loss=%.4f", float(total_loss))
                 
             else:
-                # Fallback for models that don't return 'loss' but 'logits'
-                # This part is now less likely to be used with the hierarchical model
-                logits = outputs.get('logits')
-                if logits is None:
-                    raise KeyError("Model outputs must include 'loss' or 'logits'")
-                
-                targets = batch.get('target_genes')
-                if targets is None:
-                    raise KeyError("Batch is missing 'target_genes'")
-
-                total_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-                self._logger.debug(f"Computed fallback loss={total_loss:.4f}")
+                raise KeyError("Model outputs must include 'loss'")
             
             # Validate numerical stability
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -314,66 +314,72 @@ class ModelInterface(pl.LightningModule):
             return
         
         if not hasattr(self, outputs_attr):
-            if self.trainer.is_global_zero:
-                self._logger.warning("No output buffer for phase '%s' (%s)", phase, outputs_attr)
-            return
-            
+            raise AttributeError(f"Missing output buffer for phase '{phase}' ({outputs_attr})")
+
         outputs = getattr(self, outputs_attr)
         if not outputs:
-            if self.trainer.is_global_zero:
-                self._logger.warning("Phase '%s' outputs are empty (likely sanity check)", phase)
-            return
-        
-        try:
-            # Gather tensors
-            all_predictions = []
-            all_targets = []
-            
-            for output in outputs:
-                all_predictions.append(output['predictions'])
-                all_targets.append(output['targets'])
-            
-            # Concatenate along the batch dimension
-            predictions = torch.cat(all_predictions, dim=0)  # [N, genes]
-            targets = torch.cat(all_targets, dim=0)  # [N, genes]
-            
-            self._logger.info(f"Phase {phase}: collected {predictions.shape[0]} samples, {predictions.shape[1]} genes")
-            
-            # Compute PCC metrics (raw token counts -> log2)
-            pcc_metrics = self.model_metrics.calculate_comprehensive_pcc_metrics(predictions, targets, apply_log2=True)
-            
-            # Log metrics
-            total_samples = predictions.shape[0]
-            for metric_name, value in pcc_metrics.items():
-                self.log(f'{phase}_{metric_name}', value, 
-                        on_epoch=True, 
-                        prog_bar=False, 
-                        batch_size=total_samples,
-                        sync_dist=True)
-            
-            # Print detailed results on rank zero
-            if self.trainer.is_global_zero:
-                phase_loss = float(self.trainer.callback_metrics.get(f'{phase}_loss', 0.0))
-                self._logger.info(
-                    "Epoch %s %s summary: loss=%.6f pcc10=%.4f pcc50=%.4f pcc200=%.4f mse=%.6f mae=%.6f rvd=%.6f",
-                    self.current_epoch,
-                    phase.upper(),
-                    phase_loss,
-                    pcc_metrics['pcc_10'],
-                    pcc_metrics['pcc_50'],
-                    pcc_metrics['pcc_200'],
-                    pcc_metrics['mse'],
-                    pcc_metrics['mae'],
-                    pcc_metrics['rvd'],
-                )
+            if hasattr(self.trainer, 'sanity_checking') and self.trainer.sanity_checking:
+                return
+            raise ValueError(f"Phase '{phase}' outputs are empty")
 
-            # Clear buffer
-            outputs.clear()
-            
-        except Exception as e:
-            self._logger.error(f"Failed to compute PCC metrics for phase '{phase}': {e}")
-            import traceback
-            traceback.print_exc()
+        # Gather tensors
+        all_predictions = []
+        all_targets = []
+
+        for output in outputs:
+            all_predictions.append(output['predictions'])
+            all_targets.append(output['targets'])
+
+        # Concatenate along the batch dimension
+        predictions = torch.cat(all_predictions, dim=0)  # [N, genes]
+        targets = torch.cat(all_targets, dim=0)  # [N, genes]
+
+        # DDP: gather across ranks and compute metrics on rank 0 only
+        if self.trainer.world_size > 1:
+            predictions = self.all_gather(predictions.to(self.device))
+            targets = self.all_gather(targets.to(self.device))
+            if self.trainer.is_global_zero:
+                predictions = predictions.reshape(-1, predictions.shape[-1]).cpu()
+                targets = targets.reshape(-1, targets.shape[-1]).cpu()
+            else:
+                outputs.clear()
+                return
+
+        self._logger.info("Phase %s: collected %s samples, %s genes", phase, predictions.shape[0], predictions.shape[1])
+
+        # Compute PCC metrics (raw token counts -> log2)
+        pcc_metrics = self.model_metrics.calculate_comprehensive_pcc_metrics(predictions, targets, apply_log2=True)
+
+        # Log metrics
+        total_samples = predictions.shape[0]
+        for metric_name, value in pcc_metrics.items():
+            self.log(f'{phase}_{metric_name}', value,
+                     on_epoch=True,
+                     prog_bar=False,
+                     batch_size=total_samples,
+                     sync_dist=False)
+
+        # Print detailed results on rank zero
+        if self.trainer.is_global_zero:
+            phase_loss_key = f'{phase}_loss_final'
+            if phase_loss_key not in self.trainer.callback_metrics:
+                raise KeyError(f"Missing metric in callback_metrics: {phase_loss_key}")
+            phase_loss = float(self.trainer.callback_metrics[phase_loss_key])
+            self._logger.info(
+                "Epoch %s %s summary: loss=%.6f pcc10=%.4f pcc50=%.4f pcc200=%.4f mse=%.6f mae=%.6f rvd=%.6f",
+                self.current_epoch,
+                phase.upper(),
+                phase_loss,
+                pcc_metrics['pcc_10'],
+                pcc_metrics['pcc_50'],
+                pcc_metrics['pcc_200'],
+                pcc_metrics['mse'],
+                pcc_metrics['mae'],
+                pcc_metrics['rvd'],
+            )
+
+        # Clear buffer
+        outputs.clear()
 
     def manual_inference_step(self, batch: Dict[str, torch.Tensor], phase: str = 'test') -> Dict[str, torch.Tensor]:
         """Run inference outside of the Lightning trainer while reusing internal logic."""
@@ -405,16 +411,3 @@ class ModelInterface(pl.LightningModule):
             return
         
         self._logger.info("Training finished")
-
-
-
-
-
-    def on_before_optimizer_step(self, optimizer):
-        """Hook executed before each optimizer step."""
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.parameters(), 
-            self.trainer.gradient_clip_val
-        )
-        
-        self.log('grad_norm', grad_norm, sync_dist=True)

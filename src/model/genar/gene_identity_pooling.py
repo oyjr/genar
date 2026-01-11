@@ -48,8 +48,7 @@ class GeneIdentityPooling(nn.Module):
         self.enable_pooling = enable_pooling
         
         if not enable_pooling:
-            logger.info("Gene Identity Pooling disabled; falling back to original behaviour")
-            return
+            raise ValueError("Gene Identity Pooling cannot be disabled in strict mode")
         
         # Create pooling layers for intermediate scales only
         # Skip the last scale (final gene scale) as it uses original gene identities
@@ -106,13 +105,6 @@ class GeneIdentityPooling(nn.Module):
         """
         scale_dim = self.scale_dims[scale_idx]
         
-        # Safety check: if pooling is disabled, only return for final scale
-        if not self.enable_pooling:
-            if scale_dim == self.num_genes:
-                return gene_identity_embedding.weight  # [200, 512]
-            else:
-                return None  # Signal to skip modulation
-        
         # Final scale: use original gene identities
         if scale_dim == self.num_genes:
             return gene_identity_embedding.weight  # [200, 512]
@@ -120,8 +112,7 @@ class GeneIdentityPooling(nn.Module):
         # Intermediate scales: generate pooled representations
         pooler_key = f'scale_{scale_idx}'
         if pooler_key not in self.scale_poolers:
-            logger.warning(f"No pooler found for scale {scale_idx}, skipping modulation")
-            return None
+            raise ValueError(f"No pooler found for scale {scale_idx}")
         
         # Get full gene identities and pool them
         full_identities = gene_identity_embedding.weight  # [200, 512]
@@ -188,10 +179,8 @@ class GeneIdentityPooling(nn.Module):
     
     def enable(self):
         """Enable gene identity pooling"""
-        self.enable_pooling = True
-        logger.info("Gene Identity Pooling enabled")
+        raise RuntimeError("Gene Identity Pooling cannot be enabled/disabled at runtime in strict mode")
     
     def disable(self):
-        """Disable gene identity pooling (fallback to original behavior)"""
-        self.enable_pooling = False
-        logger.info("Gene Identity Pooling disabled")
+        """Disable gene identity pooling (unsupported in strict mode)"""
+        raise RuntimeError("Gene Identity Pooling cannot be enabled/disabled at runtime in strict mode")

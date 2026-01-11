@@ -175,81 +175,102 @@ class ModelUtils:
 
     def scale_learning_rate(self, base_lr: float) -> float:
         """Scale learning rate according to batch size and device count."""
-        try:
-            # Base batch size
-            batch_size = self.get_config('DATA.batch_size', 32)
-            
-            # Number of devices
-            num_gpus = 1
-            if hasattr(self.lightning_module.trainer, 'num_devices'):
-                num_gpus = self.lightning_module.trainer.num_devices
-            elif hasattr(self.lightning_module.trainer, 'gpus'):
-                if isinstance(self.lightning_module.trainer.gpus, int):
-                    num_gpus = self.lightning_module.trainer.gpus
-                elif isinstance(self.lightning_module.trainer.gpus, (list, tuple)):
-                    num_gpus = len(self.lightning_module.trainer.gpus)
-            
-            # Effective batch size
-            effective_batch_size = batch_size * num_gpus
-            
-            # Linear scaling rule: lr = base_lr * (effective / base)
-            base_batch_size = 32
-            scaled_lr = base_lr * (effective_batch_size / base_batch_size)
-            
-            self._logger.info(f"Learning rate scaled: {base_lr:.6f} -> {scaled_lr:.6f} "
-                            f"(batch_size={batch_size}, num_devices={num_gpus})")
-            
-            return scaled_lr
-            
-        except Exception as e:
-            self._logger.warning(f"LR scaling failed: {e}; using base LR")
-            return base_lr
+        # Base batch size
+        batch_size = self.get_config('DATA.train_dataloader.batch_size')
+        if batch_size is None:
+            raise ValueError("Missing DATA.train_dataloader.batch_size in config")
+
+        if not hasattr(self.lightning_module, 'trainer') or self.lightning_module.trainer is None:
+            raise RuntimeError("Trainer is not attached; cannot scale learning rate")
+
+        if not hasattr(self.lightning_module.trainer, 'world_size'):
+            raise RuntimeError("Trainer is missing world_size; cannot scale learning rate")
+
+        num_devices = self.lightning_module.trainer.world_size
+
+        # Effective batch size
+        effective_batch_size = batch_size * num_devices
+
+        # Linear scaling rule: lr = base_lr * (effective / base)
+        base_batch_size = 32
+        scaled_lr = base_lr * (effective_batch_size / base_batch_size)
+
+        self._logger.info("Learning rate scaled: %.6f -> %.6f (batch_size=%s, num_devices=%s)",
+                          base_lr, scaled_lr, batch_size, num_devices)
+
+        return scaled_lr
 
     def get_scheduler_config(self, optimizer):
         """Return the LR scheduler configuration dictionary."""
-        scheduler_config = self.get_config('OPTIMIZER.scheduler', {})
-        
-        if not scheduler_config:
+        scheduler_config = self.get_config('TRAINING.lr_scheduler')
+        if scheduler_config is None:
+            raise ValueError("Missing TRAINING.lr_scheduler in config")
+
+        if isinstance(scheduler_config, dict):
+            scheduler_name = scheduler_config.get('name')
+            patience = scheduler_config.get('patience')
+            factor = scheduler_config.get('factor')
+            monitor = scheduler_config.get('monitor')
+            mode = scheduler_config.get('mode', 'min')
+            interval = scheduler_config.get('interval', 'epoch')
+            frequency = scheduler_config.get('frequency', 1)
+            t_max = scheduler_config.get('T_max')
+            eta_min = scheduler_config.get('eta_min')
+            step_size = scheduler_config.get('step_size')
+            gamma = scheduler_config.get('gamma')
+        else:
+            scheduler_name = getattr(scheduler_config, 'name', None)
+            patience = getattr(scheduler_config, 'patience', None)
+            factor = getattr(scheduler_config, 'factor', None)
+            monitor = getattr(scheduler_config, 'monitor', None)
+            mode = getattr(scheduler_config, 'mode', 'min')
+            interval = getattr(scheduler_config, 'interval', 'epoch')
+            frequency = getattr(scheduler_config, 'frequency', 1)
+            t_max = getattr(scheduler_config, 'T_max', None)
+            eta_min = getattr(scheduler_config, 'eta_min', None)
+            step_size = getattr(scheduler_config, 'step_size', None)
+            gamma = getattr(scheduler_config, 'gamma', None)
+
+        if patience is None:
+            raise ValueError("TRAINING.lr_scheduler.patience must be set")
+        if patience < 0:
+            raise ValueError("TRAINING.lr_scheduler.patience must be >= 0")
+        if patience == 0:
             return None
-            
-        try:
-            scheduler_name = scheduler_config.get('name', 'cosine')
-            
-            if scheduler_name == 'cosine':
-                from torch.optim.lr_scheduler import CosineAnnealingLR
-                T_max = scheduler_config.get('T_max', 100)
-                eta_min = scheduler_config.get('eta_min', 0)
-                scheduler = CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min)
-                
-            elif scheduler_name == 'step':
-                from torch.optim.lr_scheduler import StepLR
-                step_size = scheduler_config.get('step_size', 30)
-                gamma = scheduler_config.get('gamma', 0.1)
-                scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
-                
-            elif scheduler_name == 'reduce_on_plateau':
-                from torch.optim.lr_scheduler import ReduceLROnPlateau
-                mode = scheduler_config.get('mode', 'min')
-                factor = scheduler_config.get('factor', 0.5)
-                patience = scheduler_config.get('patience', 10)
-                scheduler = ReduceLROnPlateau(optimizer, mode=mode, factor=factor, patience=patience)
-                
-                return {
-                    'scheduler': scheduler,
-                    'monitor': scheduler_config.get('monitor', 'val_loss'),
-                    'interval': 'epoch',
-                    'frequency': 1
-                }
-            else:
-                self._logger.warning(f"Unsupported scheduler: {scheduler_name}")
-                return None
-                
+        if scheduler_name is None:
+            raise ValueError("TRAINING.lr_scheduler.name must be set when patience > 0")
+
+        if scheduler_name == 'cosine':
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+            if t_max is None:
+                raise ValueError("TRAINING.lr_scheduler.T_max must be set for cosine scheduler")
+            if eta_min is None:
+                raise ValueError("TRAINING.lr_scheduler.eta_min must be set for cosine scheduler")
+            scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+        elif scheduler_name == 'step':
+            from torch.optim.lr_scheduler import StepLR
+            if step_size is None or gamma is None:
+                raise ValueError("TRAINING.lr_scheduler.step_size and gamma must be set for step scheduler")
+            scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
+        elif scheduler_name == 'reduce_on_plateau':
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+            if factor is None:
+                raise ValueError("TRAINING.lr_scheduler.factor must be set for reduce_on_plateau")
+            scheduler = ReduceLROnPlateau(optimizer, mode=mode, factor=factor, patience=patience)
+
+            if monitor is None:
+                raise ValueError("TRAINING.lr_scheduler.monitor must be set for reduce_on_plateau")
             return {
                 'scheduler': scheduler,
-                'interval': scheduler_config.get('interval', 'epoch'),
-                'frequency': scheduler_config.get('frequency', 1)
+                'monitor': monitor,
+                'interval': interval,
+                'frequency': frequency
             }
-            
-        except Exception as e:
-            self._logger.error(f"Failed to create LR scheduler: {e}")
-            return None 
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+
+        return {
+            'scheduler': scheduler,
+            'interval': interval,
+            'frequency': frequency
+        }

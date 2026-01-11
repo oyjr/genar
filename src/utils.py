@@ -12,8 +12,10 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 def fix_seed(seed):
     """Fix random seeds across common frameworks."""
+    if seed is None:
+        raise ValueError("Seed must not be None")
     if isinstance(seed, dict):
-        seed = seed.get('seed', 42)  # If a dict is passed, fall back to `seed`
+        raise ValueError("Seed must be an int, not a dict")
     seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)

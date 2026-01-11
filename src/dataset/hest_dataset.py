@@ -163,12 +163,13 @@ class STDataset(Dataset):
         # Normalise positional coordinates if available
         if 'spatial' in adata.obsm:
             coords = adata.obsm['spatial'].copy()
-            coords = (coords - coords.min(axis=0)) / (coords.max(axis=0) - coords.min(axis=0))
+            denom = coords.max(axis=0) - coords.min(axis=0)
+            if np.any(denom == 0):
+                raise ValueError(f"Zero-range spatial coordinates for slide {slide_id}")
+            coords = (coords - coords.min(axis=0)) / denom
             adata.obsm['positions'] = coords
         elif 'positions' not in adata.obsm:
-            # Fallback to random coordinates when missing
-            import numpy as np
-            adata.obsm['positions'] = np.random.rand(adata.n_obs, 2)
+            raise ValueError(f"Missing spatial/positions coordinates for slide {slide_id}")
         
         return adata
 

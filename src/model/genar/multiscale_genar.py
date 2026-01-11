@@ -97,9 +97,7 @@ class GeneGroupUpsampling(nn.Module):
     def forward(self, source_embeddings: torch.Tensor, source_scale_idx: int, target_scale_idx: int):
         """Group-aware upsampling between scales."""
         if source_embeddings is None:
-            target_dim = self.scale_dims[target_scale_idx]
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            return torch.zeros(1, target_dim, self.embed_dim, device=device)
+            raise ValueError("source_embeddings must not be None for upsampling")
         
         B, source_dim, embed_dim = source_embeddings.shape
         target_dim = self.scale_dims[target_scale_idx]
@@ -107,8 +105,7 @@ class GeneGroupUpsampling(nn.Module):
         # Lookup the precomputed mapping
         mapping_key = f'scale_{source_scale_idx}_to_{target_scale_idx}'
         if mapping_key not in self.group_mappings:
-            # Fallback to interpolation for non-adjacent scales
-            return self._interpolate_upsample(source_embeddings, target_dim)
+            raise ValueError(f"Missing group mapping for {mapping_key}")
         
         mapping = self.group_mappings[mapping_key]
         
@@ -133,7 +130,7 @@ class GeneGroupUpsampling(nn.Module):
         return upsampled
     
     def _interpolate_upsample(self, source_embeddings, target_dim):
-        """Interpolation-based fallback upsampling."""
+        """Interpolation-based upsampling for non-adjacent scales."""
         _, source_dim, _ = source_embeddings.shape
         
         if source_dim == 1:
@@ -257,7 +254,7 @@ class MultiScaleGenAR(nn.Module):
             num_genes=num_genes,
             scale_dims=scale_dims,
             embed_dim=embed_dim,
-            enable_pooling=True  # Can be set to False to disable and fallback to original behavior
+            enable_pooling=True  # Required in strict mode
         )
         
         # NEW: Gene group upsampling module for intelligent target position initialization
@@ -296,7 +293,7 @@ class MultiScaleGenAR(nn.Module):
         logger.info("   - Scale Embedding Storage: progressive information transfer")
         logger.info("   - Weighted Identity Fusion: final scale mixes upsampling + identities")
         logger.info("   - Multi-Scale Gene Modulation: pooling enabled across scales")
-        logger.info("   - Conservative Design: feature flags allow fallback to baseline")
+        logger.info("   - Conservative Design: feature flags fixed in strict mode")
         
         # Scale embedding to distinguish different scales
         self.scale_embedding = nn.Embedding(self.num_scales, embed_dim)
@@ -404,6 +401,8 @@ class MultiScaleGenAR(nn.Module):
         hierarchical_targets = []
 
         # Ensure target_genes is float for pooling operations
+        if torch.any(target_genes < 0) or torch.any(target_genes >= self.vocab_size):
+            raise ValueError("Target genes are out of vocabulary range")
         target_genes_float = target_genes.float().unsqueeze(1) # -> [B, 1, 200]
 
         for _, dim in enumerate(self.scale_dims):
@@ -417,20 +416,13 @@ class MultiScaleGenAR(nn.Module):
                 pooled_targets = F.adaptive_avg_pool1d(target_genes_float, output_size=dim)
                 pooled_targets = pooled_targets.squeeze(1) # -> [B, dim]
                 
+                if pooled_targets.min() < 0 or pooled_targets.max() > (self.vocab_size - 1):
+                    raise ValueError("Pooled targets out of vocabulary range")
+
                 # Generate soft labels: floor + ceil + interpolation weight
                 floor_targets = torch.floor(pooled_targets).long()
                 ceil_targets = torch.ceil(pooled_targets).long()
                 weights = pooled_targets - floor_targets.float()  # Interpolation weights [0.0, 1.0]
-                
-                # Handle boundary conditions to ensure valid vocab indices
-                floor_targets = torch.clamp(floor_targets, 0, self.vocab_size - 1)
-                ceil_targets = torch.clamp(ceil_targets, 0, self.vocab_size - 1)
-                
-                # Special case: when ceil would exceed vocab boundary, merge weight into floor
-                boundary_mask = ceil_targets >= self.vocab_size
-                if boundary_mask.any():
-                    weights = torch.where(boundary_mask, torch.zeros_like(weights), weights)
-                    ceil_targets = torch.where(boundary_mask, floor_targets, ceil_targets)
                 
                 soft_target = {
                     'floor_targets': floor_targets,
@@ -459,6 +451,8 @@ class MultiScaleGenAR(nn.Module):
             torch.Tensor: Gaussian target distribution, shape [B, seq_len, vocab_size]
         """
         vocab_size = self.vocab_size
+        if torch.any(target < 0) or torch.any(target >= vocab_size):
+            raise ValueError("Target values are out of vocabulary range")
         
         # Create vocabulary indices tensor [vocab_size]
         vocab_indices = torch.arange(vocab_size, device=device, dtype=torch.float32)
@@ -471,8 +465,8 @@ class MultiScaleGenAR(nn.Module):
         # This allows high expression genes to have larger tolerance
         sigma = self.adaptive_sigma_alpha * mu + self.adaptive_sigma_beta
         
-        # Ensure numerical stability by clamping sigma to reasonable bounds
-        sigma = torch.clamp(sigma, min=1e-6, max=100.0)  # Prevent extreme values
+        if torch.any(sigma <= 0):
+            raise ValueError("Adaptive sigma must be positive")
         # --- END ADAPTIVE SIGMA ---
         
         # Expand vocab_indices to [1, 1, vocab_size] for broadcasting
@@ -484,23 +478,16 @@ class MultiScaleGenAR(nn.Module):
         squared_diff = (x - mu) ** 2
         gaussian_unnormalized = torch.exp(-squared_diff / (2 * sigma ** 2))
         
-        # Handle potential numerical issues
-        gaussian_unnormalized = torch.clamp(gaussian_unnormalized, min=1e-10, max=1.0)
-        
         # Normalize to create valid probability distribution
         # Sum over vocab dimension and ensure non-zero normalization
         normalization_factor = gaussian_unnormalized.sum(dim=-1, keepdim=True)
-        normalization_factor = torch.clamp(normalization_factor, min=1e-10)
+        if torch.any(normalization_factor == 0):
+            raise ValueError("Normalization factor is zero in Gaussian target distribution")
         
         target_dist = gaussian_unnormalized / normalization_factor
         
-        # Final verification and fallback
         if torch.isnan(target_dist).any() or torch.isinf(target_dist).any():
-            logger.warning("NaN or Inf detected in adaptive Gaussian target distribution, using uniform fallback")
-            # Fallback to uniform distribution around the target
-            target_dist = torch.zeros_like(gaussian_unnormalized)
-            target_indices = target.long().unsqueeze(-1)  # [B, seq_len, 1]
-            target_dist.scatter_(-1, target_indices, 1.0)
+            raise ValueError("NaN or Inf detected in adaptive Gaussian target distribution")
         
         return target_dist
 
@@ -528,18 +515,14 @@ class MultiScaleGenAR(nn.Module):
             # Compute log probabilities for KL divergence
             log_probs = F.log_softmax(logits, dim=-1)  # [B, seq_len, vocab_size]
             
-            # Additional numerical stability checks
             if torch.isinf(log_probs).any():
-                logger.warning("Inf detected in log probabilities for final scale, clipping values")
-                log_probs = torch.clamp(log_probs, min=-50.0, max=50.0)
+                raise ValueError("Inf detected in log probabilities for final scale")
             
             # Compute KL divergence: KL(target_dist || predicted_dist)
             kl_loss = F.kl_div(log_probs, target_dist, reduction='batchmean', log_target=False)
             
-            # Final sanity check and fallback
             if torch.isnan(kl_loss) or torch.isinf(kl_loss):
-                logger.warning("Invalid KL loss detected for final scale, falling back to cross-entropy")
-                return F.cross_entropy(logits.reshape(-1, self.vocab_size), target.reshape(-1))
+                raise ValueError("Invalid KL loss detected for final scale")
             
             return kl_loss
         
@@ -580,29 +563,23 @@ class MultiScaleGenAR(nn.Module):
             ceil_probs = weights * ceil_mask.float()  # [B, target_seq_len]
             target_dist[batch_indices, seq_indices, ceil_targets] = ceil_probs
         
-        # Add small epsilon for numerical stability and ensure valid probability distribution
-        eps = 1e-8
-        target_dist = target_dist + eps
-        target_dist = target_dist / target_dist.sum(dim=-1, keepdim=True)  # Renormalize
-        
-        # Additional numerical stability checks
+        dist_sum = target_dist.sum(dim=-1, keepdim=True)
+        if torch.any(dist_sum == 0):
+            raise ValueError("Target distribution sums to zero")
+        if not torch.allclose(dist_sum, torch.ones_like(dist_sum)):
+            raise ValueError("Target distribution does not sum to 1")
         if torch.isnan(target_dist).any():
-            logger.warning("NaN detected in target distribution, falling back to hard labels")
-            # Fallback to hard cross-entropy with floor targets
-            return F.cross_entropy(logits.reshape(-1, self.vocab_size), floor_targets.reshape(-1))
-        
+            raise ValueError("NaN detected in target distribution")
+
         if torch.isinf(log_probs).any():
-            logger.warning("Inf detected in log probabilities, clipping values")
-            log_probs = torch.clamp(log_probs, min=-50.0, max=50.0)
+            raise ValueError("Inf detected in log probabilities")
         
         # Compute KL divergence: KL(target_dist || predicted_dist)
         # Note: PyTorch's kl_div expects log_probs as first argument and target as second
         kl_loss = F.kl_div(log_probs, target_dist, reduction='batchmean', log_target=False)
         
-        # Final sanity check on loss value
         if torch.isnan(kl_loss) or torch.isinf(kl_loss):
-            logger.warning("Invalid KL loss detected, falling back to cross-entropy")
-            return F.cross_entropy(logits.reshape(-1, self.vocab_size), floor_targets.reshape(-1))
+            raise ValueError("Invalid KL loss detected")
         
         return kl_loss
 
@@ -763,20 +740,15 @@ class MultiScaleGenAR(nn.Module):
                 device=device
             )
             
-            if scale_conditions is not None:
-                # Apply FiLM modulation
-                x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
-                
-                if scale_dim == self.num_genes:
-                    logger.debug(f"Applied FiLM modulation for {self.num_genes} genes (final scale)")
-                else:
-                    logger.debug(f"Applied FiLM modulation for scale {scale_idx} (dim={scale_dim})")
+            if scale_conditions is None:
+                raise ValueError(f"Missing gene identity conditions for scale {scale_idx}")
+
+            # Apply FiLM modulation
+            x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
+            if scale_dim == self.num_genes:
+                logger.debug(f"Applied FiLM modulation for {self.num_genes} genes (final scale)")
             else:
-                # Fallback: original behavior for final scale only
-                if scale_dim == self.num_genes:
-                    identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
-                    x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
-                    logger.debug(f"Applied FiLM modulation for {self.num_genes} genes (final scale - fallback)")
+                logger.debug(f"Applied FiLM modulation for scale {scale_idx} (dim={scale_dim})")
             
             logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
 
@@ -901,14 +873,11 @@ class MultiScaleGenAR(nn.Module):
                 device=device
             )
             
-            if scale_conditions is not None:
-                # Apply FiLM modulation
-                x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
-            else:
-                # Fallback: original behavior for final scale only
-                if scale_dim == self.num_genes:
-                    identity_conditions = self.gene_identity_embedding.weight.unsqueeze(0).expand(B, -1, -1)
-                    x_for_prediction = self.film_layer(x_for_prediction, identity_conditions)
+            if scale_conditions is None:
+                raise ValueError(f"Missing gene identity conditions for scale {scale_idx}")
+
+            # Apply FiLM modulation
+            x_for_prediction = self.film_layer(x_for_prediction, scale_conditions)
             
             logits = self.output_head(x_for_prediction) # Shape: [B, scale_dim, vocab_size]
             
@@ -1106,13 +1075,11 @@ class MultiScaleGenAR(nn.Module):
     
     def enable_multi_scale_gene_modulation(self):
         """Enable multi-scale gene identity modulation"""
-        self.gene_identity_pooling.enable()
-        logger.info("Multi-scale gene identity modulation enabled")
+        raise RuntimeError("Multi-scale gene identity modulation cannot be toggled in strict mode")
 
     def disable_multi_scale_gene_modulation(self):
-        """Disable multi-scale gene identity modulation (fallback to original behavior)"""
-        self.gene_identity_pooling.disable()
-        logger.info("Multi-scale gene identity modulation disabled; using original behaviour")
+        """Disable multi-scale gene identity modulation (unsupported in strict mode)"""
+        raise RuntimeError("Multi-scale gene identity modulation cannot be toggled in strict mode")
 
     def _compute_weighted_cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Distance-aware cross-entropy where nearer tokens incur smaller penalties."""

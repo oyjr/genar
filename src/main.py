@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 # Project modules
 from dataset.hest_dataset import STDataset
 from model import ModelInterface
+from configs import DATASETS, DEFAULT_DATA_ROOT, ENCODER_FEATURE_DIMS
 from utils import (
     load_callbacks,
     load_loggers,
@@ -30,49 +31,6 @@ logging.getLogger('model.model_utils').setLevel(logging.INFO)
 torch.set_float32_matmul_precision('high')
 warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*")
 
-
-# Encoder feature dimensions per backbone
-ENCODER_FEATURE_DIMS = {
-    'uni': 1024,
-    'conch': 512,
-    'resnet18': 512,
-}
-
-DEFAULT_DATA_ROOT = os.environ.get('GENAR_DATA_ROOT', './data')
-
-# Dataset configuration including recommended validation/test slides
-DATASETS = {
-    'PRAD': {
-        'dir_name': 'PRAD',
-        'val_slides': 'MEND145',
-        'test_slides': 'MEND145',
-        'recommended_encoder': 'uni'
-    },
-    'her2st': {
-        'dir_name': 'her2st',
-        'val_slides': 'SPA148',
-        'test_slides': 'SPA148',
-        'recommended_encoder': 'uni'
-    },
-    'kidney': {
-        'dir_name': 'kidney',
-        'val_slides': 'NCBI697',
-        'test_slides': 'NCBI697',
-        'recommended_encoder': 'uni'
-    },
-    'mouse_brain': {
-        'dir_name': 'mouse_brain',
-        'val_slides': 'NCBI667',
-        'test_slides': 'NCBI667',
-        'recommended_encoder': 'uni'
-    },
-    'ccRCC': {
-        'dir_name': 'ccRCC',
-        'val_slides': 'INT2',
-        'test_slides': 'INT2',
-        'recommended_encoder': 'uni'
-    }
-}
 
 # GenAR model configuration
 GENAR_CONFIG = {
@@ -158,6 +116,9 @@ DEFAULT_CONFIG = {
         'mode': 'min',
         'monitor': 'train_loss_final',
         'lr_scheduler': {
+            'name': 'reduce_on_plateau',
+            'monitor': 'train_loss_final',
+            'mode': 'min',
             'patience': 0,  # Disabled by default; opt-in via CLI
             'factor': 0.5
         },
@@ -179,6 +140,9 @@ DEFAULT_CONFIG = {
         'learning_rate_monitor': {
             'logging_interval': 'epoch'
         }
+    },
+    'INFERENCE': {
+        'top_k': 1
     },
     'MULTI_GPU': {
         'find_unused_parameters': False,  # No unused params in the new design
@@ -277,10 +241,9 @@ def build_config_from_args(args):
     """Build the runtime configuration from parsed arguments."""
     from addict import Dict
 
-    # Fall back to the legacy config flow when a YAML config is provided
+    # Legacy config files are not supported in this strict mode
     if args.config:
-        logger.warning("Switching to legacy config-file mode")
-        return None
+        raise ValueError("Legacy --config is not supported; use --dataset and CLI overrides")
 
     # Required parameters
     if not args.dataset:
@@ -306,7 +269,7 @@ def build_config_from_args(args):
     data_root = os.path.abspath(args.data_root)
     dataset_path = os.path.join(data_root, dataset_info['dir_name'])
     if not os.path.exists(dataset_path):
-        logger.warning("Dataset path does not exist: %s", dataset_path)
+        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
 
     model_info = deepcopy(MODEL_CONFIGS[model_name])
 
@@ -373,8 +336,13 @@ def build_config_from_args(args):
     if batch_size:
         config.DATA.train_dataloader.batch_size = batch_size
     if args.patience is not None:
+        if args.patience < 0:
+            raise ValueError("`--patience` must be >= 0")
         # Enable LR scheduler only when patience is explicitly set
         config.TRAINING.lr_scheduler.patience = args.patience
+        config.TRAINING.lr_scheduler.name = 'reduce_on_plateau'
+        config.TRAINING.lr_scheduler.monitor = config.TRAINING.monitor
+        config.TRAINING.lr_scheduler.mode = config.TRAINING.mode
         # Mirror the patience value into the early stopping callback
         if args.patience == 0:
             # Setting zero keeps early stopping disabled
@@ -423,6 +391,8 @@ def build_config_from_args(args):
     monitor_metric = 'train_loss_final'
     config.TRAINING.monitor = monitor_metric
     config.TRAINING.mode = 'min'
+    config.TRAINING.lr_scheduler.monitor = config.TRAINING.monitor
+    config.TRAINING.lr_scheduler.mode = config.TRAINING.mode
     config.CALLBACKS.early_stopping.monitor = monitor_metric
     config.CALLBACKS.early_stopping.mode = 'min'
     config.CALLBACKS.model_checkpoint.monitor = monitor_metric
@@ -482,10 +452,10 @@ def create_dataloaders(config):
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config.DATA.val_dataloader.batch_size,
-        shuffle=False,
-        num_workers=config.DATA.val_dataloader.num_workers,
-        pin_memory=config.DATA.val_dataloader.pin_memory
+        batch_size=config.DATA.test_dataloader.batch_size,
+        shuffle=config.DATA.test_dataloader.shuffle,
+        num_workers=config.DATA.test_dataloader.num_workers,
+        pin_memory=config.DATA.test_dataloader.pin_memory
     )
     
     return train_loader, val_loader, test_loader
@@ -534,6 +504,11 @@ def main(config):
     accumulate_grad_batches = getattr(config.MULTI_GPU, 'accumulate_grad_batches', 1)
     
     # Trainer configuration
+    if config.devices < 1:
+        raise ValueError("`--gpus` must be >= 1; CPU training is not supported in strict mode")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training; no GPU is available")
+
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=config.devices,
@@ -567,5 +542,6 @@ if __name__ == '__main__':
     
     # Build configuration and run
     config = build_config_from_args(args)
+    fix_seed(config.GENERAL.seed)
 
     main(config)

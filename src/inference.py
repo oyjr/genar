@@ -15,13 +15,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 import numpy as np
 import pandas as pd
-import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
 # Project modules
 from dataset.hest_dataset import STDataset
 from model import ModelInterface
 from model.model_metrics import ModelMetrics
+from configs import DATASETS, DEFAULT_DATA_ROOT, ENCODER_FEATURE_DIMS
 from utils import fix_seed
 
 # Configure logging
@@ -31,31 +31,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*")
-
-# Dataset configuration
-DEFAULT_DATA_ROOT = os.environ.get('GENAR_DATA_ROOT', './data')
-DATASETS = {
-    'PRAD': {
-        'dir_name': 'PRAD',
-        'val_slides': 'MEND144',
-        'test_slides': 'MEND144',
-        'recommended_encoder': 'uni'
-    },
-    'her2st': {
-        'dir_name': 'her2st',
-        'val_slides': 'SPA148',
-        'test_slides': 'SPA148',
-        'recommended_encoder': 'conch'
-    }
-}
-
-# Encoder feature dimensions
-ENCODER_FEATURE_DIMS = {
-    'uni': 1024,
-    'conch': 512,
-    'resnet18': 512,
-}
-
 
 def parse_args():
     """Parse command-line arguments for inference."""
@@ -74,7 +49,7 @@ Example:
     parser.add_argument('--ckpt_path', type=str, required=True,
                         help='Model checkpoint to load')
     parser.add_argument('--dataset', type=str, required=True, choices=list(DATASETS.keys()),
-                        help='Dataset name (PRAD or her2st)')
+                        help='Dataset name')
     parser.add_argument('--slide_id', type=str, required=True,
                         help='Slide identifier to evaluate (e.g. MEND144)')
 
@@ -83,15 +58,15 @@ Example:
                         help='Root directory containing dataset folders '
                              '(default: $GENAR_DATA_ROOT or ./data)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
-                        help='Encoder type (defaults to the dataset recommendation)')
+                        help='Encoder type; must match the checkpoint if provided')
     parser.add_argument('--output_dir', type=str, default='./inference_results',
                         help='Output directory for all artifacts')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='GPU index to use (set -1 for CPU)')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Inference batch size (default: 64)')
-    parser.add_argument('--max_gene_count', type=int, default=500,
-                        help='Maximum gene count value (default: 500)')
+    parser.add_argument('--max_gene_count', type=int, default=None,
+                        help='Maximum gene count value; must match the checkpoint if provided')
     parser.add_argument('--seed', type=int, default=2021,
                         help='Random seed (default: 2021)')
     parser.add_argument('--save_predictions', action='store_true',
@@ -106,12 +81,12 @@ def setup_device(gpu_id: int):
         device = torch.device('cpu')
         logger.info("Running inference on CPU")
     else:
-        if torch.cuda.is_available():
-            device = torch.device(f'cuda:{gpu_id}')
-            logger.info(f"Running inference on GPU {gpu_id}")
-        else:
-            device = torch.device('cpu')
-            logger.warning("CUDA not available, falling back to CPU")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for GPU inference but is not available")
+        if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
+            raise ValueError(f"Invalid gpu_id={gpu_id}; available devices: {torch.cuda.device_count()}")
+        device = torch.device(f'cuda:{gpu_id}')
+        logger.info(f"Running inference on GPU {gpu_id}")
 
     return device
 
@@ -209,7 +184,7 @@ def run_inference(model, test_loader, device: torch.device):
     return predictions, targets, avg_loss
 
 
-def calculate_detailed_metrics(predictions: torch.Tensor, targets: torch.Tensor):
+def calculate_detailed_metrics(predictions: torch.Tensor, targets: torch.Tensor, config):
     """Compute evaluation metrics and summary statistics."""
     logger.info("Computing metrics")
 
@@ -218,13 +193,6 @@ def calculate_detailed_metrics(predictions: torch.Tensor, targets: torch.Tensor)
         predictions = predictions.numpy()
     if torch.is_tensor(targets):
         targets = targets.numpy()
-
-    # Create the helper objects expected by ModelMetrics
-    class SimpleConfig:
-        def __init__(self):
-            self.MODEL = type('obj', (object,), {'num_genes': 200})()
-
-    config = SimpleConfig()
 
     class SimpleLightningModule:
         def log(self, *args, **kwargs):
@@ -387,24 +355,15 @@ def main():
         logger.error(f"Checkpoint not found: {args.ckpt_path}")
         return
 
-    # Validate dataset choice
-    if args.dataset not in DATASETS:
-        logger.error(f"Unsupported dataset: {args.dataset}")
-        return
-
     dataset_info = DATASETS[args.dataset]
     data_root = os.path.abspath(args.data_root)
     dataset_path = os.path.join(data_root, dataset_info['dir_name'])
     if not os.path.exists(dataset_path):
-        logger.warning("Dataset path does not exist: %s", dataset_path)
+        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
 
-    # Resolve encoder selection
-    encoder_name = args.encoder or dataset_info['recommended_encoder']
-    
     logger.info("Inference configuration:")
     logger.info(f"  dataset: {args.dataset}")
     logger.info(f"  slide:   {args.slide_id}")
-    logger.info(f"  encoder: {encoder_name}")
     logger.info(f"  checkpoint: {args.ckpt_path}")
     logger.info(f"  output:  {args.output_dir}")
     
@@ -412,11 +371,28 @@ def main():
         # Load model
         model, config = load_model_from_checkpoint(args.ckpt_path, device)
         
+        if not hasattr(config, 'expr_name'):
+            raise ValueError("Checkpoint config is missing expr_name")
+        if args.dataset != config.expr_name:
+            raise ValueError(f"Dataset mismatch: checkpoint={config.expr_name} cli={args.dataset}")
+
+        if not hasattr(config, 'encoder_name'):
+            raise ValueError("Checkpoint config is missing encoder_name")
+        if args.encoder and args.encoder != config.encoder_name:
+            raise ValueError(f"Encoder mismatch: checkpoint={config.encoder_name} cli={args.encoder}")
+
+        if not hasattr(config, 'max_gene_count'):
+            raise ValueError("Checkpoint config is missing max_gene_count")
+        if args.max_gene_count is not None and args.max_gene_count != config.max_gene_count:
+            raise ValueError(
+                f"max_gene_count mismatch: checkpoint={config.max_gene_count} cli={args.max_gene_count}"
+            )
+
+        logger.info(f"  encoder: {config.encoder_name}")
+        logger.info(f"  max_gene_count: {config.max_gene_count}")
+
         # Update dataset-related configuration
         config.data_path = dataset_path
-        config.expr_name = args.dataset
-        config.encoder_name = encoder_name
-        config.max_gene_count = args.max_gene_count
         
         # Build the test dataloader
         test_loader, test_dataset = create_test_dataloader(config, args.slide_id, args.batch_size)
@@ -425,7 +401,7 @@ def main():
         predictions, targets, avg_loss = run_inference(model, test_loader, device)
         
         # Aggregate metrics
-        metrics = calculate_detailed_metrics(predictions, targets)
+        metrics = calculate_detailed_metrics(predictions, targets, config)
         
         # Print a textual report
         print_results(metrics, avg_loss)
