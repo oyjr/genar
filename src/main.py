@@ -38,34 +38,36 @@ ENCODER_FEATURE_DIMS = {
     'resnet18': 512,
 }
 
+DEFAULT_DATA_ROOT = os.environ.get('GENAR_DATA_ROOT', './data')
+
 # Dataset configuration including recommended validation/test slides
 DATASETS = {
     'PRAD': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
+        'dir_name': 'PRAD',
         'val_slides': 'MEND145',
         'test_slides': 'MEND145',
         'recommended_encoder': 'uni'
     },
     'her2st': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
+        'dir_name': 'her2st',
         'val_slides': 'SPA148',
         'test_slides': 'SPA148',
         'recommended_encoder': 'uni'
     },
     'kidney': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/kidney/',
+        'dir_name': 'kidney',
         'val_slides': 'NCBI697',
         'test_slides': 'NCBI697',
         'recommended_encoder': 'uni'
     },
     'mouse_brain': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/mouse_brain/',
+        'dir_name': 'mouse_brain',
         'val_slides': 'NCBI667',
         'test_slides': 'NCBI667',
         'recommended_encoder': 'uni'
     },
     'ccRCC': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/ccRCC/',
+        'dir_name': 'ccRCC',
         'val_slides': 'INT2',
         'test_slides': 'INT2',
         'recommended_encoder': 'uni'
@@ -216,6 +218,9 @@ Examples:
     # Core arguments
     parser.add_argument('--dataset', type=str, choices=list(DATASETS.keys()),
                         help='Dataset name (PRAD, her2st, kidney, mouse_brain, ccRCC)')
+    parser.add_argument('--data-root', type=str, default=DEFAULT_DATA_ROOT,
+                        help='Root directory containing dataset folders '
+                             '(default: $GENAR_DATA_ROOT or ./data)')
     parser.add_argument('--model', type=str, default='GENAR', choices=list(MODEL_CONFIGS.keys()),
                         help='Model type (GENAR or FOUNDATION_BASELINE, default: GENAR)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
@@ -308,6 +313,10 @@ def build_config_from_args(args):
 
     # Dataset and model metadata
     dataset_info = DATASETS[args.dataset]
+    data_root = os.path.abspath(args.data_root)
+    dataset_path = os.path.join(data_root, dataset_info['dir_name'])
+    if not os.path.exists(dataset_path):
+        logger.warning("Dataset path does not exist: %s", dataset_path)
 
     model_info = deepcopy(MODEL_CONFIGS[model_name])
 
@@ -392,7 +401,7 @@ def build_config_from_args(args):
     # Dataset-related settings
     config.mode = args.mode
     config.expr_name = args.dataset
-    config.data_path = dataset_info['path']
+    config.data_path = dataset_path
     config.slide_val = dataset_info['val_slides']
     config.slide_test = dataset_info['test_slides']
     config.encoder_name = encoder_name

@@ -61,12 +61,12 @@ class STDataset(Dataset):
         self.max_gene_count = max_gene_count
         
         # Directory layout
-        self.st_dir = f"{data_path}st"
-        self.processed_dir = f"{data_path}processed_data"
+        self.st_dir = os.path.join(data_path, 'st')
+        self.processed_dir = os.path.join(data_path, 'processed_data')
 
         # Embedding directory
         emb_suffix = "_aug" if use_augmented else ""
-        self.emb_dir = f"{self.processed_dir}/1spot_{encoder_name}_ebd{emb_suffix}"
+        self.emb_dir = os.path.join(self.processed_dir, f"spot_features_{encoder_name}{emb_suffix}")
 
         logger.debug("Initialising STDataset: mode=%s, dataset=%s, encoder=%s", mode, expr_name, encoder_name)
 

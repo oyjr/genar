@@ -8,7 +8,7 @@ Date: 2024
 import os
 import numpy as np
 import scanpy as sc
-from typing import List
+from typing import List, Optional
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -36,13 +36,35 @@ def save_gene_list(gene_list_file: str, genes: List[str]) -> None:
             f.write(f"{gene}\n")
 
 
-def load_slide_gene_expression(data_path: str, slide_id: str) -> np.ndarray:
+def _resolve_h5ad_path(data_path: str, slide_id: str, h5ad_root: Optional[str]) -> str:
+    """Resolve the path to a slide-level h5ad file."""
+    if h5ad_root:
+        return os.path.join(h5ad_root, f"{slide_id}.h5ad")
+
+    candidates = [
+        os.path.join(data_path, 'adata', f"{slide_id}.h5ad"),
+        os.path.join(data_path, 'processhest', 'adata', f"{slide_id}.h5ad"),
+        os.path.join(os.path.dirname(data_path), 'processhest', 'adata', f"{slide_id}.h5ad"),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    formatted = "\n  - ".join(candidates)
+    raise FileNotFoundError(
+        "h5ad file not found. Set GENAR_H5AD_ROOT or place the file in one of:\n"
+        f"  - {formatted}"
+    )
+
+
+def load_slide_gene_expression(
+    data_path: str,
+    slide_id: str,
+    h5ad_root: Optional[str] = None,
+) -> np.ndarray:
     """Load the [n_spots, n_genes] expression matrix for a slide."""
-    # h5ad files are stored in a shared root
-    h5ad_file = f"/data/ouyangjiarui/hest/processhest/adata/{slide_id}.h5ad"
-    
-    if not os.path.exists(h5ad_file):
-        raise FileNotFoundError(f"h5ad file not found: {h5ad_file}")
+    h5ad_file = _resolve_h5ad_path(data_path, slide_id, h5ad_root)
     
     adata = sc.read_h5ad(h5ad_file)
     

@@ -15,7 +15,7 @@ import shutil
 from datetime import datetime
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import logging
 
 from .utils import (
@@ -30,33 +30,40 @@ logger = logging.getLogger(__name__)
 class GeneClusteringProcessor:
     """Gene clustering helper used during preprocessing."""
     
-    def __init__(self, scale_dims: Tuple[int, ...] = (1, 4, 8, 40, 100, 200)):
+    def __init__(
+        self,
+        scale_dims: Tuple[int, ...] = (1, 4, 8, 40, 100, 200),
+        data_root: Optional[str] = None,
+        h5ad_root: Optional[str] = None,
+    ):
         """
         Args:
             scale_dims: Multi-scale configuration used by GenAR models
         """
         self.scale_dims = scale_dims
+        self.data_root = os.path.abspath(data_root or os.environ.get('GENAR_DATA_ROOT', './data'))
+        self.h5ad_root = h5ad_root or os.environ.get('GENAR_H5AD_ROOT')
         
         # Dataset configuration
         self.datasets = {
             'PRAD': {
-                'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
+                'dir_name': 'PRAD',
                 'val_slides': 'MEND145'
             },
             'her2st': {
-                'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
+                'dir_name': 'her2st',
                 'val_slides': 'SPA148'
             },
             'kidney': {
-                'path': '/data/ouyangjiarui/stem/hest1k_datasets/kidney/',
+                'dir_name': 'kidney',
                 'val_slides': 'NCBI697'
             },
             'mouse_brain': {
-                'path': '/data/ouyangjiarui/stem/hest1k_datasets/mouse_brain/',
+                'dir_name': 'mouse_brain',
                 'val_slides': 'NCBI667'
             },
             'ccRCC': {
-                'path': '/data/ouyangjiarui/stem/hest1k_datasets/ccRCC/',
+                'dir_name': 'ccRCC',
                 'val_slides': 'INT2'
             }
         }
@@ -68,8 +75,12 @@ class GeneClusteringProcessor:
             raise ValueError(f"Unsupported dataset: {dataset_name}")
         
         dataset_config = self.datasets[dataset_name]
-        data_path = os.path.join(dataset_config['path'], 'processed_data')
+        dataset_root = os.path.join(self.data_root, dataset_config['dir_name'])
+        data_path = os.path.join(dataset_root, 'processed_data')
         val_slide = dataset_config['val_slides']
+
+        if not os.path.exists(dataset_root):
+            logger.warning("Dataset root does not exist: %s", dataset_root)
         
         logger.info(f"Processing dataset: {dataset_name}")
         logger.info(f"   data path: {data_path}")
@@ -116,7 +127,11 @@ class GeneClusteringProcessor:
         
         for slide_id in train_slides:
             try:
-                slide_expr = load_slide_gene_expression(data_path, slide_id)
+                slide_expr = load_slide_gene_expression(
+                    data_path,
+                    slide_id,
+                    h5ad_root=self.h5ad_root,
+                )
                 logger.info(f"   {slide_id}: {slide_expr.shape[0]} spots, {slide_expr.shape[1]} genes")
                 
                 # Keep the first 200 genes

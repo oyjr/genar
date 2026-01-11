@@ -58,6 +58,22 @@ Notes:
         action='store_true',
         help='Process all datasets'
     )
+
+    parser.add_argument(
+        '--data-root',
+        type=str,
+        default=os.environ.get('GENAR_DATA_ROOT', './data'),
+        help='Root directory containing dataset folders '
+             '(default: $GENAR_DATA_ROOT or ./data)',
+    )
+
+    parser.add_argument(
+        '--h5ad-root',
+        type=str,
+        default=os.environ.get('GENAR_H5AD_ROOT'),
+        help='Root directory containing slide h5ad files '
+             '(default: $GENAR_H5AD_ROOT)',
+    )
     
     args = parser.parse_args()
     
@@ -67,7 +83,10 @@ Notes:
         return 1
     
     # Processor
-    processor = GeneClusteringProcessor()
+    processor = GeneClusteringProcessor(
+        data_root=args.data_root,
+        h5ad_root=args.h5ad_root,
+    )
     
     try:
         if args.all_datasets:

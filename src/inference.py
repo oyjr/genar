@@ -33,17 +33,18 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", message=".*TypedStorage is deprecated.*")
 
 # Dataset configuration
+DEFAULT_DATA_ROOT = os.environ.get('GENAR_DATA_ROOT', './data')
 DATASETS = {
     'PRAD': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/PRAD/',
+        'dir_name': 'PRAD',
         'val_slides': 'MEND144',
         'test_slides': 'MEND144',
         'recommended_encoder': 'uni'
     },
     'her2st': {
-        'path': '/data/ouyangjiarui/stem/hest1k_datasets/her2st/',
+        'dir_name': 'her2st',
         'val_slides': 'SPA148',
-        'test_slides': 'SPA148', 
+        'test_slides': 'SPA148',
         'recommended_encoder': 'conch'
     }
 }
@@ -78,6 +79,9 @@ Example:
                         help='Slide identifier to evaluate (e.g. MEND144)')
 
     # Optional arguments
+    parser.add_argument('--data-root', type=str, default=DEFAULT_DATA_ROOT,
+                        help='Root directory containing dataset folders '
+                             '(default: $GENAR_DATA_ROOT or ./data)')
     parser.add_argument('--encoder', type=str, choices=list(ENCODER_FEATURE_DIMS.keys()),
                         help='Encoder type (defaults to the dataset recommendation)')
     parser.add_argument('--output_dir', type=str, default='./inference_results',
@@ -390,6 +394,10 @@ def main():
         return
 
     dataset_info = DATASETS[args.dataset]
+    data_root = os.path.abspath(args.data_root)
+    dataset_path = os.path.join(data_root, dataset_info['dir_name'])
+    if not os.path.exists(dataset_path):
+        logger.warning("Dataset path does not exist: %s", dataset_path)
 
     # Resolve encoder selection
     encoder_name = args.encoder or dataset_info['recommended_encoder']
@@ -406,7 +414,7 @@ def main():
         model, config = load_model_from_checkpoint(args.ckpt_path, device)
         
         # Update dataset-related configuration
-        config.data_path = dataset_info['path']
+        config.data_path = dataset_path
         config.expr_name = args.dataset
         config.encoder_name = encoder_name
         config.max_gene_count = args.max_gene_count

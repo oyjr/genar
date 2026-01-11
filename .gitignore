@@ -4,3 +4,5 @@ logs/
 scripts/
 HEST/
 configs/
+__pycache__/
+*.py[cod]

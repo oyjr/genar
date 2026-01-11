@@ -8,12 +8,13 @@ pipeline without further code changes.  For each slide it:
 2. Crops RGB patches from the whole-slide image around every spot.
 3. Runs the patches through an ImageNet-pretrained ResNet18 backbone.
 4. Stores the resulting `[num_spots, 512]` tensor under
-   `processed_data/1spot_resnet18_ebd/{slide_id}_resnet18.pt`.
+   `processed_data/spot_features_resnet18/{slide_id}_resnet18.pt`.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,17 +39,17 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 @dataclass
 class DatasetConfig:
     name: str
-    root: Path
+    dir_name: str
 
 
 DATASETS: Dict[str, DatasetConfig] = {
-    "PRAD": DatasetConfig("PRAD", Path("/data/250010227/oy/Stem/hest1k_datasets/PRAD")),
-    "her2st": DatasetConfig("her2st", Path("/data/250010227/oy/Stem/hest1k_datasets/her2st")),
-    "kidney": DatasetConfig("kidney", Path("/data/250010227/oy/Stem/hest1k_datasets/kidney")),
-    "mouse_brain": DatasetConfig("mouse_brain", Path("/data/250010227/oy/Stem/hest1k_datasets/mouse_brain")),
+    "PRAD": DatasetConfig("PRAD", "PRAD"),
+    "her2st": DatasetConfig("her2st", "her2st"),
+    "kidney": DatasetConfig("kidney", "kidney"),
+    "mouse_brain": DatasetConfig("mouse_brain", "mouse_brain"),
 }
 
-OUTPUT_SUBDIR = "processed_data/1spot_resnet18_ebd"
+OUTPUT_SUBDIR = "processed_data/spot_features_resnet18"
 WSI_SUBDIR = "wsis"
 ST_SUBDIR = "st"
 SLIDE_LIST_PATH = "processed_data/all_slide_lst.txt"
@@ -67,6 +68,13 @@ def parse_args() -> argparse.Namespace:
         default="all",
         choices=["all", *DATASETS.keys()],
         help="Dataset to process (default: all)",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path(os.environ.get("GENAR_DATA_ROOT", "./data")),
+        help="Root directory containing dataset folders "
+             "(default: $GENAR_DATA_ROOT or ./data)",
     )
     parser.add_argument(
         "--device",
@@ -313,12 +321,16 @@ def main() -> None:
 
     device = torch.device(args.device)
     model = prepare_model(device)
+    data_root = args.data_root.resolve()
 
     summary: List[Tuple[str, int]] = []
 
     for config in dataset_sequence:
-        slides = load_slide_ids(config.root)
-        out_dir = ensure_output_dir(config.root)
+        dataset_dir = data_root / config.dir_name
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"Dataset root not found: {dataset_dir}")
+        slides = load_slide_ids(dataset_dir)
+        out_dir = ensure_output_dir(dataset_dir)
         processed = 0
 
         with tqdm(slides, desc=config.name, unit="slide") as iterator:
@@ -334,7 +346,7 @@ def main() -> None:
 
                 embeddings = process_slide(
                     model=model,
-                    dataset_dir=config.root,
+                    dataset_dir=dataset_dir,
                     slide_id=slide_id,
                     batch_size=args.batch_size,
                     patch_size_override=args.patch_size,
