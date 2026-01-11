@@ -247,16 +247,6 @@ Examples:
     parser.add_argument('--sync-batchnorm', action='store_true',
                         help='Enable synchronized BatchNorm (recommended for multi-GPU)')
 
-    # Data augmentation flags
-    parser.add_argument('--use-augmented', action='store_true', default=False,
-                        help='Use augmented features (default: disabled)')
-    parser.add_argument('--expand-augmented', action='store_true', default=False,
-                        help='Expand augmented data into seven virtual samples per spot')
-    parser.add_argument('--no-use-augmented', dest='use_augmented', action='store_false',
-                        help='Explicitly disable augmented features')
-    parser.add_argument('--no-expand-augmented', dest='expand_augmented', action='store_false',
-                        help='Explicitly disable augmented data expansion')
-
     # Gene-count arguments
     parser.add_argument('--max-gene-count', type=int, default=500,
                         help='Upper bound for gene counts (default: 500)')
@@ -405,8 +395,6 @@ def build_config_from_args(args):
     config.slide_val = dataset_info['val_slides']
     config.slide_test = dataset_info['test_slides']
     config.encoder_name = encoder_name
-    config.use_augmented = getattr(args, 'use_augmented', False)
-    config.expand_augmented = getattr(args, 'expand_augmented', False)
     config.gene_count_mode = 'discrete_tokens'
     config.max_gene_count = getattr(args, 'max_gene_count', 500)
     
@@ -467,14 +455,13 @@ def create_dataloaders(config):
         'slide_val': config.slide_val,
         'slide_test': config.slide_test,
         'encoder_name': config.encoder_name,
-        'use_augmented': config.use_augmented,
         'max_gene_count': getattr(config, 'max_gene_count', 500),
     }
     
     # Build datasets
-    train_dataset = STDataset(mode='train', expand_augmented=config.expand_augmented, **base_params)
-    val_dataset = STDataset(mode='val', expand_augmented=False, **base_params)
-    test_dataset = STDataset(mode='test', expand_augmented=False, **base_params)
+    train_dataset = STDataset(mode='train', **base_params)
+    val_dataset = STDataset(mode='val', **base_params)
+    test_dataset = STDataset(mode='test', **base_params)
     
     # DataLoaders
     train_loader = DataLoader(

@@ -156,12 +156,11 @@ def create_test_dataloader(config, slide_id: str, batch_size: int = 64):
         'slide_val': slide_id,  # Use the requested slide in both splits
         'slide_test': slide_id,
         'encoder_name': config.encoder_name,
-        'use_augmented': False,  # Disable augmentation for inference
         'max_gene_count': getattr(config, 'max_gene_count', 500),
     }
 
     # Dataset and loader
-    test_dataset = STDataset(mode='test', expand_augmented=False, **base_params)
+    test_dataset = STDataset(mode='test', **base_params)
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,

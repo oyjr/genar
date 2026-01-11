@@ -44,7 +44,6 @@ genar/
       st/
       processed_data/
         spot_features_uni/
-        spot_features_uni_aug/
         selected_gene_list.txt
         all_slide_lst.txt
     her2st/

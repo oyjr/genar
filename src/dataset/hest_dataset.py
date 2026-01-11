@@ -1,6 +1,5 @@
 import logging
 import os
-import pandas as pd
 import numpy as np
 from scipy import sparse
 import torch
@@ -22,8 +21,6 @@ class STDataset(Dataset):
                  slide_val: str = '',          # Validation slides
                  slide_test: str = '',         # Test slides
                  encoder_name: str = 'uni',    # Feature encoder
-                 use_augmented: bool = False,  # Use augmented features
-                 expand_augmented: bool = False,  # Expand augmented samples
                  max_gene_count: int = 500):   # Max gene count cap
         """
         Args:
@@ -33,8 +30,6 @@ class STDataset(Dataset):
             slide_val: Comma-separated slide IDs for validation.
             slide_test: Comma-separated slide IDs for testing.
             encoder_name: Encoder type ('uni', 'conch', 'resnet18').
-            use_augmented: Whether augmented embeddings are available.
-            expand_augmented: Expand augmented spots into individual rows.
             max_gene_count: Maximum gene count used for tokenisation.
         """
         super().__init__()
@@ -48,16 +43,10 @@ class STDataset(Dataset):
                 f"got {encoder_name}"
             )
         
-        # Only expand augmented data during training when augmentation is enabled
-        if expand_augmented and (not use_augmented or mode != 'train'):
-            expand_augmented = False
-        
         self.mode = mode
         self.data_path = data_path
         self.expr_name = expr_name
         self.encoder_name = encoder_name
-        self.use_augmented = use_augmented
-        self.expand_augmented = expand_augmented
         self.max_gene_count = max_gene_count
         
         # Directory layout
@@ -65,8 +54,7 @@ class STDataset(Dataset):
         self.processed_dir = os.path.join(data_path, 'processed_data')
 
         # Embedding directory
-        emb_suffix = "_aug" if use_augmented else ""
-        self.emb_dir = os.path.join(self.processed_dir, f"spot_features_{encoder_name}{emb_suffix}")
+        self.emb_dir = os.path.join(self.processed_dir, f"spot_features_{encoder_name}")
 
         logger.debug("Initialising STDataset: mode=%s, dataset=%s, encoder=%s", mode, expr_name, encoder_name)
 
@@ -132,7 +120,7 @@ class STDataset(Dataset):
         }
 
     def _init_train_mode(self):
-        """Preload training data and optional augmentations."""
+        """Preload training data."""
         # Preload AnnData objects for every training slide
         self.adata_dict = {}
         lengths = []
@@ -140,87 +128,19 @@ class STDataset(Dataset):
         for slide_id in self.ids:
             adata = self._load_st(slide_id)
             self.adata_dict[slide_id] = adata
-            
-            if self.expand_augmented:
-                # Augmented inputs expand each spot into seven variants
-                lengths.append(len(adata) * 7)
-                # Prepare expanded tensors and metadata
-                self._prepare_expanded_data(slide_id, adata)
-            else:
-                lengths.append(len(adata))
+            lengths.append(len(adata))
 
         self.cumlen = np.cumsum(lengths)
+        logger.debug("Training mode dataset size: %d", self.cumlen[-1])
 
-        if self.expand_augmented:
-            logger.debug("Training mode with augmentation expansion: %d samples", self.cumlen[-1])
-        else:
-            logger.debug("Training mode standard dataset size: %d", self.cumlen[-1])
-
-    def _prepare_expanded_data(self, slide_id: str, adata: ad.AnnData):
-        """Materialise the expanded augmented dataset."""
-        if not hasattr(self, 'expanded_emb_dict'):
-            self.expanded_emb_dict = {}
-            self.expanded_adata_dict = {}
-
-        # Load augmented embeddings (stored either as [spots,7,dim] or [spots*7,dim])
-        emb = self._load_emb(slide_id, None, 'aug')
-
-        # Normalise tensor shape
-        if len(emb.shape) == 3:
-            num_spots, num_augs, feature_dim = emb.shape
-            expanded_emb = emb.reshape(-1, feature_dim)
-        else:
-            expanded_emb = emb
-
-        self.expanded_emb_dict[slide_id] = expanded_emb
-
-        # Expand AnnData metadata/expressions
-        expanded_obs_data = []
-        expanded_X_data = []
-        expanded_positions = []
-        
-        for aug_idx in range(7):
-            for spot_idx in range(len(adata)):
-                expanded_obs_data.append({
-                    'original_spot_id': spot_idx,
-                    'aug_id': aug_idx
-                })
-                expanded_X_data.append(adata.X[spot_idx])
-                expanded_positions.append(adata.obsm['positions'][spot_idx])
-        
-        # Build expanded AnnData object
-        obs_df = pd.DataFrame(expanded_obs_data)
-        obs_df.index = obs_df.index.astype(str)
-
-        expanded_adata = ad.AnnData(
-            X=sparse.vstack(expanded_X_data) if sparse.issparse(adata.X) else np.vstack(expanded_X_data),
-            obs=obs_df,
-            var=adata.var.copy()
-        )
-        expanded_adata.obsm['positions'] = np.array(expanded_positions)
-        
-        self.expanded_adata_dict[slide_id] = expanded_adata
-
-    def _load_emb(self, slide_id: str, idx: Optional[int] = None, mode: str = 'standard') -> torch.Tensor:
-        """Load embeddings for a slide in standard or augmented mode."""
-        if mode == 'aug' and self.use_augmented:
-            emb_file = f"{self.emb_dir}/{slide_id}_{self.encoder_name}_aug.pt"
-        else:
-            # Fall back to the standard embedding directory
-            base_dir = self.emb_dir.replace('_aug', '')
-            emb_file = f"{base_dir}/{slide_id}_{self.encoder_name}.pt"
+    def _load_emb(self, slide_id: str, idx: Optional[int] = None) -> torch.Tensor:
+        """Load embeddings for a slide."""
+        emb_file = f"{self.emb_dir}/{slide_id}_{self.encoder_name}.pt"
 
         if not os.path.exists(emb_file):
             raise FileNotFoundError(f"Embedding file not found: {emb_file}")
 
         features = torch.load(emb_file, map_location='cpu', weights_only=True)
-
-        # Support 3D augmented tensors
-        if mode == 'aug' and len(features.shape) == 3:
-            if idx is not None:
-                return features[idx, 0, :]
-            else:
-                return features
 
         # Standard 2D format
         if idx is not None:
@@ -275,7 +195,7 @@ class STDataset(Dataset):
             return self._get_eval_item(index)
 
     def _get_train_item(self, index: int) -> Dict[str, torch.Tensor]:
-        """Return a training sample (with optional augmentation)."""
+        """Return a training sample."""
         # Locate the slide and sample index
         i = 0
         while index >= self.cumlen[i]:
@@ -284,40 +204,18 @@ class STDataset(Dataset):
         sample_idx = index - (self.cumlen[i-1] if i > 0 else 0)
         slide_id = self.int2id[i]
         
-        if self.expand_augmented:
-            # Use pre-expanded augmented tensors
-            features = self.expanded_emb_dict[slide_id][sample_idx]
-            expanded_adata = self.expanded_adata_dict[slide_id]
-            expression = expanded_adata[sample_idx].X
-            positions = expanded_adata.obsm['positions'][sample_idx]
-            
-            # Augmentation provenance
-            original_spot_id = int(expanded_adata.obs['original_spot_id'].iloc[sample_idx])
-            aug_id = int(expanded_adata.obs['aug_id'].iloc[sample_idx])
-            
-            return {
-                'img': torch.FloatTensor(features),
-                'target_genes': self._process_gene_expression(expression),
-                'positions': torch.FloatTensor(positions),
-                'slide_id': slide_id,
-                'spot_idx': sample_idx,
-                'original_spot_id': original_spot_id,
-                'aug_id': aug_id
-            }
-        else:
-            # Standard path
-            features = self._load_emb(slide_id, sample_idx, 'standard')
-            adata = self.adata_dict[slide_id]
-            expression = adata[sample_idx].X
-            positions = adata.obsm['positions'][sample_idx]
-            
-            return {
-                'img': features,
-                'target_genes': self._process_gene_expression(expression),
-                'positions': torch.FloatTensor(positions),
-                'slide_id': slide_id,
-                'spot_idx': sample_idx
-            }
+        features = self._load_emb(slide_id, sample_idx)
+        adata = self.adata_dict[slide_id]
+        expression = adata[sample_idx].X
+        positions = adata.obsm['positions'][sample_idx]
+        
+        return {
+            'img': features,
+            'target_genes': self._process_gene_expression(expression),
+            'positions': torch.FloatTensor(positions),
+            'slide_id': slide_id,
+            'spot_idx': sample_idx
+        }
 
     def _get_eval_item(self, index: int) -> Dict[str, torch.Tensor]:
         """Return a validation/test sample."""
@@ -335,7 +233,7 @@ class STDataset(Dataset):
         slide_id = self.int2id[i]
         
         # Load embeddings and expression
-        features = self._load_emb(slide_id, sample_idx, 'standard')
+        features = self._load_emb(slide_id, sample_idx)
         adata = self._get_cached_eval_adata(slide_id)
         expression = adata[sample_idx].X
         positions = adata.obsm['positions'][sample_idx]
@@ -350,7 +248,7 @@ class STDataset(Dataset):
 
     def get_full_slide_for_testing(self, slide_id: str) -> Dict[str, torch.Tensor]:
         """Return full-slide tensors for evaluation utilities."""
-        features = self._load_emb(slide_id, None, 'standard')  # [num_spots, feature_dim]
+        features = self._load_emb(slide_id, None)  # [num_spots, feature_dim]
         adata = self._get_cached_eval_adata(slide_id)
         
         expression = adata.X
