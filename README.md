@@ -43,8 +43,8 @@ genar/
       wsis/
       st/
       processed_data/
-        1spot_uni_ebd/
-        1spot_uni_ebd_aug/
+        spot_features_uni/
+        spot_features_uni_aug/
         selected_gene_list.txt
         all_slide_lst.txt
     her2st/
