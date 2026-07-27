@@ -1,0 +1,12 @@
+logs/
+.cursor/
+.vscode/
+HEST/
+configs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+inference_results/
+*.ckpt
