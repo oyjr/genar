@@ -1,0 +1,1 @@
+"""GenAR release regression tests."""

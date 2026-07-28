@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use GenAR, please cite the Medical Image Analysis paper."
+title: "GenAR: Next-scale autoregressive generation for spatial gene expression prediction"
+type: software
+license: MIT
+authors:
+  - family-names: Ouyang
+    given-names: Jiarui
+  - family-names: Wang
+    given-names: Yihui
+  - family-names: Gao
+    given-names: Yihang
+  - family-names: Xu
+    given-names: Yingxue
+  - family-names: Yang
+    given-names: Shu
+  - family-names: Chen
+    given-names: Hao
+repository-code: "https://github.com/oyjr/genar"
+preferred-citation:
+  type: article
+  title: "GenAR: Next-scale autoregressive generation for spatial gene expression prediction"
+  authors:
+    - family-names: Ouyang
+      given-names: Jiarui
+    - family-names: Wang
+      given-names: Yihui
+    - family-names: Gao
+      given-names: Yihang
+    - family-names: Xu
+      given-names: Yingxue
+    - family-names: Yang
+      given-names: Shu
+    - family-names: Chen
+      given-names: Hao
+  journal: Medical Image Analysis
+  volume: 114
+  start: "104232"
+  year: 2026
+  doi: "10.1016/j.media.2026.104232"
