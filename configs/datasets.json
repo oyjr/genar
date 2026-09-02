@@ -1,0 +1,41 @@
+{
+  "repo_id": "MahmoodLab/hest",
+  "revision": "42fa9a56fa7f439e466b7e306cda4bd224e4fe84",
+  "datasets": {
+    "PRAD": {
+      "directory": "PRAD",
+      "prefix": "MEND",
+      "range": [139, 162],
+      "exclude": [155],
+      "test": "MEND145"
+    },
+    "her2st": {
+      "directory": "her2st",
+      "prefix": "SPA",
+      "range": [119, 154],
+      "exclude": [],
+      "test": "SPA148"
+    },
+    "kidney": {
+      "directory": "kidney",
+      "prefix": "NCBI",
+      "range": [692, 714],
+      "exclude": [],
+      "test": "NCBI697"
+    },
+    "mouse_brain": {
+      "directory": "mouse_brain",
+      "prefix": "NCBI",
+      "range": [658, 671],
+      "exclude": [],
+      "test": "NCBI667"
+    },
+    "ccRCC": {
+      "directory": "ccRCC",
+      "prefix": "INT",
+      "range": [1, 24],
+      "exclude": [],
+      "test": "INT2"
+    }
+  }
+}

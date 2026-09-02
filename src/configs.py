@@ -1,6 +1,6 @@
 import os
 
-# Defaults reported in the final Medical Image Analysis paper.
+# Shared training defaults.
 PAPER_NUM_GENES = 200
 PAPER_SCALE_DIMS = (1, 4, 8, 40, 100, 200)
 PAPER_MAX_GENE_COUNT = 2000
@@ -8,8 +8,7 @@ PAPER_BATCH_SIZE = 64
 PAPER_LEARNING_RATE = 1.0e-4
 PAPER_SEED = 2021
 
-# Named layouts used by the scale-sensitivity experiments.  ``paper`` is the
-# six-scale configuration used for the main results.
+# Named layouts used by the scale-sensitivity experiments.
 SCALE_PRESETS = {
     'paper': PAPER_SCALE_DIMS,
     'k4': (1, 8, 40, 200),
@@ -29,8 +28,7 @@ ENCODER_FEATURE_DIMS = {
 
 DEFAULT_DATA_ROOT = os.environ.get('GENAR_DATA_ROOT', './data')
 
-# The paper evaluates one held-out slide per dataset. It is not reused as a
-# validation loader during training.
+# Default dataset splits used by the command-line training and evaluation tools.
 DATASETS = {
     'PRAD': {
         'dir_name': 'PRAD',

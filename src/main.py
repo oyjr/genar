@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train GenAR and the ablation configurations used in the paper."""
+"""Train GenAR."""
 
 from __future__ import annotations
 
@@ -224,7 +224,7 @@ def parse_scale_loss_weights(
 
 def get_parse() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Train GenAR with the configuration used in the paper',
+        description='Train GenAR',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -241,6 +241,13 @@ def get_parse() -> argparse.ArgumentParser:
         '--model',
         default='GENAR',
         choices=list(MODEL_CONFIGS),
+    )
+    parser.add_argument(
+        '--embed-dim',
+        type=int,
+        default=512,
+        choices=[512, 768],
+        help='Model embedding width',
     )
     parser.add_argument(
         '--encoder',
@@ -262,10 +269,7 @@ def get_parse() -> argparse.ArgumentParser:
     parser.add_argument(
         '--global-batch-size',
         type=int,
-        help=(
-            'Batch size across all GPU processes. Defaults to the paper value '
-            f'of {PAPER_BATCH_SIZE}.'
-        ),
+        help=f'Batch size across all GPU processes (default: {PAPER_BATCH_SIZE})',
     )
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--lr', type=float)
@@ -351,24 +355,17 @@ def get_parse() -> argparse.ArgumentParser:
     parser.add_argument('--grouping-seed', type=int, default=42)
     parser.add_argument(
         '--val-slides',
-        help=(
-            'Optional comma-separated validation slides. The paper default '
-            'uses no validation slide and selects checkpoints by training loss.'
-        ),
+        help='Optional comma-separated validation slides',
     )
     parser.add_argument(
         '--test-slides',
-        help='Comma-separated held-out test slides; defaults to the paper split',
+        help='Comma-separated test slides',
     )
     parser.add_argument(
         '--ablation-protocol',
         default='normalized',
         choices=['normalized', 'published'],
-        help=(
-            'normalized matches per-scale loss reduction and activates the '
-            'full continuous head; published reproduces the original Table '
-            '4/6 ablation implementation'
-        ),
+        help='Loss-reduction and continuous-head compatibility mode',
     )
     parser.add_argument(
         '--config',
@@ -442,7 +439,7 @@ def build_config_from_args(args) -> Dict:
             and args.final_loss_mode == 'cross_entropy'
         ):
             raise ValueError(
-                "The no_film implementation uses the paper Gaussian KL loss"
+                "The no_film implementation uses the Gaussian KL loss"
             )
         final_loss_mode = args.final_loss_mode
         if final_loss_mode == 'gaussian_nll':
@@ -477,6 +474,8 @@ def build_config_from_args(args) -> Dict:
                 'max_gene_count': args.max_gene_count,
                 'histology_feature_dim': ENCODER_FEATURE_DIMS[encoder_name],
                 'feature_dim': ENCODER_FEATURE_DIMS[encoder_name],
+                'embed_dim': args.embed_dim,
+                'condition_embed_dim': args.embed_dim,
             }
         )
         run_parts = ['GENAR']
@@ -656,7 +655,7 @@ def _loader_kwargs(config: Dict, split: str) -> dict:
 
 
 def create_dataloaders(config: Dict):
-    """Build loaders without exposing the test split during training."""
+    """Build loaders for the configured train, validation, and test splits."""
     base_params = {
         'data_path': config.data_path,
         'expr_name': config.expr_name,
@@ -708,7 +707,7 @@ def create_dataloaders(config: Dict):
 
 
 def main(config: Dict):
-    """Run a deterministic Lightning training or checkpoint evaluation."""
+    """Run Lightning training or checkpoint evaluation."""
     fix_seed(config.GENERAL.seed)
     pl.seed_everything(config.GENERAL.seed, workers=True)
 

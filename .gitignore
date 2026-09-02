@@ -1,6 +1,7 @@
 logs/
 data/
 checkpoints/
+genes/
 lightning_logs/
 wandb/
 *.h5ad
@@ -12,11 +13,13 @@ wandb/
 .cursor/
 .vscode/
 HEST/
-configs/
+configs/*
+!configs/datasets.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .coverage
+.cache/
 inference_results/
 *.ckpt

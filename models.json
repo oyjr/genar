@@ -1,0 +1,25 @@
+{
+  "repo_id": "ouyjr/GenAR",
+  "models": {
+    "PRAD": {
+      "checkpoint": "checkpoints/prad.ckpt",
+      "genes": "genes/prad.txt"
+    },
+    "her2st": {
+      "checkpoint": "checkpoints/her2st.ckpt",
+      "genes": "genes/her2st.txt"
+    },
+    "kidney": {
+      "checkpoint": "checkpoints/kidney.ckpt",
+      "genes": "genes/kidney.txt"
+    },
+    "mouse_brain": {
+      "checkpoint": "checkpoints/mouse_brain.ckpt",
+      "genes": "genes/mouse_brain.txt"
+    },
+    "ccRCC": {
+      "checkpoint": "checkpoints/ccrcc.ckpt",
+      "genes": "genes/ccrcc.txt"
+    }
+  }
+}
